@@ -1,0 +1,17 @@
+name: PowerShell validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate scripts
+        shell: pwsh
+        run: .\Tests\Invoke-Validation.ps1
