@@ -1,0 +1,86 @@
+# Local command/request notes
+.Commands/
+.Commands/**
+.Comments/
+.Comments/**
+
+# Local runtime markers
+.WindowsAutoCleanupAclHardened
+
+# Logs
+Logs/
+logs/
+log/
+*.log
+*.trace
+*.debug
+
+# Cache
+.cache/
+cache/
+.caches/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+credentials.*
+secrets.*
+token.*
+tokens.*
+cookie.*
+cookies.*
+session.*
+sessions.*
+
+# Local output / generated data
+output/
+outputs/
+downloads/
+download/
+dist/
+build/
+
+# PowerShell local/user artifacts
+*.ps1xml
+*.psd1.user
+*.psm1.user
+
+# Editor and IDE folders
+.vscode/
+.idea/
+.vs/
+.claude/
+*.code-workspace
+
+# OS metadata
+.DS_Store
+Thumbs.db
+thumbs.db
+desktop.ini
+Desktop.ini
