@@ -39,7 +39,13 @@ function Initialize-InstallerLog {
         New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction Stop | Out-Null
     }
     catch {
-        $fallbackRoot = if ($env:TEMP) { $env:TEMP } else { 'C:\Windows\Temp' }
+        $fallbackRoot = if ($env:ProgramData) { Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\Logs' } else { Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup' }
+        try {
+            if (-not (Test-Path -LiteralPath $fallbackRoot -PathType Container)) {
+                New-Item -Path $fallbackRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            }
+        }
+        catch { $null = $_ }
         $script:LogPath = Join-Path -Path $fallbackRoot -ChildPath ('Uninstall-WindowsAutoCleanupTask_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
         New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
     }
@@ -59,7 +65,7 @@ function Write-InstallerLine {
         default   { Write-Host $line -ForegroundColor White }
     }
     if ($script:LogPath) {
-        try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 -ErrorAction Stop } catch { }
+        try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 -ErrorAction Stop } catch { $null = $_ }
     }
 }
 
@@ -72,7 +78,7 @@ function Wait-InstallerExit {
         $null = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     }
     catch {
-        try { Read-Host -Prompt 'Press Enter to close this window' | Out-Null } catch { }
+        try { Read-Host -Prompt 'Press Enter to close this window' | Out-Null } catch { $null = $_ }
     }
 }
 
@@ -89,9 +95,12 @@ function Test-IsAdministrator {
 
 function Get-PreferredPowerShellPath {
     # Prefer PowerShell 7 (pwsh.exe) when available; fall back to Windows PowerShell 5.1.
-    $pwshCmd = Get-Command -Name 'pwsh.exe' -ErrorAction SilentlyContinue
-    if ($pwshCmd -and $pwshCmd.Source -and (Test-Path -LiteralPath $pwshCmd.Source -PathType Leaf)) {
-        return $pwshCmd.Source
+    $pwshCmd = @(Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($pwshCmd.Count -gt 0) {
+        $pwshPath = [string]$pwshCmd[0].Source
+        if ($pwshPath -and (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
+            return $pwshPath
+        }
     }
 
     if ($env:ProgramFiles) {

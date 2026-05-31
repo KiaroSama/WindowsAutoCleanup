@@ -1,4 +1,4 @@
-﻿# WindowsAutoCleanup
+# WindowsAutoCleanup
 
 WindowsAutoCleanup is an administrator-only PowerShell cleanup utility for Windows systems. It removes only explicitly allow-listed temporary files and cache locations on drive `C:`, runs supported Windows cleanup tools, and can install itself as a hidden daily scheduled task.
 
@@ -11,16 +11,16 @@ The project is designed for unattended maintenance on Windows 10, Windows 11, an
 - Permanently deletes temporary files and cache data from approved locations.
 - Cleans Windows temp folders, user temp folders, thumbnail/icon cache databases, DirectX shader cache, internet cache folders, Microsoft Edge cache folders, Delivery Optimization cache, Windows Update download cache, downloaded program files, location cache, selected Defender cleanup/history paths, `C:\Windows.old`, and the Recycle Bin on drive `C:`.
 - Runs `DISM /Online /Cleanup-Image /StartComponentCleanup /Quiet /ResetBase` by default for Windows component store cleanup.
-- Runs the Windows Plug and Play cleanup handler (`pnpclean.dll`) and a conservative `pnputil` duplicate/superseded driver package cleanup pass.
+- Runs the Windows Plug and Play cleanup handler (`pnpclean.dll`) and a conservative locale-safe `pnputil` duplicate/superseded driver package cleanup pass.
 - Uses `cleanmgr.exe /sagerun` only on Windows client systems; Windows Server skips cleanmgr because legacy Disk Cleanup handlers can hang on Server builds.
 - Keeps cleanmgr bounded by a five-minute watchdog on Windows client systems.
 - Avoids clearing File Explorer history, Recent items, Quick Access state, pinned/frequent destinations, or recommended items.
 - Avoids restarting File Explorer and does not reboot the computer.
 - Skips locked, inaccessible, unsafe, or out-of-scope files.
 - Avoids following symlink, junction, and other reparse-point roots.
-- Logs every run to a local `Logs` folder.
+- Logs every run to a local `Logs` folder, with fallback logs under `ProgramData\WindowsAutoCleanup\Logs` or `Windows\Logs\WindowsAutoCleanup` if the project folder is not writable.
 - Includes installer and uninstaller scripts for a hidden scheduled task.
-- On the first elevated cleanup run, hardens the project folder ACL so normal users cannot accidentally modify or delete the scripts.
+- On the first elevated cleanup run, hardens the project folder ACL so normal users cannot accidentally modify or delete the scripts. Pass `-SkipAclHardening` to opt out for development/Git checkouts.
 
 ## Supported Platforms
 
@@ -48,7 +48,7 @@ Important behavior:
 - Non-`C:` drives are rejected by target validation.
 - `DISM /ResetBase` is enabled by default. After this cleanup, installed Windows updates cannot be uninstalled.
 - To avoid `DISM /ResetBase`, run the cleanup or install the scheduled task with `-ResetWindowsUpdateBase:$false`.
-- The first elevated cleanup run hardens the project folder ACL. `SYSTEM` and `BUILTIN\Administrators` receive Full Control; regular users receive Read & Execute only. A local `.WindowsAutoCleanupAclHardened` marker is written and ignored by Git.
+- The first elevated cleanup run hardens the project folder ACL. `SYSTEM` and `BUILTIN\Administrators` receive Full Control; regular users receive Read & Execute only. A local `.WindowsAutoCleanupAclHardened` marker is written and ignored by Git. Use `-SkipAclHardening` when running from a development clone where normal-user Git/edit access must remain available.
 - The script does not intentionally delete browser history, cookies, saved passwords, File Explorer history, Quick Access state, or pinned/frequent destinations.
 - Windows Defender Tamper Protection can lock Defender scan history files. Locked files are skipped or scheduled for deletion on reboot only when Windows allows it.
 
@@ -196,7 +196,7 @@ Each script writes timestamped logs to a local `Logs` folder next to the scripts
 - `Install-WindowsAutoCleanupTask_yyyyMMdd_HHmmss.log`
 - `Uninstall-WindowsAutoCleanupTask_yyyyMMdd_HHmmss.log`
 
-Logs can contain local usernames, local paths, host details, and cleanup results. The `Logs/` folder is ignored by Git and should not be published.
+Logs can contain local usernames, local paths, host details, and cleanup results. The `Logs/` folder is ignored by Git and should not be published. If the project `Logs/` folder cannot be created, the scripts fall back to `C:\ProgramData\WindowsAutoCleanup\Logs` and then `C:\Windows\Logs\WindowsAutoCleanup`.
 
 The cleanup log includes per-category counts for removed files, removed directories, removed reparse points, skipped items, failed items, and best-effort free-space delta for drive `C:`. The free-space delta can be negative if Windows writes new data during the run.
 
@@ -228,7 +228,7 @@ Skipped items are normal when paths do not exist, belong to another profile, are
 
 ### The folder became read-only for normal users
 
-This is expected after the first elevated cleanup run. The ACL hardening step is meant to protect the scripts from accidental modification or deletion by normal users.
+This is expected after the first elevated cleanup run. The ACL hardening step is meant to protect the scripts from accidental modification or deletion by normal users. Use `-SkipAclHardening` before the first run if this folder is a development/Git checkout, or reset the ACL manually from an elevated terminal if you need to restore write access.
 
 ## License
 

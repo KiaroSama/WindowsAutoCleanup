@@ -17,13 +17,17 @@
 
 [CmdletBinding()]
 param(
-    # Used by Task Scheduler. Scheduled execution stays hidden and never relaunches in Windows Terminal.
+    # Used by Task Scheduler. Scheduled execution fails fast instead of trying an interactive UAC relaunch.
     [switch]$Scheduled,
 
     # Aggressive component cleanup is enabled by default to reduce Windows Update
     # Cleanup further. Installed Windows updates cannot be uninstalled afterwards.
     # Pass -ResetWindowsUpdateBase:$false to disable it for a specific manual run.
-    [switch]$ResetWindowsUpdateBase = $true
+    [switch]$ResetWindowsUpdateBase = $true,
+
+    # Skip the one-time project-folder ACL hardening step. This is useful for
+    # development checkouts where normal Git/edit workflows must keep write access.
+    [switch]$SkipAclHardening
 )
 
 Set-StrictMode -Version 2.0
@@ -36,6 +40,7 @@ $script:ScriptRoot = Split-Path -Parent $script:ScriptPath
 $script:LogRoot = Join-Path -Path $script:ScriptRoot -ChildPath 'Logs'
 $script:LogPath = $null
 $script:AclHardeningMarkerPath = Join-Path -Path $script:ScriptRoot -ChildPath '.WindowsAutoCleanupAclHardened'
+$script:MoveFileExLoadWarningLogged = $false
 $script:AttemptedCategories = New-Object 'System.Collections.Generic.List[string]'
 $script:Warnings = New-Object 'System.Collections.Generic.List[string]'
 $script:Results = New-Object 'System.Collections.Generic.List[object]'
@@ -97,13 +102,32 @@ function Initialize-Log {
         New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction Stop | Out-Null
     }
     catch {
-        $fallbackRoot = if ($env:TEMP) { $env:TEMP } else { 'C:\Windows\Temp' }
+        $fallbackRoot = if ($env:ProgramData) {
+            Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\Logs'
+        }
+        else {
+            Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup'
+        }
+        try {
+            if (-not (Test-Path -LiteralPath $fallbackRoot -PathType Container)) {
+                New-Item -Path $fallbackRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            }
+        }
+        catch {
+            $fallbackRoot = Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup'
+            try {
+                if (-not (Test-Path -LiteralPath $fallbackRoot -PathType Container)) {
+                    New-Item -Path $fallbackRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                }
+            }
+            catch { $null = $_ }
+        }
         $script:LogPath = Join-Path -Path $fallbackRoot -ChildPath ('WindowsAutoCleanup_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
         New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
     }
 }
 
-function Write-Log {
+function Write-CleanupLog {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('INFO','WARN','ERROR')][string]$Level,
         [Parameter(Mandatory = $true)][string]$Message
@@ -117,6 +141,7 @@ function Write-Log {
     }
     catch {
         # Cleanup must stay silent even when logging fails.
+        $null = $_
     }
 }
 
@@ -124,7 +149,7 @@ function Add-CleanupWarning {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     $script:Warnings.Add($Message) | Out-Null
-    Write-Log -Level 'WARN' -Message $Message
+    Write-CleanupLog -Level 'WARN' -Message $Message
 }
 
 function Test-IsAdministrator {
@@ -141,9 +166,12 @@ function Test-IsAdministrator {
 function Get-PreferredPowerShellPath {
     # Prefer PowerShell 7 (pwsh.exe) when available; fall back to Windows PowerShell 5.1.
     # The script's #Requires -Version 5.1 is satisfied by both hosts.
-    $pwshCmd = Get-Command -Name 'pwsh.exe' -ErrorAction SilentlyContinue
-    if ($pwshCmd -and $pwshCmd.Source -and (Test-Path -LiteralPath $pwshCmd.Source -PathType Leaf)) {
-        return $pwshCmd.Source
+    $pwshCmd = @(Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($pwshCmd.Count -gt 0) {
+        $pwshPath = [string]$pwshCmd[0].Source
+        if ($pwshPath -and (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
+            return $pwshPath
+        }
     }
 
     # Try the canonical PowerShell 7 install location even when not on PATH (for
@@ -164,30 +192,36 @@ function Invoke-ElevatedRelaunchIfNeeded {
 
     if ($Scheduled) {
         Initialize-Log
-        Write-Log -Level 'ERROR' -Message 'Administrator privileges are required. Scheduled execution is not elevated.'
+        Write-CleanupLog -Level 'ERROR' -Message 'Administrator privileges are required. Scheduled execution is not elevated.'
         exit 1
     }
 
     $powerShellExe = Get-PreferredPowerShellPath
     $scriptArg = '"{0}"' -f $script:ScriptPath
+    $childArgs = '-NoProfile -ExecutionPolicy Bypass -File {0}' -f $scriptArg
+    if ($PSBoundParameters.ContainsKey('ResetWindowsUpdateBase')) {
+        $childArgs = '{0} -ResetWindowsUpdateBase:${1}' -f $childArgs, ([bool]$ResetWindowsUpdateBase).ToString().ToLowerInvariant()
+    }
+    if ($SkipAclHardening) {
+        $childArgs = '{0} -SkipAclHardening' -f $childArgs
+    }
 
     try {
         $wt = Get-Command -Name 'wt.exe' -ErrorAction SilentlyContinue
         if ($wt -and $wt.Source) {
             # Pass the preferred PowerShell binary explicitly so Windows Terminal does
             # not fall back to its default profile (which is usually Windows PowerShell 5.1).
-            $wtArgs = '"{0}" -NoProfile -ExecutionPolicy Bypass -File {1}' -f $powerShellExe, $scriptArg
+            $wtArgs = '"{0}" {1}' -f $powerShellExe, $childArgs
             Start-Process -FilePath $wt.Source -ArgumentList $wtArgs -Verb RunAs -ErrorAction Stop | Out-Null
         }
         else {
-            $psArgs = '-NoProfile -ExecutionPolicy Bypass -File {0}' -f $scriptArg
-            Start-Process -FilePath $powerShellExe -ArgumentList $psArgs -Verb RunAs -ErrorAction Stop | Out-Null
+            Start-Process -FilePath $powerShellExe -ArgumentList $childArgs -Verb RunAs -ErrorAction Stop | Out-Null
         }
         exit 0
     }
     catch {
         Initialize-Log
-        Write-Log -Level 'ERROR' -Message ('Failed to relaunch as administrator: {0}' -f $_.Exception.Message)
+        Write-CleanupLog -Level 'ERROR' -Message ('Failed to relaunch as administrator: {0}' -f $_.Exception.Message)
         exit 1
     }
 }
@@ -278,7 +312,7 @@ function Set-WindowsAutoCleanupItemAcl {
 
 function Invoke-ScriptRootAclHardening {
     if (Test-Path -LiteralPath $script:AclHardeningMarkerPath -PathType Leaf) {
-        Write-Log -Level 'INFO' -Message 'Script folder ACL hardening already applied; marker found.'
+        Write-CleanupLog -Level 'INFO' -Message 'Script folder ACL hardening already applied; marker found.'
         return
     }
 
@@ -293,7 +327,7 @@ function Invoke-ScriptRootAclHardening {
         return
     }
 
-    Write-Log -Level 'INFO' -Message ("Applying one-time script folder ACL hardening: {0}" -f $root)
+    Write-CleanupLog -Level 'INFO' -Message ("Applying one-time script folder ACL hardening: {0}" -f $root)
 
     $directories = New-Object 'System.Collections.Generic.List[string]'
     $files = New-Object 'System.Collections.Generic.List[string]'
@@ -361,7 +395,7 @@ function Invoke-ScriptRootAclHardening {
             Add-CleanupWarning ("Script folder ACL hardening completed with {0} failed item(s) and {1} skipped reparse point(s)." -f $failed, $skippedReparsePoints)
         }
         else {
-            Write-Log -Level 'INFO' -Message ("Script folder ACL hardening completed. Files={0}; Directories={1}; SkippedReparsePoints={2}." -f $files.Count, $directories.Count, $skippedReparsePoints)
+            Write-CleanupLog -Level 'INFO' -Message ("Script folder ACL hardening completed. Files={0}; Directories={1}; SkippedReparsePoints={2}." -f $files.Count, $directories.Count, $skippedReparsePoints)
         }
     }
     catch {
@@ -374,16 +408,33 @@ function Get-NormalizedPath {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
 
-    # Handle bare drive-letter inputs like 'C:' explicitly. [System.IO.Path]::GetFullPath
-    # would otherwise resolve them against the per-drive current directory on Windows
-    # (for example, 'C:' could become 'C:\Windows\System32'), which silently defeats
-    # protected-path checks for the drive root.
-    if ($Path -match '^[A-Za-z]:$') {
-        return $Path.ToUpperInvariant()
+    $candidate = $Path.Trim()
+
+    # Normalize extended-length paths that still point to a normal drive path.
+    # UNC and volume-GUID forms are intentionally rejected by the C: allow-list.
+    if ($candidate.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($candidate -match '^\\\\\?\\([A-Za-z]:\\.*)$') {
+            $candidate = $Matches[1]
+        }
+        elseif ($candidate -match '^\\\\\?\\([A-Za-z]:)$') {
+            return $Matches[1].ToUpperInvariant()
+        }
+        else {
+            return $null
+        }
+    }
+
+    # Handle bare drive-letter inputs like 'C:' explicitly. Reject drive-relative
+    # forms like 'C:foo' because .NET resolves them against a mutable per-drive CWD.
+    if ($candidate -match '^[A-Za-z]:$') {
+        return $candidate.ToUpperInvariant()
+    }
+    if ($candidate -match '^[A-Za-z]:(?!\\)') {
+        return $null
     }
 
     try {
-        return ([System.IO.Path]::GetFullPath($Path)).TrimEnd('\')
+        return ([System.IO.Path]::GetFullPath($candidate)).TrimEnd('\')
     }
     catch {
         return $null
@@ -465,7 +516,7 @@ function Get-CDriveFreeBytes {
             $drive = Get-PSDrive -Name C -ErrorAction Stop
             if ($drive -and $null -ne $drive.Free) { return [int64]$drive.Free }
         }
-        catch { }
+        catch { $null = $_ }
     }
 
     return $null
@@ -477,7 +528,7 @@ function Test-IsWindowsServer {
         if ($null -ne $os.ProductType -and [int]$os.ProductType -ne 1) { return $true }
         if ($os.Caption -match '\bServer\b') { return $true }
     }
-    catch { }
+    catch { $null = $_ }
 
     return $false
 }
@@ -559,6 +610,10 @@ public static class MoveFileExNative
         return [MoveFileExNative]::MoveFileEx($normalized, $null, 0x4)
     }
     catch {
+        if (-not $script:MoveFileExLoadWarningLogged) {
+            Add-CleanupWarning ("Pending-delete registration is unavailable: {0}" -f $_.Exception.Message)
+            $script:MoveFileExLoadWarningLogged = $true
+        }
         return $false
     }
 }
@@ -643,7 +698,7 @@ function Remove-DirectoryTreeSafe {
     try {
         $rootAttr = [System.IO.File]::GetAttributes($normalizedRoot)
         if (($rootAttr -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Write-Log -Level 'INFO' -Message "Skipping reparse-point root for '$Category': $normalizedRoot"
+            Write-CleanupLog -Level 'INFO' -Message "Skipping reparse-point root for '$Category': $normalizedRoot"
             New-Result -Category $Category -Path $normalizedRoot -Skipped 1
             return
         }
@@ -655,7 +710,7 @@ function Remove-DirectoryTreeSafe {
     }
 
     $script:AttemptedCategories.Add($Category) | Out-Null
-    Write-Log -Level 'INFO' -Message "Attempting category '$Category': $normalizedRoot"
+    Write-CleanupLog -Level 'INFO' -Message "Attempting category '$Category': $normalizedRoot"
 
     $stats = @{ FilesDeleted = 0L; DirectoriesDeleted = 0L; ReparsePointsDeleted = 0L; PendingDeletes = 0L; Skipped = 0L; Failed = 0L }
     $rootInfo = $null
@@ -767,7 +822,7 @@ function Remove-FilesByPatternSafe {
     }
 
     $script:AttemptedCategories.Add($Category) | Out-Null
-    Write-Log -Level 'INFO' -Message "Attempting category '$Category': $normalizedRoot"
+    Write-CleanupLog -Level 'INFO' -Message "Attempting category '$Category': $normalizedRoot"
 
     $stats = @{ FilesDeleted = 0L; DirectoriesDeleted = 0L; ReparsePointsDeleted = 0L; PendingDeletes = 0L; Skipped = 0L; Failed = 0L }
 
@@ -806,13 +861,18 @@ function Get-UserProfileDirectories {
     $usersRoot = 'C:\Users'
     if (-not (Test-Path -LiteralPath $usersRoot -PathType Container)) { return @() }
 
+    $excludedProfileNames = @('All Users', 'Default', 'Default User', 'Public')
+
     try {
         # Filter out reparse points such as the legacy 'Default User' and 'All Users'
-        # junctions. Following them would either point at duplicate locations or at
-        # paths that do not exist (for example, C:\Users\All Users -> C:\ProgramData).
+        # junctions, plus non-interactive template/shared profiles. Following them
+        # only adds skipped noise and can touch locations that are not user caches.
         return @(
             Get-ChildItem -LiteralPath $usersRoot -Directory -Force -ErrorAction Stop |
-                Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 }
+                Where-Object {
+                    ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -and
+                    $_.Name -notin $excludedProfileNames
+                }
         )
     }
     catch {
@@ -888,24 +948,24 @@ function Get-CleanupTargets {
         Add-UniqueDirectoryTarget -Targets $targets -Category 'Current user TEMP contents' -Path $env:TEMP
     }
 
-    foreach ($profile in Get-UserProfileDirectories) {
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'User TEMP contents' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Temp')
+    foreach ($userProfile in Get-UserProfileDirectories) {
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'User TEMP contents' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Temp')
         # Delete only generated shell cache databases. File Explorer privacy history,
         # Recent items, Quick Access state, and pinned/frequent destinations are
         # intentionally not touched. Explorer is not stopped; running Explorer may
         # recreate base cache databases immediately after deletion.
-        Add-UniquePatternTarget -Targets $targets -Category 'Windows Explorer thumbnail cache' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\Explorer') -Patterns @('thumbcache_*.db', 'iconcache_*.db')
+        Add-UniquePatternTarget -Targets $targets -Category 'Windows Explorer thumbnail cache' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\Explorer') -Patterns @('thumbcache_*.db', 'iconcache_*.db')
         # WinINET / legacy IE / Edge-legacy cache. cleanmgr's "Temporary Internet Files"
         # category targets these folders but rarely empties them on Windows 11. WebCache is
         # intentionally not touched here because it is a database (browser URL history etc.),
         # not a discardable cache.
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (INetCache)' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\INetCache')
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (Temporary Internet Files)' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\Temporary Internet Files')
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (IECompatCache)' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\IECompatCache')
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (IECompatUaCache)' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\IECompatUaCache')
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'DirectX Shader Cache' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\D3DSCache')
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'Location Privacy cache' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\Location')
-        Add-UniqueDirectoryTarget -Targets $targets -Category 'Location Privacy cache' -Path (Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\LocationProvider')
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (INetCache)' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\INetCache')
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (Temporary Internet Files)' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\Temporary Internet Files')
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (IECompatCache)' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\IECompatCache')
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'Internet cache (IECompatUaCache)' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\IECompatUaCache')
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'DirectX Shader Cache' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\D3DSCache')
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'Location Privacy cache' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\Location')
+        Add-UniqueDirectoryTarget -Targets $targets -Category 'Location Privacy cache' -Path (Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Windows\LocationProvider')
 
         # Microsoft Edge (Chromium) per-profile caches. cleanmgr does not touch these.
         # The cache folders are pure caches; Edge regenerates them on demand. Files held
@@ -916,7 +976,7 @@ function Get-CleanupTargets {
         # 'Ad Blocking', 'BrowserMetrics', 'Application Guard', etc. are component-shared
         # state, not user profiles, and we deliberately skip them to keep the log focused
         # and avoid touching component data.
-        $edgeUserData = Join-Path -Path $profile.FullName -ChildPath 'AppData\Local\Microsoft\Edge\User Data'
+        $edgeUserData = Join-Path -Path $userProfile.FullName -ChildPath 'AppData\Local\Microsoft\Edge\User Data'
         if (Test-Path -LiteralPath $edgeUserData -PathType Container) {
             try {
                 $edgeProfiles = @(
@@ -933,9 +993,14 @@ function Get-CleanupTargets {
             foreach ($edgeProfile in $edgeProfiles) {
                 $edgeCacheRoots = @(
                     'Cache\Cache_Data'
+                    'Cache\js'
+                    'Cache\wasm'
                     'Code Cache\js'
                     'Code Cache\wasm'
+                    'DawnCache'
+                    'DawnWebGPUCache'
                     'GPUCache'
+                    'ShaderCache\GPUCache'
                     'Service Worker\CacheStorage'
                     'Service Worker\ScriptCache'
                 )
@@ -988,8 +1053,7 @@ function Get-CleanupTargets {
 
 function Get-DiskCleanupVolumeCacheRoots {
     $roots = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches',
-        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
     )
 
     return @($roots | Where-Object { Test-Path -LiteralPath $_ })
@@ -1000,7 +1064,7 @@ function Get-EffectiveDiskCleanupCategories {
 
     if ($ResetWindowsUpdateBase) {
         $categories = @($categories | Where-Object { $_ -ne 'Update Cleanup' })
-        Write-Log -Level 'INFO' -Message 'Skipping cleanmgr Windows Update Cleanup category because DISM /ResetBase is enabled.'
+        Write-CleanupLog -Level 'INFO' -Message 'Skipping cleanmgr Windows Update Cleanup category because DISM /ResetBase is enabled.'
     }
 
     return $categories
@@ -1046,6 +1110,7 @@ function Clear-DiskCleanupStateFlags {
             catch {
                 # Property may not exist on this category. That is expected for
                 # categories that we did not set; ignore.
+                $null = $_
             }
         }
     }
@@ -1063,19 +1128,22 @@ function Invoke-DiskCleanup {
 
     if (Test-IsWindowsServer) {
         $script:AttemptedCategories.Add($category) | Out-Null
-        Write-Log -Level 'INFO' -Message "Skipping cleanmgr.exe on Windows Server; legacy Disk Cleanup handlers can hang on Server builds. DISM, pnpclean, pnputil, and explicit C: allow-list cleanup still run."
+        Write-CleanupLog -Level 'INFO' -Message "Skipping cleanmgr.exe on Windows Server; legacy Disk Cleanup handlers can hang on Server builds. DISM, pnpclean, pnputil, and explicit C: allow-list cleanup still run."
         New-Result -Category $category -Path $cleanmgr -Skipped 1
         return
     }
 
     $script:AttemptedCategories.Add($category) | Out-Null
-    Write-Log -Level 'INFO' -Message ("Attempting category '{0}' via cleanmgr.exe /sagerun:{1}" -f $category, $script:DiskCleanupSageId)
+    Write-CleanupLog -Level 'INFO' -Message ("Attempting category '{0}' via cleanmgr.exe /sagerun:{1}" -f $category, $script:DiskCleanupSageId)
 
     $stats = @{ FilesDeleted = 0L; DirectoriesDeleted = 0L; ReparsePointsDeleted = 0L; Skipped = 0L; Failed = 0L }
     $touched = $false
     $categories = Get-EffectiveDiskCleanupCategories
 
     try {
+        # Clear stale flags from an abnormal previous exit before writing this run's profile.
+        Clear-DiskCleanupStateFlags -SageId $script:DiskCleanupSageId
+
         $touched = Set-DiskCleanupStateFlags `
             -SageId $script:DiskCleanupSageId `
             -Categories $categories `
@@ -1090,7 +1158,7 @@ function Invoke-DiskCleanup {
             $proc = Start-Process -FilePath $cleanmgr -ArgumentList @('/d', 'C:', $sagerunArg) -WindowStyle Hidden -PassThru -ErrorAction Stop
             $exited = $proc.WaitForExit($script:DiskCleanupTimeoutMs)
             if (-not $exited) {
-                try { $proc.Kill() } catch { }
+                try { $proc.Kill() } catch { $null = $_ }
                 Add-CleanupWarning ("cleanmgr.exe did not exit within {0} minutes; the process was killed and the legacy Disk Cleanup step was skipped." -f [int]($script:DiskCleanupTimeoutMs / 60000))
                 $stats.Skipped++
             }
@@ -1134,10 +1202,10 @@ function Invoke-ComponentCleanup {
     $dismArgs = @('/Online', '/Cleanup-Image', '/StartComponentCleanup', '/Quiet')
     if ($ResetWindowsUpdateBase) {
         $dismArgs += '/ResetBase'
-        Write-Log -Level 'WARN' -Message 'Windows Update ResetBase mode is enabled; installed Windows updates cannot be uninstalled after this DISM cleanup.'
+        Write-CleanupLog -Level 'WARN' -Message 'Windows Update ResetBase mode is enabled; installed Windows updates cannot be uninstalled after this DISM cleanup.'
     }
 
-    Write-Log -Level 'INFO' -Message ("Attempting category '{0}' via dism.exe {1}" -f $category, ($dismArgs -join ' '))
+    Write-CleanupLog -Level 'INFO' -Message ("Attempting category '{0}' via dism.exe {1}" -f $category, ($dismArgs -join ' '))
 
     $stats = @{ FilesDeleted = 0L; DirectoriesDeleted = 0L; ReparsePointsDeleted = 0L; Skipped = 0L; Failed = 0L }
 
@@ -1145,7 +1213,7 @@ function Invoke-ComponentCleanup {
         $proc = Start-Process -FilePath $dism -ArgumentList $dismArgs -WindowStyle Hidden -PassThru -ErrorAction Stop
         $exited = $proc.WaitForExit($script:ExternalToolTimeoutMs)
         if (-not $exited) {
-            try { $proc.Kill() } catch { }
+            try { $proc.Kill() } catch { $null = $_ }
             Add-CleanupWarning "dism.exe did not exit within the timeout; the process was killed."
             $stats.Failed++
         }
@@ -1184,6 +1252,7 @@ function Get-DriverStoreSnapshot {
         }
         catch {
             # Snapshot is diagnostic only; cleanup can still proceed.
+            $null = $_
         }
     }
 
@@ -1204,9 +1273,14 @@ function Invoke-PnpCleanDriverPackageCleanup {
         New-Result -Category $category -Path $pnpclean -Skipped 1
         return
     }
+    if (-not (Test-IsAdministrator)) {
+        Add-CleanupWarning "Administrator privileges are required for pnpclean.dll; skipping Windows driver package cleanup handler."
+        New-Result -Category $category -Path $pnpclean -Skipped 1
+        return
+    }
 
     $script:AttemptedCategories.Add($category) | Out-Null
-    Write-Log -Level 'INFO' -Message ("Attempting category '{0}' via pnpclean.dll /DRIVERS /MAXCLEAN" -f $category)
+    Write-CleanupLog -Level 'INFO' -Message ("Attempting category '{0}' via pnpclean.dll /DRIVERS /MAXCLEAN" -f $category)
 
     $stats = @{ FilesDeleted = 0L; DirectoriesDeleted = 0L; ReparsePointsDeleted = 0L; Skipped = 0L; Failed = 0L }
     $before = Get-DriverStoreSnapshot
@@ -1221,7 +1295,7 @@ function Invoke-PnpCleanDriverPackageCleanup {
 
         $exited = $proc.WaitForExit($script:ExternalToolTimeoutMs)
         if (-not $exited) {
-            try { $proc.Kill() } catch { }
+            try { $proc.Kill() } catch { $null = $_ }
             Add-CleanupWarning "pnpclean.dll driver cleanup did not exit within the timeout; the process was killed."
             $stats.Failed++
         }
@@ -1242,10 +1316,10 @@ function Invoke-PnpCleanDriverPackageCleanup {
 
     $bytesFreed = $before.Bytes - $after.Bytes
     if ($bytesFreed -gt 0) {
-        Write-Log -Level 'INFO' -Message ("pnpclean.dll driver store reduction: {0} ({1:N0} bytes)." -f (Format-Bytes -Bytes $bytesFreed), $bytesFreed)
+        Write-CleanupLog -Level 'INFO' -Message ("pnpclean.dll driver store reduction: {0} ({1:N0} bytes)." -f (Format-Bytes -Bytes $bytesFreed), $bytesFreed)
     }
     else {
-        Write-Log -Level 'INFO' -Message 'pnpclean.dll did not report a measurable driver store size reduction.'
+        Write-CleanupLog -Level 'INFO' -Message 'pnpclean.dll did not report a measurable driver store size reduction.'
     }
 
     New-Result -Category $category -Path $pnpclean `
@@ -1254,6 +1328,255 @@ function Invoke-PnpCleanDriverPackageCleanup {
         -ReparsePointsDeleted $stats.ReparsePointsDeleted `
         -Skipped $stats.Skipped `
         -Failed $stats.Failed
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter(Mandatory = $true)]$InputObject,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+
+    $properties = @($InputObject.PSObject.Properties)
+    foreach ($name in $Names) {
+        $property = @($properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1)
+        if ($property.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$property[0].Value)) {
+            return ([string]$property[0].Value).Trim()
+        }
+    }
+
+    $normalizedNames = @($Names | ForEach-Object { ($_ -replace '[^A-Za-z0-9]', '').ToLowerInvariant() })
+    foreach ($property in $properties) {
+        $normalizedPropertyName = ($property.Name -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+        if ($normalizedNames -contains $normalizedPropertyName -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return ([string]$property.Value).Trim()
+        }
+    }
+
+    return $null
+}
+
+function ConvertTo-DriverDateVersion {
+    param(
+        [string]$DriverDateText,
+        [string]$DriverVersionText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DriverDateText) -and $DriverVersionText -match '^\s*(\d{1,4}[./-]\d{1,2}[./-]\d{1,4})\s+(.+?)\s*$') {
+        $DriverDateText = $Matches[1]
+        $DriverVersionText = $Matches[2]
+    }
+    elseif ([string]::IsNullOrWhiteSpace($DriverVersionText) -and $DriverDateText -match '^\s*(\d{1,4}[./-]\d{1,2}[./-]\d{1,4})\s+(.+?)\s*$') {
+        $DriverDateText = $Matches[1]
+        $DriverVersionText = $Matches[2]
+    }
+
+    $driverDate = [datetime]::MinValue
+    $dateParsed = $false
+    $dateFormats = @('M/d/yyyy', 'MM/dd/yyyy', 'd/M/yyyy', 'dd/MM/yyyy', 'yyyy-MM-dd', 'yyyy/MM/dd', 'd.M.yyyy', 'dd.MM.yyyy', 'M.d.yyyy', 'MM.dd.yyyy', 'yyyy.MM.dd')
+    if (-not [string]::IsNullOrWhiteSpace($DriverDateText)) {
+        foreach ($format in $dateFormats) {
+            if ([datetime]::TryParseExact($DriverDateText.Trim(), $format, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$driverDate)) {
+                $dateParsed = $true
+                break
+            }
+        }
+        if (-not $dateParsed) {
+            if ([datetime]::TryParse($DriverDateText.Trim(), [System.Globalization.CultureInfo]::CurrentCulture, [System.Globalization.DateTimeStyles]::None, [ref]$driverDate)) {
+                $dateParsed = $true
+            }
+        }
+    }
+
+    $driverVersion = [version]'0.0.0.0'
+    $versionParsed = $false
+    if (-not [string]::IsNullOrWhiteSpace($DriverVersionText)) {
+        $versionText = $DriverVersionText.Trim()
+        if ($versionText -match '(\d+(?:\.\d+){1,3})') {
+            $versionText = $Matches[1]
+        }
+        try {
+            $driverVersion = [version]$versionText
+            $versionParsed = $true
+        }
+        catch {
+            $versionParsed = $false
+        }
+    }
+
+    if (-not $dateParsed -or -not $versionParsed) { return $null }
+
+    return [PSCustomObject]@{
+        DriverDate = $driverDate
+        DriverVersion = $driverVersion
+    }
+}
+
+function New-DriverPackageRecord {
+    param(
+        [string]$PublishedName,
+        [string]$OriginalName,
+        [string]$ProviderName,
+        [string]$ClassName,
+        [string]$DriverDateText,
+        [string]$DriverVersionText
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PublishedName) -or
+        [string]::IsNullOrWhiteSpace($OriginalName) -or
+        [string]::IsNullOrWhiteSpace($ProviderName) -or
+        [string]::IsNullOrWhiteSpace($ClassName)) {
+        return $null
+    }
+
+    $parsedVersion = ConvertTo-DriverDateVersion -DriverDateText $DriverDateText -DriverVersionText $DriverVersionText
+    if (-not $parsedVersion) { return $null }
+
+    return [PSCustomObject]@{
+        PublishedName = $PublishedName.Trim()
+        OriginalName = $OriginalName.Trim().ToLowerInvariant()
+        ProviderName = $ProviderName.Trim().ToLowerInvariant()
+        ClassName = $ClassName.Trim().ToLowerInvariant()
+        DriverDate = $parsedVersion.DriverDate
+        DriverVersion = $parsedVersion.DriverVersion
+    }
+}
+
+function ConvertFrom-PnPUtilCsvOutput {
+    param([Parameter(Mandatory = $true)][string[]]$Lines)
+
+    $textLines = @($Lines | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $headerIndex = -1
+    for ($i = 0; $i -lt $textLines.Count; $i++) {
+        if ($textLines[$i] -match ',' -and $textLines[$i] -match 'Published|Original|Provider|Class|Driver') {
+            $headerIndex = $i
+            break
+        }
+    }
+    if ($headerIndex -lt 0) { return @() }
+
+    $csvText = ($textLines[$headerIndex..($textLines.Count - 1)] -join [Environment]::NewLine)
+    try {
+        $rows = @($csvText | ConvertFrom-Csv -ErrorAction Stop)
+    }
+    catch {
+        return @()
+    }
+
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($row in $rows) {
+        $record = New-DriverPackageRecord `
+            -PublishedName (Get-ObjectPropertyValue -InputObject $row -Names @('Published Name', 'PublishedName', 'Published', 'DriverName')) `
+            -OriginalName (Get-ObjectPropertyValue -InputObject $row -Names @('Original Name', 'OriginalName', 'Original INF Name', 'OriginalInfName')) `
+            -ProviderName (Get-ObjectPropertyValue -InputObject $row -Names @('Provider Name', 'ProviderName', 'Provider')) `
+            -ClassName (Get-ObjectPropertyValue -InputObject $row -Names @('Class Name', 'ClassName', 'Class')) `
+            -DriverDateText (Get-ObjectPropertyValue -InputObject $row -Names @('Driver Date', 'DriverDate', 'Date')) `
+            -DriverVersionText (Get-ObjectPropertyValue -InputObject $row -Names @('Driver Version', 'DriverVersion', 'Version'))
+        if ($record) { [void]$records.Add($record) }
+    }
+
+    return $records.ToArray()
+}
+
+function ConvertFrom-PnPUtilTextOutput {
+    param([Parameter(Mandatory = $true)][string[]]$Lines)
+
+    $drivers = New-Object 'System.Collections.Generic.List[object]'
+    $current = $null
+
+    foreach ($line in $Lines) {
+        $text = [string]$line
+
+        if ($text -match '^\s*Published Name\s*:\s*(.+?)\s*$') {
+            if ($current -and -not [string]::IsNullOrWhiteSpace($current.PublishedName)) {
+                $record = New-DriverPackageRecord @current
+                if ($record) { [void]$drivers.Add($record) }
+            }
+            $current = @{
+                PublishedName = $Matches[1].Trim()
+                OriginalName = $null
+                ProviderName = $null
+                ClassName = $null
+                DriverDateText = $null
+                DriverVersionText = $null
+            }
+            continue
+        }
+
+        if (-not $current) { continue }
+
+        if ($text -match '^\s*Original Name\s*:\s*(.+?)\s*$') {
+            $current.OriginalName = $Matches[1].Trim()
+        }
+        elseif ($text -match '^\s*Provider Name\s*:\s*(.+?)\s*$') {
+            $current.ProviderName = $Matches[1].Trim()
+        }
+        elseif ($text -match '^\s*Class Name\s*:\s*(.+?)\s*$') {
+            $current.ClassName = $Matches[1].Trim()
+        }
+        elseif ($text -match '^\s*Driver Version\s*:\s*(.+?)\s*$') {
+            $current.DriverDateText = $Matches[1].Trim()
+        }
+    }
+
+    if ($current -and -not [string]::IsNullOrWhiteSpace($current.PublishedName)) {
+        $record = New-DriverPackageRecord @current
+        if ($record) { [void]$drivers.Add($record) }
+    }
+
+    return $drivers.ToArray()
+}
+
+function Get-PnPUtilDriverPackages {
+    param([Parameter(Mandatory = $true)][string]$PnPUtilPath)
+
+    $csvLines = $null
+    try {
+        $csvLines = @(& $PnPUtilPath /enum-drivers /format csv 2>&1)
+        $csvExitCode = $LASTEXITCODE
+    }
+    catch {
+        $csvLines = $null
+        $csvExitCode = 1
+    }
+
+    if ($csvExitCode -eq 0 -and $csvLines) {
+        $csvDrivers = @(ConvertFrom-PnPUtilCsvOutput -Lines @($csvLines | ForEach-Object { [string]$_ }))
+        if ($csvDrivers.Count -gt 0) {
+            Write-CleanupLog -Level 'INFO' -Message 'Parsed pnputil driver list from locale-invariant CSV output.'
+            return @($csvDrivers)
+        }
+    }
+
+    $textLines = $null
+    try {
+        $textLines = @(& $PnPUtilPath /enum-drivers 2>&1)
+    }
+    catch {
+        throw "pnputil /enum-drivers failed: $($_.Exception.Message)"
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "pnputil /enum-drivers exited with code $LASTEXITCODE."
+    }
+
+    $textDrivers = @(ConvertFrom-PnPUtilTextOutput -Lines @($textLines | ForEach-Object { [string]$_ }))
+    if ($textDrivers.Count -eq 0 -and $csvLines) {
+        Add-CleanupWarning 'pnputil structured CSV output was unavailable or unparseable, and text fallback did not produce driver records. Driver cleanup was skipped safely.'
+    }
+    return @($textDrivers)
+}
+
+function Test-DriverPackageSuperseded {
+    param(
+        [Parameter(Mandatory = $true)]$Candidate,
+        [Parameter(Mandatory = $true)]$Newest
+    )
+
+    if ($Candidate.DriverDate -eq $Newest.DriverDate) {
+        return ($Candidate.DriverVersion -lt $Newest.DriverVersion)
+    }
+
+    return ($Candidate.DriverDate -lt $Newest.DriverDate -and $Candidate.DriverVersion -le $Newest.DriverVersion)
 }
 
 function Invoke-DriverPackageCleanup {
@@ -1267,77 +1590,17 @@ function Invoke-DriverPackageCleanup {
     }
 
     $script:AttemptedCategories.Add($category) | Out-Null
-    Write-Log -Level 'INFO' -Message ("Attempting category '{0}' via pnputil /enum-drivers + /delete-driver" -f $category)
+    Write-CleanupLog -Level 'INFO' -Message ("Attempting category '{0}' via pnputil /enum-drivers /format csv + /delete-driver" -f $category)
 
     $stats = @{ FilesDeleted = 0L; DirectoriesDeleted = 0L; ReparsePointsDeleted = 0L; Skipped = 0L; Failed = 0L }
 
-    $lines = $null
     try {
-        $lines = @(& $pnputil /enum-drivers 2>&1)
+        $drivers = @(Get-PnPUtilDriverPackages -PnPUtilPath $pnputil)
     }
     catch {
-        Add-CleanupWarning ("pnputil /enum-drivers failed: {0}" -f $_.Exception.Message)
+        Add-CleanupWarning $_.Exception.Message
         New-Result -Category $category -Path $pnputil -Failed 1
         return
-    }
-
-    if ($LASTEXITCODE -ne 0) {
-        Add-CleanupWarning ("pnputil /enum-drivers exited with code {0}." -f $LASTEXITCODE)
-        New-Result -Category $category -Path $pnputil -Failed 1
-        return
-    }
-
-    $drivers = New-Object 'System.Collections.Generic.List[object]'
-    $current = $null
-
-    foreach ($line in $lines) {
-        $text = [string]$line
-
-        if ($text -match '^\s*Published Name\s*:\s*(.+?)\s*$') {
-            if ($current -and -not [string]::IsNullOrWhiteSpace($current.PublishedName)) {
-                [void]$drivers.Add([PSCustomObject]$current)
-            }
-            $current = @{
-                PublishedName = $Matches[1].Trim()
-                OriginalName = $null
-                ProviderName = $null
-                ClassName = $null
-                DriverDate = [datetime]::MinValue
-                DriverVersion = [version]'0.0.0.0'
-            }
-            continue
-        }
-
-        if (-not $current) { continue }
-
-        if ($text -match '^\s*Original Name\s*:\s*(.+?)\s*$') {
-            $current.OriginalName = $Matches[1].Trim().ToLowerInvariant()
-        }
-        elseif ($text -match '^\s*Provider Name\s*:\s*(.+?)\s*$') {
-            $current.ProviderName = $Matches[1].Trim().ToLowerInvariant()
-        }
-        elseif ($text -match '^\s*Class Name\s*:\s*(.+?)\s*$') {
-            $current.ClassName = $Matches[1].Trim().ToLowerInvariant()
-        }
-        elseif ($text -match '^\s*Driver Version\s*:\s*(\d{1,2}/\d{1,2}/\d{4})\s+(.+?)\s*$') {
-            try {
-                $current.DriverDate = [datetime]::ParseExact($Matches[1], 'MM/dd/yyyy', [System.Globalization.CultureInfo]::InvariantCulture)
-            }
-            catch {
-                $current.DriverDate = [datetime]::MinValue
-            }
-
-            try {
-                $current.DriverVersion = [version]($Matches[2].Trim())
-            }
-            catch {
-                $current.DriverVersion = [version]'0.0.0.0'
-            }
-        }
-    }
-
-    if ($current -and -not [string]::IsNullOrWhiteSpace($current.PublishedName)) {
-        [void]$drivers.Add([PSCustomObject]$current)
     }
 
     $oemDrivers = @(
@@ -1355,8 +1618,9 @@ function Invoke-DriverPackageCleanup {
     }
 
     # Group by original INF + class + provider. Keep the newest by date/version and
-    # ask pnputil to delete older packages. No /force or /uninstall flags are used:
-    # pnputil will refuse anything still bound to a present device.
+    # ask pnputil to delete only packages that are older by date and not newer by
+    # version, or same-date lower-version packages. No /force or /uninstall flags
+    # are used: pnputil will refuse anything still bound to a present device.
     $groups = $oemDrivers | Group-Object -Property OriginalName, ClassName, ProviderName
     $candidates = New-Object 'System.Collections.Generic.List[object]'
 
@@ -1369,7 +1633,7 @@ function Invoke-DriverPackageCleanup {
         $newest = @($sorted | Select-Object -First 1)[0]
         $older = @(
             $sorted | Select-Object -Skip 1 | Where-Object {
-                $_.DriverDate -lt $newest.DriverDate -or $_.DriverVersion -lt $newest.DriverVersion
+                Test-DriverPackageSuperseded -Candidate $_ -Newest $newest
             }
         )
 
@@ -1379,12 +1643,12 @@ function Invoke-DriverPackageCleanup {
     }
 
     if ($candidates.Count -eq 0) {
-        Write-Log -Level 'INFO' -Message "No superseded driver packages were found."
+        Write-CleanupLog -Level 'INFO' -Message "No superseded driver packages were found."
         New-Result -Category $category -Path $pnputil
         return
     }
 
-    Write-Log -Level 'INFO' -Message ("Found {0} superseded driver package candidate(s); attempting removal." -f $candidates.Count)
+    Write-CleanupLog -Level 'INFO' -Message ("Found {0} superseded driver package candidate(s); attempting removal." -f $candidates.Count)
 
     foreach ($drv in $candidates) {
         $publishedName = $null
@@ -1394,7 +1658,7 @@ function Invoke-DriverPackageCleanup {
             continue
         }
 
-        Write-Log -Level 'INFO' -Message ("Trying superseded driver package removal: {0} ({1}, {2}, {3}, {4})" -f `
+        Write-CleanupLog -Level 'INFO' -Message ("Trying superseded driver package removal: {0} ({1}, {2}, {3}, {4})" -f `
             $publishedName, $drv.OriginalName, $drv.ProviderName, $drv.DriverDate.ToString('yyyy-MM-dd'), $drv.DriverVersion)
 
         try {
@@ -1403,12 +1667,12 @@ function Invoke-DriverPackageCleanup {
                 $stats.FilesDeleted++
             }
             else {
-                # Non-zero exit codes are expected here: pnputil refuses to delete a driver
-                # that is in use, was already removed, or otherwise cannot be cleaned. Skip.
+                Write-CleanupLog -Level 'INFO' -Message ("pnputil refused or skipped driver package {0}; exit code {1}." -f $publishedName, $proc.ExitCode)
                 $stats.Skipped++
             }
         }
         catch {
+            Write-CleanupLog -Level 'INFO' -Message ("pnputil could not delete driver package {0}: {1}" -f $publishedName, $_.Exception.Message)
             $stats.Skipped++
         }
     }
@@ -1421,10 +1685,22 @@ function Invoke-DriverPackageCleanup {
         -Failed $stats.Failed
 }
 
+function Test-RecycleBinDriveCHasFiles {
+    try {
+        if (-not (Test-Path -LiteralPath 'C:\$Recycle.Bin' -PathType Container)) { return $false }
+        $firstFile = Get-ChildItem -LiteralPath 'C:\$Recycle.Bin' -Force -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        return ($null -ne $firstFile)
+    }
+    catch {
+        # If enumeration itself fails, let Clear-RecycleBin be the source of truth.
+        return $true
+    }
+}
+
 function Clear-RecycleBinDriveC {
     $category = 'Recycle Bin (drive C: only)'
     $script:AttemptedCategories.Add($category) | Out-Null
-    Write-Log -Level 'INFO' -Message ("Attempting category '{0}'" -f $category)
+    Write-CleanupLog -Level 'INFO' -Message ("Attempting category '{0}'" -f $category)
 
     $stats = @{ FilesDeleted = 0L; DirectoriesDeleted = 0L; ReparsePointsDeleted = 0L; Skipped = 0L; Failed = 0L }
 
@@ -1439,17 +1715,23 @@ function Clear-RecycleBinDriveC {
         return
     }
 
-    try {
-        Clear-RecycleBin -DriveLetter 'C' -Force -ErrorAction Stop
+    if (-not (Test-RecycleBinDriveCHasFiles)) {
+        $stats.Skipped++
     }
-    catch {
-        # Empty Recycle Bin throws a non-fatal exception. Treat it as skipped.
-        if ($_.Exception.Message -match 'empty|not\s+find') {
-            $stats.Skipped++
+    else {
+        try {
+            Clear-RecycleBin -DriveLetter 'C' -Force -ErrorAction Stop
         }
-        else {
-            Add-CleanupWarning ("Clear-RecycleBin failed for drive C: {0}" -f $_.Exception.Message)
-            $stats.Failed++
+        catch {
+            # Empty Recycle Bin messages are localized. Confirm by state instead
+            # of matching text from the exception message.
+            if (-not (Test-RecycleBinDriveCHasFiles)) {
+                $stats.Skipped++
+            }
+            else {
+                Add-CleanupWarning ("Clear-RecycleBin failed for drive C: {0}" -f $_.Exception.Message)
+                $stats.Failed++
+            }
         }
     }
 
@@ -1464,9 +1746,9 @@ function Clear-RecycleBinDriveC {
 }
 
 function Write-RunHeader {
-    Write-Log -Level 'INFO' -Message 'WindowsAutoCleanup started.'
-    Write-Log -Level 'INFO' -Message ('Start time: {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
-    Write-Log -Level 'INFO' -Message ('Admin rights active: {0}' -f (Test-IsAdministrator))
+    Write-CleanupLog -Level 'INFO' -Message 'WindowsAutoCleanup started.'
+    Write-CleanupLog -Level 'INFO' -Message ('Start time: {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    Write-CleanupLog -Level 'INFO' -Message ('Admin rights active: {0}' -f (Test-IsAdministrator))
 
     # Log the PowerShell host that is actually executing the script so it can be
     # distinguished from the host that double-click associated with the .ps1 file.
@@ -1476,27 +1758,28 @@ function Write-RunHeader {
         $edition = if ($PSVersionTable.ContainsKey('PSEdition')) { $PSVersionTable.PSEdition } else { 'Desktop' }
         $versionString = '{0} {1} ({2})' -f $(if ($edition -eq 'Core') { 'PowerShell' } else { 'Windows PowerShell' }), $PSVersionTable.PSVersion, $edition
         if ($hostPath) {
-            Write-Log -Level 'INFO' -Message ('PowerShell host: {0} at {1}' -f $versionString, $hostPath)
+            Write-CleanupLog -Level 'INFO' -Message ('PowerShell host: {0} at {1}' -f $versionString, $hostPath)
         } else {
-            Write-Log -Level 'INFO' -Message ('PowerShell host: {0}' -f $versionString)
+            Write-CleanupLog -Level 'INFO' -Message ('PowerShell host: {0}' -f $versionString)
         }
     }
     catch {
-        Write-Log -Level 'WARN' -Message ('Could not determine PowerShell host: {0}' -f $_.Exception.Message)
+        Write-CleanupLog -Level 'WARN' -Message ('Could not determine PowerShell host: {0}' -f $_.Exception.Message)
     }
 
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        Write-Log -Level 'INFO' -Message ('OS version: {0} build {1}' -f $os.Caption, $os.BuildNumber)
+        Write-CleanupLog -Level 'INFO' -Message ('OS version: {0} build {1}' -f $os.Caption, $os.BuildNumber)
     }
     catch {
-        Write-Log -Level 'WARN' -Message ('Could not query OS version: {0}' -f $_.Exception.Message)
+        Write-CleanupLog -Level 'WARN' -Message ('Could not query OS version: {0}' -f $_.Exception.Message)
     }
-    Write-Log -Level 'INFO' -Message ('Windows Server detected: {0}' -f (Test-IsWindowsServer))
+    Write-CleanupLog -Level 'INFO' -Message ('Windows Server detected: {0}' -f (Test-IsWindowsServer))
 
-    Write-Log -Level 'INFO' -Message 'Cleanup scope: drive C: only.'
-    Write-Log -Level 'INFO' -Message 'Cleanup mode: allow-list locations + cleanmgr Disk Cleanup + DISM component cleanup + pnpclean/pnputil driver cleanup + Recycle Bin (C:).'
-    Write-Log -Level 'INFO' -Message ('Windows Update ResetBase mode: {0}' -f ([bool]$ResetWindowsUpdateBase))
+    Write-CleanupLog -Level 'INFO' -Message 'Cleanup scope: drive C: only.'
+    Write-CleanupLog -Level 'INFO' -Message 'Cleanup mode: allow-list locations + cleanmgr Disk Cleanup + DISM component cleanup + pnpclean/pnputil driver cleanup + Recycle Bin (C:).'
+    Write-CleanupLog -Level 'INFO' -Message ('Windows Update ResetBase mode: {0}' -f ([bool]$ResetWindowsUpdateBase))
+    Write-CleanupLog -Level 'INFO' -Message ('Script folder ACL hardening disabled by parameter: {0}' -f ([bool]$SkipAclHardening))
 }
 
 function Write-RunFooter {
@@ -1505,42 +1788,42 @@ function Write-RunFooter {
 
     $uniqueCategories = @($script:AttemptedCategories | Sort-Object -Unique)
     if ($uniqueCategories.Count -gt 0) {
-        Write-Log -Level 'INFO' -Message ('Cleanup categories attempted: {0}' -f ($uniqueCategories -join '; '))
+        Write-CleanupLog -Level 'INFO' -Message ('Cleanup categories attempted: {0}' -f ($uniqueCategories -join '; '))
     }
     else {
-        Write-Log -Level 'INFO' -Message 'Cleanup categories attempted: none'
+        Write-CleanupLog -Level 'INFO' -Message 'Cleanup categories attempted: none'
     }
 
     foreach ($result in $script:Results) {
-        Write-Log -Level 'INFO' -Message ('Result | Category="{0}" | Path="{1}" | Files={2} | Directories={3} | ReparsePoints={4} | PendingDeleteOnReboot={5} | Skipped={6} | Failed={7}' -f `
+        Write-CleanupLog -Level 'INFO' -Message ('Result | Category="{0}" | Path="{1}" | Files={2} | Directories={3} | ReparsePoints={4} | PendingDeleteOnReboot={5} | Skipped={6} | Failed={7}' -f `
             $result.Category, $result.Path, $result.FilesDeleted, $result.DirectoriesDeleted, $result.ReparsePointsDeleted, $result.PendingDeletes, $result.Skipped, $result.Failed)
     }
 
-    Write-Log -Level 'INFO' -Message ('Total files removed: {0}' -f $script:TotalFilesDeleted)
-    Write-Log -Level 'INFO' -Message ('Total directories removed: {0}' -f $script:TotalDirectoriesDeleted)
-    Write-Log -Level 'INFO' -Message ('Total reparse points removed: {0}' -f $script:TotalReparsePointsDeleted)
-    Write-Log -Level 'INFO' -Message ('Pending deletes on reboot: {0}' -f $script:TotalPendingDeletes)
-    Write-Log -Level 'INFO' -Message ('Skipped items summary: {0}' -f $script:TotalSkipped)
-    Write-Log -Level 'INFO' -Message ('Failed items summary: {0}' -f $script:TotalFailed)
+    Write-CleanupLog -Level 'INFO' -Message ('Total files removed: {0}' -f $script:TotalFilesDeleted)
+    Write-CleanupLog -Level 'INFO' -Message ('Total directories removed: {0}' -f $script:TotalDirectoriesDeleted)
+    Write-CleanupLog -Level 'INFO' -Message ('Total reparse points removed: {0}' -f $script:TotalReparsePointsDeleted)
+    Write-CleanupLog -Level 'INFO' -Message ('Pending deletes on reboot: {0}' -f $script:TotalPendingDeletes)
+    Write-CleanupLog -Level 'INFO' -Message ('Skipped items summary: {0}' -f $script:TotalSkipped)
+    Write-CleanupLog -Level 'INFO' -Message ('Failed items summary: {0}' -f $script:TotalFailed)
 
     $bytesFreed = $null
     if ($null -ne $script:StartFreeBytesC -and $null -ne $script:EndFreeBytesC) {
         $bytesFreed = [int64]($script:EndFreeBytesC - $script:StartFreeBytesC)
     }
-    Write-Log -Level 'INFO' -Message ('Bytes freed where practical: {0}' -f (Format-Bytes -Bytes $bytesFreed))
+    Write-CleanupLog -Level 'INFO' -Message ('Bytes freed where practical: {0}' -f (Format-Bytes -Bytes $bytesFreed))
 
     foreach ($warning in $script:Warnings) {
-        Write-Log -Level 'WARN' -Message ('Summary warning: {0}' -f $warning)
+        Write-CleanupLog -Level 'WARN' -Message ('Summary warning: {0}' -f $warning)
     }
 
     if ($script:TotalFailed -gt 0 -or $script:Warnings.Count -gt 0) {
-        Write-Log -Level 'WARN' -Message 'Final status: completed with warnings.'
+        Write-CleanupLog -Level 'WARN' -Message 'Final status: completed with warnings.'
     }
     else {
-        Write-Log -Level 'INFO' -Message 'Final status: success.'
+        Write-CleanupLog -Level 'INFO' -Message 'Final status: success.'
     }
 
-    Write-Log -Level 'INFO' -Message ('Total time elapsed: {0}' -f $elapsed)
+    Write-CleanupLog -Level 'INFO' -Message ('Total time elapsed: {0}' -f $elapsed)
 }
 
 try {
@@ -1549,11 +1832,16 @@ try {
     Write-RunHeader
 
     if (-not (Test-IsAdministrator)) {
-        Write-Log -Level 'ERROR' -Message 'Administrator privileges are required.'
+        Write-CleanupLog -Level 'ERROR' -Message 'Administrator privileges are required.'
         exit 1
     }
 
-    Invoke-ScriptRootAclHardening
+    if ($SkipAclHardening) {
+        Write-CleanupLog -Level 'INFO' -Message 'Script folder ACL hardening skipped by -SkipAclHardening.'
+    }
+    else {
+        Invoke-ScriptRootAclHardening
+    }
 
     $script:StartFreeBytesC = Get-CDriveFreeBytes
 
@@ -1583,7 +1871,7 @@ try {
 }
 catch {
     if (-not $script:LogPath) { Initialize-Log }
-    Write-Log -Level 'ERROR' -Message ('Unhandled error: {0}' -f $_.Exception.Message)
+    Write-CleanupLog -Level 'ERROR' -Message ('Unhandled error: {0}' -f $_.Exception.Message)
     Write-RunFooter
     exit 1
 }
