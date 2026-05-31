@@ -19,9 +19,13 @@
     Do not wait for a key press before exiting. Intended for automation and tests.
 
 .PARAMETER ResetWindowsUpdateBase
-    Adds -ResetWindowsUpdateBase to the scheduled Run.ps1 action. Enabled by
-    default. This enables DISM /ResetBase and makes installed Windows updates
+    Adds the ResetWindowsUpdateBase value to the scheduled Run.ps1 action. Enabled
+    by default. This enables DISM /ResetBase and makes installed Windows updates
     non-uninstallable. Pass -ResetWindowsUpdateBase:$false to disable it.
+
+.PARAMETER SkipAclHardening
+    Adds -SkipAclHardening to the scheduled Run.ps1 action so normal users keep
+    write access to the project folder for development or Git workflows.
 #>
 
 [CmdletBinding()]
@@ -36,7 +40,10 @@ param(
 
     # Aggressive Windows Update component cleanup for scheduled runs is enabled by
     # default. Installed Windows updates cannot be uninstalled after DISM /ResetBase.
-    [switch]$ResetWindowsUpdateBase = $true
+    [switch]$ResetWindowsUpdateBase = $true,
+
+    # Keep normal-user write access to the project folder for development/Git checkouts.
+    [switch]$SkipAclHardening
 )
 
 Set-StrictMode -Version 2.0
@@ -60,7 +67,13 @@ function Initialize-InstallerLog {
         New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction Stop | Out-Null
     }
     catch {
-        $fallbackRoot = if ($env:TEMP) { $env:TEMP } else { 'C:\Windows\Temp' }
+        $fallbackRoot = if ($env:ProgramData) { Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\Logs' } else { Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup' }
+        try {
+            if (-not (Test-Path -LiteralPath $fallbackRoot -PathType Container)) {
+                New-Item -Path $fallbackRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            }
+        }
+        catch { $null = $_ }
         $script:LogPath = Join-Path -Path $fallbackRoot -ChildPath ('Install-WindowsAutoCleanupTask_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
         New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
     }
@@ -80,7 +93,7 @@ function Write-InstallerLine {
         default   { Write-Host $line -ForegroundColor White }
     }
     if ($script:LogPath) {
-        try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 -ErrorAction Stop } catch { }
+        try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 -ErrorAction Stop } catch { $null = $_ }
     }
 }
 
@@ -96,7 +109,7 @@ function Wait-InstallerExit {
         $null = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
     }
     catch {
-        try { Read-Host -Prompt 'Press Enter to close this window' | Out-Null } catch { }
+        try { Read-Host -Prompt 'Press Enter to close this window' | Out-Null } catch { $null = $_ }
     }
 }
 
@@ -113,9 +126,12 @@ function Test-IsAdministrator {
 
 function Get-PreferredPowerShellPath {
     # Prefer PowerShell 7 (pwsh.exe) when available; fall back to Windows PowerShell 5.1.
-    $pwshCmd = Get-Command -Name 'pwsh.exe' -ErrorAction SilentlyContinue
-    if ($pwshCmd -and $pwshCmd.Source -and (Test-Path -LiteralPath $pwshCmd.Source -PathType Leaf)) {
-        return $pwshCmd.Source
+    $pwshCmd = @(Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($pwshCmd.Count -gt 0) {
+        $pwshPath = [string]$pwshCmd[0].Source
+        if ($pwshPath -and (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
+            return $pwshPath
+        }
     }
 
     if ($env:ProgramFiles) {
@@ -138,8 +154,11 @@ function Invoke-ElevatedRelaunchIfNeeded {
     $scriptArg = '"{0}"' -f $PSCommandPath
     $dailyRunTimeArg = '"{0}"' -f $DailyRunTime
     $childArgs = '-NoProfile -ExecutionPolicy Bypass -File {0} -DailyRunTime {1}' -f $scriptArg, $dailyRunTimeArg
-    if ($ResetWindowsUpdateBase) {
-        $childArgs = '{0} -ResetWindowsUpdateBase' -f $childArgs
+    if ($PSBoundParameters.ContainsKey('ResetWindowsUpdateBase')) {
+        $childArgs = '{0} -ResetWindowsUpdateBase:${1}' -f $childArgs, ([bool]$ResetWindowsUpdateBase).ToString().ToLowerInvariant()
+    }
+    if ($SkipAclHardening) {
+        $childArgs = '{0} -SkipAclHardening' -f $childArgs
     }
     if ($NoPause) {
         $childArgs = '{0} -NoPause' -f $childArgs
@@ -181,6 +200,7 @@ try {
     }
     Write-InstallerLine -Level INFO -Message ("Main script: {0}" -f $mainScript)
     Write-InstallerLine -Level INFO -Message ("Windows Update ResetBase scheduled mode: {0}" -f ([bool]$ResetWindowsUpdateBase))
+    Write-InstallerLine -Level INFO -Message ("Scheduled ACL hardening disabled: {0}" -f ([bool]$SkipAclHardening))
 
     try {
         $runTime = [DateTime]::ParseExact($DailyRunTime, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
@@ -208,9 +228,9 @@ try {
     }
 
     $quotedMainScript = '"{0}"' -f $mainScript
-    $taskArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -Scheduled' -f $quotedMainScript
-    if ($ResetWindowsUpdateBase) {
-        $taskArguments = '{0} -ResetWindowsUpdateBase' -f $taskArguments
+    $taskArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -Scheduled -ResetWindowsUpdateBase:${1}' -f $quotedMainScript, ([bool]$ResetWindowsUpdateBase).ToString().ToLowerInvariant()
+    if ($SkipAclHardening) {
+        $taskArguments = '{0} -SkipAclHardening' -f $taskArguments
     }
 
     $action = New-ScheduledTaskAction -Execute $taskHost -Argument $taskArguments -WorkingDirectory $script:ScriptRoot
@@ -285,8 +305,12 @@ try {
     if ($registeredActionArguments -notmatch '(^|\s)-WindowStyle\s+Hidden(\s|$)' -or $registeredActionArguments -notmatch '(^|\s)-Scheduled(\s|$)') {
         throw "Scheduled task was registered, but its action arguments are missing -WindowStyle Hidden or -Scheduled."
     }
-    if ($ResetWindowsUpdateBase -and $registeredActionArguments -notmatch '(^|\s)-ResetWindowsUpdateBase(\s|$)') {
-        throw "Scheduled task was registered, but its action arguments are missing -ResetWindowsUpdateBase."
+    $expectedResetBaseArgument = '-ResetWindowsUpdateBase:${0}' -f ([bool]$ResetWindowsUpdateBase).ToString().ToLowerInvariant()
+    if ($registeredActionArguments -notmatch [regex]::Escape($expectedResetBaseArgument)) {
+        throw "Scheduled task was registered, but its action arguments are missing $expectedResetBaseArgument."
+    }
+    if ($SkipAclHardening -and $registeredActionArguments -notmatch '(^|\s)-SkipAclHardening(\s|$)') {
+        throw "Scheduled task was registered, but its action arguments are missing -SkipAclHardening."
     }
 
     Write-InstallerLine -Level SUCCESS -Message ("Scheduled task '{0}' is registered." -f $TaskName)
@@ -297,6 +321,13 @@ try {
     Write-InstallerLine -Level INFO -Message ("Task compatibility: {0}" -f $registeredCompatibility)
     Write-InstallerLine -Level INFO -Message ("Task principal: {0} / {1}" -f $registeredUserId, $registeredLogonType)
     Write-InstallerLine -Level INFO -Message ("Task action: {0} {1}" -f $registeredActionExecute, $registeredActionArguments)
+    try {
+        $registeredInfo = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+        Write-InstallerLine -Level INFO -Message ("Task next run time: {0}" -f $registeredInfo.NextRunTime)
+    }
+    catch {
+        Write-InstallerLine -Level WARN -Message ("Could not read task next run time: {0}" -f $_.Exception.Message)
+    }
     Write-InstallerLine -Level SUCCESS -Message 'Final status: success.'
 
     Wait-InstallerExit

@@ -36,7 +36,7 @@ function Assert-NotMatches {
     if ($Text -match $Pattern) { throw $Message }
 }
 
-function Parse-PowerShellFile {
+function ConvertFrom-PowerShellFile {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $tokens = $null
@@ -55,9 +55,9 @@ $installerScript = Join-Path -Path $repoRoot -ChildPath 'Install-WindowsAutoClea
 $uninstallerScript = Join-Path -Path $repoRoot -ChildPath 'Uninstall-WindowsAutoCleanupTask.ps1'
 $readmePath = Join-Path -Path $repoRoot -ChildPath 'README.md'
 
-$mainAst = Parse-PowerShellFile -Path $mainScript
-[void](Parse-PowerShellFile -Path $installerScript)
-[void](Parse-PowerShellFile -Path $uninstallerScript)
+$mainAst = ConvertFrom-PowerShellFile -Path $mainScript
+[void](ConvertFrom-PowerShellFile -Path $installerScript)
+[void](ConvertFrom-PowerShellFile -Path $uninstallerScript)
 
 $mainText = Get-Content -LiteralPath $mainScript -Raw
 $installerText = Get-Content -LiteralPath $installerScript -Raw
@@ -103,14 +103,19 @@ Assert-Matches -Text $mainText -Pattern 'legacy Disk Cleanup step was skipped[\s
 Assert-Matches -Text $mainText -Pattern 'Invoke-ComponentCleanup[\s\S]*Invoke-DiskCleanup' -Message 'DISM component cleanup must run before cleanmgr.'
 Assert-Matches -Text $installerText -Pattern '\[switch\]\$ResetWindowsUpdateBase\s*=\s*\$true' -Message 'Installer must enable ResetWindowsUpdateBase in the scheduled task by default.'
 Assert-Matches -Text $installerText -Pattern 'childArgs.*-DailyRunTime' -Message 'Installer self-elevation must preserve -DailyRunTime.'
-Assert-Matches -Text $installerText -Pattern 'childArgs.*-ResetWindowsUpdateBase' -Message 'Installer self-elevation must preserve -ResetWindowsUpdateBase.'
+Assert-Matches -Text $mainText -Pattern 'childArgs.*-ResetWindowsUpdateBase:' -Message 'Main script self-elevation must preserve explicit ResetWindowsUpdateBase true/false values.'
+Assert-Matches -Text $installerText -Pattern 'childArgs.*-ResetWindowsUpdateBase:' -Message 'Installer self-elevation must preserve explicit ResetWindowsUpdateBase true/false values.'
 Assert-Matches -Text $installerText -Pattern 'childArgs.*-NoPause' -Message 'Installer self-elevation must preserve -NoPause.'
-Assert-Matches -Text $installerText -Pattern 'taskArguments.*-ResetWindowsUpdateBase' -Message 'Installer must add ResetWindowsUpdateBase to the scheduled action when requested.'
+Assert-Matches -Text $installerText -Pattern 'taskArguments.*-ResetWindowsUpdateBase:' -Message 'Installer must always add the explicit ResetWindowsUpdateBase true/false value to the scheduled action.'
+Assert-Matches -Text $mainText -Pattern '\[switch\]\$SkipAclHardening' -Message 'Main script must support -SkipAclHardening for development checkouts.'
+Assert-Matches -Text $installerText -Pattern '\[switch\]\$SkipAclHardening' -Message 'Installer must support -SkipAclHardening for scheduled runs.'
 Assert-Matches -Text $installerText -Pattern 'ExecutionTimeLimit\s+\(New-TimeSpan -Hours 4\)' -Message 'Scheduled task must allow enough time for DISM plus cleanmgr on Server builds.'
 Assert-Matches -Text $uninstallerText -Pattern '\[switch\]\$NoPause' -Message 'Uninstaller must support -NoPause for automation.'
 Assert-Matches -Text $uninstallerText -Pattern 'childArgs.*-NoPause' -Message 'Uninstaller self-elevation must preserve -NoPause.'
 Assert-Matches -Text $uninstallerText -Pattern 'Unregister-ScheduledTask.*-TaskPath\s+\$TaskPath' -Message 'Uninstaller must remove the explicit root TaskPath.'
 Assert-Matches -Text $mainText -Pattern 'pnputil\s+/enum-drivers' -Message 'Driver cleanup should enumerate the same driver store view exposed by pnputil.'
+Assert-Matches -Text $mainText -Pattern '/format\s+csv' -Message 'Driver cleanup should prefer locale-invariant pnputil CSV output.'
+Assert-Matches -Text $mainText -Pattern 'ConvertFrom-Csv' -Message 'Driver cleanup should parse structured pnputil output.'
 Assert-NotMatches -Text $mainText -Pattern 'Get-WindowsDriver\s+-Online' -Message 'Driver cleanup should not depend only on Get-WindowsDriver for superseded package detection.'
 Assert-Matches -Text $mainText -Pattern 'RunDLL_PnpClean' -Message 'Driver cleanup should invoke the Windows pnpclean handler used by Disk Cleanup.'
 Assert-Matches -Text $mainText -Pattern '/DRIVERS' -Message 'pnpclean driver cleanup should pass /DRIVERS.'
@@ -122,6 +127,8 @@ Assert-Matches -Text $mainText -Pattern 'S-1-5-32-544' -Message 'ACL hardening s
 Assert-Matches -Text $mainText -Pattern 'S-1-5-32-545' -Message 'ACL hardening should limit regular Users.'
 Assert-Matches -Text $mainText -Pattern 'ReadAndExecute' -Message 'ACL hardening should leave regular users with read/execute only.'
 Assert-Matches -Text $mainText -Pattern 'SetAccessRuleProtection\(\$true,\s*\$false\)' -Message 'ACL hardening should disable inherited write/delete permissions.'
+Assert-Matches -Text $mainText -Pattern 'ProgramData.*WindowsAutoCleanup' -Message 'Log fallback should avoid TEMP locations that the script cleans.'
+Assert-NotMatches -Text $mainText -Pattern 'foreach \(\$profile in Get-UserProfileDirectories\)' -Message 'Cleanup target enumeration must not shadow the PowerShell $profile automatic variable.'
 
 # Load only function definitions from the main script. This gives real function-level
 # coverage without executing the destructive cleanup entry point.
@@ -147,6 +154,8 @@ foreach ($functionDefinition in $functionDefinitions) {
 }
 
 Assert-Condition -Condition ((Get-NormalizedPath -Path 'C:') -eq 'C:') -Message 'Bare drive paths must normalize to the drive root form.'
+Assert-Condition -Condition (-not (Test-IsOnCDrive -Path 'C:foo')) -Message 'Drive-relative paths must be rejected instead of resolving against per-drive CWD.'
+Assert-Condition -Condition (Test-IsOnCDrive -Path '\\?\C:\Windows\Temp') -Message 'Extended-length C: paths should stay inside the C: allow-list.'
 Assert-Condition -Condition (Test-IsOnCDrive -Path 'C:\Windows\Temp') -Message 'C:\Windows\Temp should be recognized as on C:.'
 Assert-Condition -Condition (-not (Test-IsOnCDrive -Path 'D:\Temp')) -Message 'Non-C: paths must be rejected.'
 Assert-Condition -Condition (Test-IsProtectedPath -Path 'C:\Windows') -Message 'Protected roots must remain protected.'
@@ -156,6 +165,7 @@ Assert-Condition -Condition (Test-IsSafeScriptRootForAclHardening) -Message 'Rep
 
 $targets = @(Get-CleanupTargets)
 Assert-Condition -Condition ($targets.Count -gt 0) -Message 'Get-CleanupTargets should produce cleanup targets.'
+Assert-Condition -Condition (-not (($targets.Path -join ';') -match 'C:\\Users\\(?:Public|Default)\\')) -Message 'Get-CleanupTargets should exclude non-interactive Public and Default profile templates.'
 foreach ($target in $targets) {
     Assert-Condition -Condition (Test-IsOnCDrive -Path $target.Path) -Message "Cleanup target must stay on C:: $($target.Path)"
 }
@@ -191,5 +201,19 @@ $diskCleanupDirectTargets = @(
     }
 )
 Assert-Condition -Condition ($diskCleanupDirectTargets.Count -gt 0) -Message 'Get-CleanupTargets should include direct targets for stubborn Disk Cleanup categories.'
+
+$csvDrivers = @(ConvertFrom-PnPUtilCsvOutput -Lines @(
+    'DriverName,OriginalName,ProviderName,ClassName,DriverVersion',
+    'oem10.inf,driver.inf,Vendor,System,2024-01-02 2.3.4.5'
+))
+Assert-Condition -Condition ($csvDrivers.Count -eq 1 -and $csvDrivers[0].PublishedName -eq 'oem10.inf') -Message 'pnputil CSV parser should produce driver records.'
+$dotDateCsvDrivers = @(ConvertFrom-PnPUtilCsvOutput -Lines @(
+    'DriverName,OriginalName,ProviderName,ClassName,DriverVersion',
+    'oem11.inf,driver.inf,Vendor,System,14.02.2022 1.2.0.44'
+))
+Assert-Condition -Condition ($dotDateCsvDrivers.Count -eq 1 -and $dotDateCsvDrivers[0].DriverDate -eq [datetime]'2022-02-14') -Message 'pnputil CSV parser should accept dot-separated locale date values.'
+$newestDriver = [PSCustomObject]@{ DriverDate = [datetime]'2024-01-01'; DriverVersion = [version]'1.0.0.0' }
+$sideBranchDriver = [PSCustomObject]@{ DriverDate = [datetime]'2023-12-01'; DriverVersion = [version]'2.0.0.0' }
+Assert-Condition -Condition (-not (Test-DriverPackageSuperseded -Candidate $sideBranchDriver -Newest $newestDriver)) -Message 'Driver cleanup must not delete a higher-version side branch only because its date is older.'
 
 Write-Host 'Validation passed.'
