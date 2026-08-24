@@ -10,11 +10,13 @@
     there, so the elevation branch has to fail closed with exit code 4 and nothing is registered,
     deployed or deleted anywhere.
 
-    That child is started through runas /trustlevel:0x20000, which hands it a Basic User token. The
-    test therefore never depends on how the test process itself is running: an ELEVATED runner (all
-    of GitHub's windows-latest images) would otherwise walk straight past the elevation branch and
-    into code that talks to the live Task Scheduler. Every child is bounded by a wall-clock
-    deadline, and its process tree is killed if it overruns.
+    That child is started under a SAFER normal-user token by Start-TestRestrictedProcess, so the
+    test never depends on how the test process itself is running: an ELEVATED runner (all of
+    GitHub's windows-latest images) would otherwise walk straight past the elevation branch and into
+    code that talks to the live Task Scheduler. The child REPORTS the token it got and a child that
+    came back elevated fails the run, because every assertion here is only worth something against
+    an unprivileged one. Every child is bounded by a wall-clock deadline and killed with its tree if
+    it overruns.
 #>
 
 Set-StrictMode -Version 2.0
@@ -40,81 +42,75 @@ function ConvertTo-WrapperLiteral {
     return ("'" + $Value.Replace("'", "''") + "'")
 }
 
-function Wait-ChildProcessExit {
-    <#
-    .SYNOPSIS
-        Waits, bounded, for the process whose id the wrapper recorded. Returns $true when it is gone.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$PidFile,
-        [ValidateRange(1, 120)][int]$TimeoutSeconds = 20
-    )
-
-    if (-not (Test-Path -LiteralPath $PidFile -PathType Leaf)) { return $true }
-
-    $childId = 0
-    if (-not [int]::TryParse(([System.IO.File]::ReadAllText($PidFile).Trim()), [ref]$childId)) { return $true }
-    if ($childId -le 0) { return $true }
-
-    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
-    while ([datetime]::UtcNow -lt $deadline) {
-        try { $null = [System.Diagnostics.Process]::GetProcessById($childId) }
-        catch { return $true }
-        Start-Sleep -Milliseconds 100
-    }
-
-    return $false
-}
-
 function Start-BoundedWrapper {
     <#
     .SYNOPSIS
-        Starts one launcher, waits for it, then waits, bounded, for the wrapper's result file.
+        Runs the wrapper as a bounded child and reports whether it left its result file behind.
     .DESCRIPTION
-        runas hands its child off instead of waiting for it, so the exit code has to arrive through
-        a file the wrapper writes last. Both waits are bounded; the bound expiring IS the detected
-        failure, and the caller kills the recorded process tree.
+        The wrapper is a REAL child now, whether it was started under the restricted token or, on an
+        unelevated host that could not produce one, as an ordinary process. So the bound is a wait on
+        its own handle, the result file is already written by the time that wait returns - the
+        wrapper writes it before it exits - and an overrun is killed by handle-pinned id, which no
+        recycled pid can alias while this process still holds the handle.
+
+        Nothing is redirected: with no console there is nothing to redirect to, and everything the
+        caller reads travels through files the wrapper writes.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$FileName,
         [Parameter(Mandatory = $true)][string]$Arguments,
         [Parameter(Mandatory = $true)][string]$ResultFile,
         [Parameter(Mandatory = $true)][string]$Label,
+        [switch]$Restricted,
         [ValidateRange(5, 600)][int]$TimeoutSeconds = 45
     )
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FileName
-    $psi.Arguments = $Arguments
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    # Never the sandbox: a child's current directory holds a lock that would defeat its own cleanup.
-    $psi.WorkingDirectory = $script:RepoRoot
+    # Never the sandbox as working directory: a child's current directory holds a lock that would
+    # defeat its own cleanup.
+    $child = $null
+    $launchError = ''
+    if ($Restricted) {
+        $started = Start-TestRestrictedProcess -FilePath $FileName -Arguments $Arguments -WorkingDirectory $script:RepoRoot
+        $child = $started.Child
+        $launchError = $started.Error
+    }
+    else {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FileName
+        $psi.Arguments = $Arguments
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.WorkingDirectory = $script:RepoRoot
+        try { $child = [System.Diagnostics.Process]::Start($psi) }
+        catch { $child = $null; $launchError = $_.Exception.Message }
+    }
 
-    $diagnostic = ''
-    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
-    $launcher = [System.Diagnostics.Process]::Start($psi)
+    if (-not $child) {
+        return [PSCustomObject]@{
+            TimedOut = $true
+            Exited = $false
+            Diagnostic = ('[{0} did not start] {1}' -f $Label, $launchError)
+        }
+    }
+
+    $exited = $false
+    $exitCode = -1
     try {
-        $stdout = $launcher.StandardOutput.ReadToEndAsync()
-        $stderr = $launcher.StandardError.ReadToEndAsync()
-        [void]$launcher.WaitForExit([int]($TimeoutSeconds * 1000))
-        [void]$stdout.Wait(5000)
-        [void]$stderr.Wait(5000)
-        $diagnostic = ('[{0} exit={1}] {2}{3}' -f $Label, $launcher.ExitCode, [string]$stdout.Result, [string]$stderr.Result)
+        $exited = $child.WaitForExit([int]($TimeoutSeconds * 1000))
+        if ($exited) { $exitCode = [int]$child.ExitCode }
+        else {
+            [void](Stop-WacProcessTree -ProcessId $child.Id)
+            [void]$child.WaitForExit(10000)
+        }
     }
     finally {
-        try { $launcher.Dispose() } catch { $null = $_ }
-    }
-
-    while (-not (Test-Path -LiteralPath $ResultFile -PathType Leaf) -and [datetime]::UtcNow -lt $deadline) {
-        Start-Sleep -Milliseconds 200
+        try { $child.Dispose() } catch { $null = $_ }
     }
 
     return [PSCustomObject]@{
         TimedOut = -not (Test-Path -LiteralPath $ResultFile -PathType Leaf)
-        Diagnostic = $diagnostic
+        Exited = $exited
+        Diagnostic = ('[{0} exited={1} hostExit={2}]' -f $Label, $exited, $exitCode)
     }
 }
 
@@ -143,16 +139,15 @@ function Invoke-SandboxedEntryPoint {
     $wrapper = Join-Path -Path $Sandbox -ChildPath 'wrapper.ps1'
     $outFile = Join-Path -Path $Sandbox -ChildPath 'child.out'
     $resultFile = Join-Path -Path $Sandbox -ChildPath 'child.exit'
-    $pidFile = Join-Path -Path $Sandbox -ChildPath 'child.pid'
     $entryPoint = Join-Path -Path $script:RepoRoot -ChildPath $ScriptName
 
     # A sandbox may be reused for a second run; a stale result file would be read as this run's.
-    foreach ($stale in @($outFile, $resultFile, $pidFile)) {
+    foreach ($stale in @($outFile, $resultFile)) {
         if (Test-Path -LiteralPath $stale -PathType Leaf) { [System.IO.File]::Delete($stale) }
     }
 
-    # The wrapper, not the parent, redirects the environment: runas.exe itself has to keep the real
-    # %SystemRoot% to be found and to start anything.
+    # The wrapper, not the parent, redirects the environment: %SystemRoot% has to stay real until
+    # the host itself has started, and only the wrapper runs after that.
     $lines = @(
         ('$env:ProgramFiles = {0}' -f (ConvertTo-WrapperLiteral -Value $programFiles)),
         ('$env:ProgramData = {0}' -f (ConvertTo-WrapperLiteral -Value $programData)),
@@ -163,7 +158,11 @@ function Invoke-SandboxedEntryPoint {
         # assert there.
         ('$env:LOCALAPPDATA = {0}' -f (ConvertTo-WrapperLiteral -Value $localAppData)),
         ('$env:SystemRoot = {0}' -f (ConvertTo-WrapperLiteral -Value $systemRoot)),
-        ('[System.IO.File]::WriteAllText({0}, [string]$PID)' -f (ConvertTo-WrapperLiteral -Value $pidFile)),
+        # The token this child actually got. Everything asserted about an unelevated run is worth
+        # nothing if the de-elevation quietly stopped working, so the child reports the token it
+        # holds and the caller fails on it instead of trusting the API that handed it out.
+        '$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())',
+        '$admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
         '$code = 90',
         'try {',
         ('    & {0} {1} *> {2}' -f (ConvertTo-WrapperLiteral -Value $entryPoint), ($EntryArgument -join ' '),
@@ -174,25 +173,19 @@ function Invoke-SandboxedEntryPoint {
         '    $code = 91',
         ('    [System.IO.File]::AppendAllText({0}, ($_ | Out-String))' -f (ConvertTo-WrapperLiteral -Value $outFile)),
         '}',
-        ('[System.IO.File]::WriteAllText({0}, [string]$code)' -f (ConvertTo-WrapperLiteral -Value $resultFile)),
+        ('[System.IO.File]::WriteAllText({0}, ("ADMIN=$admin" + [Environment]::NewLine + "EXIT=$code"))' -f `
+            (ConvertTo-WrapperLiteral -Value $resultFile)),
         'exit $code'
     )
     [System.IO.File]::WriteAllLines($wrapper, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
 
-    # -WindowStyle Hidden is not cosmetic here. runas.exe builds its child's startup info itself, so
-    # the CreateNoWindow we set on the runas PROCESS does not reach the process runas launches: the
-    # wrapper gets a real console that pops to the foreground and steals focus, once per case. The
-    # host hides its own window at startup when asked, which is the only lever the parent still has.
     $hostArguments = ConvertTo-WacCommandLine -ArgumentList @(
-        '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
-    $childCommand = ConvertTo-WacCommandLine -ArgumentList @(
-        (Get-TestHostPath), '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
 
-    $attempt = Start-BoundedWrapper -Label 'runas' -TimeoutSeconds $TimeoutSeconds -ResultFile $resultFile `
-        -FileName (Join-Path -Path $env:SystemRoot -ChildPath 'System32\runas.exe') `
-        -Arguments (ConvertTo-WacCommandLine -ArgumentList @('/trustlevel:0x20000', $childCommand))
+    $attempt = Start-BoundedWrapper -Label 'restricted' -Restricted -TimeoutSeconds $TimeoutSeconds `
+        -ResultFile $resultFile -FileName (Get-TestHostPath) -Arguments $hostArguments
 
-    # If the Safer basic-user token is unavailable, an ordinary child of an unelevated parent is
+    # If the Safer normal-user token is unavailable, an ordinary child of an unelevated parent is
     # already unelevated and is just as safe. From an ELEVATED parent it is NOT, so there is no
     # fallback there: the entry points would reach the live Task Scheduler.
     if ($attempt.TimedOut -and -not (Test-WacIsAdministrator)) {
@@ -200,31 +193,28 @@ function Invoke-SandboxedEntryPoint {
             -FileName (Get-TestHostPath) -Arguments $hostArguments
         $attempt = [PSCustomObject]@{
             TimedOut = $direct.TimedOut
+            Exited = $direct.Exited
             Diagnostic = ('{0} {1}' -f $attempt.Diagnostic, $direct.Diagnostic)
         }
     }
 
     $timedOut = $attempt.TimedOut
     $diagnostic = $attempt.Diagnostic
-    if ($timedOut) {
-        # Never leave an orphan behind, even when the child is not in this process's tree.
-        try {
-            if (Test-Path -LiteralPath $pidFile -PathType Leaf) {
-                [void](Stop-WacProcessTree -ProcessId ([int]([System.IO.File]::ReadAllText($pidFile).Trim())))
-            }
-        }
-        catch {
-            $null = $_
-        }
-    }
 
     $exitCode = $null
-    $childExited = $false
+    $childElevated = $false
     if (-not $timedOut) {
-        $exitCode = [int]([System.IO.File]::ReadAllText($resultFile).Trim())
-        # The result file is the wrapper's last write, so the process is about to go. Waiting for it
-        # is what lets the sandbox be deleted, and is the only way to prove nothing was left running.
-        $childExited = Wait-ChildProcessExit -PidFile $pidFile -TimeoutSeconds 20
+        foreach ($line in @([System.IO.File]::ReadAllLines($resultFile))) {
+            if ($line.StartsWith('EXIT=', [System.StringComparison]::Ordinal)) { $exitCode = [int]$line.Substring(5).Trim() }
+            elseif ($line.StartsWith('ADMIN=', [System.StringComparison]::Ordinal)) {
+                $childElevated = [string]::Equals($line.Substring(6).Trim(), 'True', [System.StringComparison]::Ordinal)
+            }
+        }
+
+        # Asserted HERE, in the one place every case goes through, so no case can be written that
+        # forgets it: an elevated child walks past the elevation branch entirely, and the exit code
+        # it reports then proves nothing about the contract under test.
+        Assert-False $childElevated ('the child ran ELEVATED, so it never exercised the unelevated path. ' + $diagnostic)
     }
 
     $output = ''
@@ -237,7 +227,7 @@ function Invoke-SandboxedEntryPoint {
         MachineLogDirectory = (Join-Path -Path $programData -ChildPath 'WindowsAutoCleanup\Logs')
         DeploymentRoot = (Join-Path -Path $programFiles -ChildPath 'WindowsAutoCleanup')
         TimedOut = $timedOut
-        ChildExited = $childExited
+        ChildExited = $attempt.Exited
         Diagnostic = $diagnostic
     }
 }
