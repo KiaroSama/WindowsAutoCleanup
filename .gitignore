@@ -4,7 +4,8 @@
 .Comments/
 .Comments/**
 
-# Local runtime markers
+# Leftover marker from the ACL-hardening capability removed in v1.2.0. Kept ignored so an
+# older checkout that still carries the file does not show it as untracked.
 .WindowsAutoCleanupAclHardened
 
 # Logs
@@ -84,3 +85,26 @@ Thumbs.db
 thumbs.db
 desktop.ini
 Desktop.ini
+
+# Hook Maker: local/private files (auto-managed)
+/.ai/
+/secrets.md
+/explain-AI.md
+/reference.md
+/CLAUDE.md
+/AGENTS.md
+/.agents/
+/.claude/
+/.kiro/
+/.codex/
+/.cursor/
+/.cline/
+/graphify-out/
+.ignoreme
+**/.ignoreme
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+!/.env.template
+!/.env.dist

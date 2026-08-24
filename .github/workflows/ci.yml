@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Nothing here writes to the repository or to any package registry.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.host }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both shipped hosts must pass: .NET Framework and .NET differ on long paths, argument
+          # handling and encoding, and this project runs under whichever one the task registers.
+          - host: pwsh
+            shell: pwsh
+          - host: powershell
+            shell: powershell
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        timeout-minutes: 5
+
+      - name: Static analysis
+        shell: ${{ matrix.shell }}
+        timeout-minutes: 10
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+            Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck
+          }
+          Import-Module PSScriptAnalyzer
+          # Scan the SHIPPED set rather than '.', so the identical command is runnable in a working
+          # tree that also holds git-ignored agent runtimes and gives the same answer as CI.
+          $shipped = @('Run.ps1', 'Install-WindowsAutoCleanupTask.ps1', 'Uninstall-WindowsAutoCleanupTask.ps1', 'src', 'Tests')
+          $findings = @($shipped | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings .\Tests\PSScriptAnalyzerSettings.psd1 })
+          if ($findings.Count -gt 0) {
+            $findings | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String -Width 240 | Write-Host
+            Write-Host ('PSScriptAnalyzer reported {0} finding(s) at Error or Warning severity.' -f $findings.Count)
+            exit 1
+          }
+          Write-Host 'PSScriptAnalyzer is clean.'
+
+      - name: Tests
+        shell: ${{ matrix.shell }}
+        timeout-minutes: 15
+        run: .\Tests\Run-Tests.ps1 -Host ${{ matrix.host }} -ManifestPath "$env:RUNNER_TEMP\executed-suites.txt"
+
+      - name: Guard - every discovered suite ran
+        if: always()
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          # -Recurse matters: without it this guard shares the runner's blind spot, so a suite in a
+          # Tests subdirectory would never run AND the guard would still report success.
+          $discovered = @(Get-ChildItem -LiteralPath 'Tests' -Filter '*.Tests.ps1' -File -Recurse | ForEach-Object { $_.Name } | Sort-Object -Unique)
+          if ($discovered.Count -eq 0) { Write-Host 'No Tests\*.Tests.ps1 suite exists.'; exit 1 }
+
+          $manifest = Join-Path $env:RUNNER_TEMP 'executed-suites.txt'
+          if (-not (Test-Path -LiteralPath $manifest)) { Write-Host 'The runner wrote no manifest, so no suite can be proven to have run.'; exit 1 }
+
+          $executed = @(Get-Content -LiteralPath $manifest | Where-Object { $_.Trim() } | Sort-Object -Unique)
+          $missing = @($discovered | Where-Object { $executed -notcontains $_ })
+          if ($missing.Count -gt 0) {
+            Write-Host ('These suites exist but were not executed: {0}' -f ($missing -join ', '))
+            exit 1
+          }
+          Write-Host ('All {0} discovered suite(s) ran.' -f $discovered.Count)

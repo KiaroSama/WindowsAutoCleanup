@@ -1,0 +1,11 @@
+# The working tree currently mixes CRLF and LF, which makes every diff noisier than the change it
+# carries. Normalise text on commit and check PowerShell out with CRLF, which is what the Windows
+# hosts and editors this project targets expect.
+* text=auto
+
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+*.md   text eol=lf
+*.yml  text eol=lf
