@@ -226,6 +226,9 @@ Nothing in v1.2.0 recreates any of this — the capability is gone, and a test f
 
 **The installer refuses to register the task.** The deployment directory failed the machine-trust check, meaning a non-administrative principal could still write to what `SYSTEM` would execute. The log names the exact path and principal. This fails closed on purpose.
 
+**`Get-ScheduledTask` does not show the task.**
+The task is registered under `\WindowsAutoCleanup\` with a `SYSTEM` principal, and its security descriptor is not readable by a standard user, so an unelevated `Get-ScheduledTask` or `schtasks /query` reports nothing at all. Query it from an elevated shell, or read the Task Scheduler operational event log, which records registration (event 106) and each run (events 100/102/201) regardless of privilege.
+
 **The uninstaller says the task is not ours.** A task with the same name exists but does not carry this project's ownership marker. It is left untouched; remove it yourself if you are sure.
 
 ## Repository files
