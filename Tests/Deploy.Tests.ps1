@@ -101,6 +101,24 @@ function Grant-TestEveryoneWrite {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
+function New-TestDirectorySecurity {
+    <#
+    .SYNOPSIS
+        A DirectorySecurity carrying exactly the SDDL given, with nothing on disk behind it.
+    .DESCRIPTION
+        The ancestor DECISION is reachable this way and no other. A directory whose owner is an
+        arbitrary account cannot be created without SeRestorePrivilege, and one with an empty DACL
+        cannot be created without a write this project refuses to make - so the owner and rule-less
+        refusals had no fixture, and deleting either of them left the whole suite green. Get-Acl is
+        not involved here, so the descriptor is exactly what the SDDL says and nothing else.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Sddl)
+
+    $descriptor = New-Object System.Security.AccessControl.DirectorySecurity
+    $descriptor.SetSecurityDescriptorSddlForm($Sddl)
+    return $descriptor
+}
+
 function New-StubAction {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Execute,
@@ -475,6 +493,261 @@ Test-Case 'Test-WacDeploymentTrusted passes on a real machine-owned directory' {
     Assert-True $trust.IsTrusted ([string]$trust.Reason)
     Assert-Equal 0 @($trust.Untrusted).Count
     Assert-True ($trust.CheckedCount -ge 1)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Ancestor trust (ledger R-22): write access to a PARENT replaces everything inside it
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'Get-WacPathAncestor walks to the volume root and returns it in rooted form' {
+    $ancestors = @(Get-WacPathAncestor -Path 'C:\Program Files\WindowsAutoCleanup\Run.ps1')
+
+    Assert-Equal 3 $ancestors.Count ($ancestors -join '; ')
+    Assert-Equal 'C:\Program Files\WindowsAutoCleanup' $ancestors[0]
+    Assert-Equal 'C:\Program Files' $ancestors[1]
+    Assert-Equal 'C:\' $ancestors[2] 'the walk must reach the volume root, in rooted form'
+
+    Assert-Equal 0 @(Get-WacPathAncestor -Path 'C:\').Count 'the volume root has no ancestor'
+    Assert-Equal 0 @(Get-WacPathAncestor -Path '').Count
+    Assert-Equal 0 @(Get-WacPathAncestor -Path '\\server\share\x').Count 'a UNC path is not a supported local path'
+}
+
+Test-Case 'Test-WacAncestorIsMachineTrusted accepts every legitimate Windows ancestor' {
+    # The default DACL of C:\ grants Authenticated Users CreateDirectories on the folder ITSELF, so
+    # an ancestor check that asked the strict "can anyone write here at all" question would report
+    # the volume root of a healthy machine as untrusted and refuse every correct install.
+    $taskHost = Get-WacCanonicalPowerShellHost
+    Assert-True ([bool]$taskHost) 'no machine-trusted PowerShell host exists on this machine'
+
+    $paths = @(
+        'C:\',
+        $env:ProgramFiles,
+        (Join-Path -Path $env:SystemRoot -ChildPath 'System32'),
+        (Split-Path -Parent $taskHost)
+    )
+
+    foreach ($path in $paths) {
+        $trust = Test-WacAncestorIsMachineTrusted -Path $path
+        Assert-True $trust.IsTrusted ('{0}: {1}' -f $path, [string]$trust.Reason)
+    }
+}
+
+Test-Case 'Test-WacAncestorIsMachineTrusted reads the volume root, not the session location on that drive' {
+    # Measured on pwsh 7.6.5: Get-Acl -LiteralPath 'C:' returns the descriptor of whichever
+    # directory the session sits in on drive C, so the root has to be re-rooted before it is read.
+    # An installer is normally launched from somewhere on C:, which is exactly when this bites.
+    $sandbox = New-TestSandbox -Prefix 'dep-driverel'
+    Grant-TestEveryoneWrite -Path $sandbox
+
+    $qualifier = Split-Path -Qualifier $sandbox
+    Assert-False (Test-WacAncestorIsMachineTrusted -Path $sandbox).IsTrusted `
+        'the probe directory must be distinguishable from the volume root'
+
+    $outside = Test-WacAncestorIsMachineTrusted -Path $qualifier
+
+    $saved = (Get-Location).Path
+    try {
+        Set-Location -LiteralPath $sandbox
+        $inside = Test-WacAncestorIsMachineTrusted -Path $qualifier
+    }
+    finally {
+        Set-Location -LiteralPath ($qualifier + '\')
+        Set-Location -LiteralPath $saved
+    }
+
+    # Both sides are asserted TRUE, not merely equal: with the re-rooting removed both readings
+    # degrade to a user-writable directory and an equality-only assertion stays green.
+    Assert-True $outside.IsTrusted ('the volume root itself must be trusted for this case to mean anything: ' + [string]$outside.Reason)
+    Assert-True $inside.IsTrusted ('the session location on the drive was inspected instead of the volume root: ' + [string]$inside.Reason)
+    Assert-Equal ([string]$outside.Owner) ([string]$inside.Owner) 'a different object was inspected'
+}
+
+Test-Case 'Test-WacDeploymentTrusted names a user-writable PARENT of the deployment root' {
+    Invoke-InDeploymentSandbox -Prefix 'dep-parent' -Body {
+        param($sandbox)
+
+        $source = New-TestCheckout -Path (Join-Path -Path $sandbox -ChildPath 'checkout')
+        $deployment = Install-WacDeployment -SourceRoot $source
+        $parent = Get-WacNormalizedPath -Path (Split-Path -Parent $deployment.DeploymentRoot)
+
+        # Everyone:Modify carries DELETE and DELETE_CHILD, which is precisely the grant that lets a
+        # standard user rename the whole deployment aside and drop a different one in its place.
+        # The ACE is not inheritable, so the deployment root's own descriptor is left alone and the
+        # only new failure can come from the ancestor walk.
+        Grant-TestEveryoneWrite -Path $parent
+
+        $trust = Test-WacDeploymentTrusted -DeploymentRoot $deployment.DeploymentRoot
+        $reported = @(@($trust.Untrusted) | ForEach-Object { $_.Path })
+        $named = @($reported | Where-Object { $_ -ieq $parent })
+        $expected = 1 + @(Get-WacPathAncestor -Path $deployment.DeploymentRoot).Count
+
+        Assert-False $trust.IsTrusted ('a deployment under a user-writable parent was trusted: ' + [string]$trust.Reason)
+        Assert-Equal 1 $named.Count ('the parent {0} was never checked; reported: {1}' -f $parent, ($reported -join '; '))
+        Assert-True ($trust.CheckedCount -ge $expected) `
+            ('ancestors were not counted: {0} checked, {1} expected at minimum' -f $trust.CheckedCount, $expected)
+    }
+}
+
+Test-Case 'Test-WacDeploymentTrusted trusts the real machine chain up to the volume root' {
+    $probe = Get-WacDeploymentRoot
+    if (-not (Test-Path -LiteralPath $probe -PathType Container)) {
+        $probe = Join-Path -Path $env:SystemRoot -ChildPath 'System32\drivers\etc'
+    }
+    Assert-True (Test-Path -LiteralPath $probe -PathType Container) ('no real machine-owned probe exists: ' + $probe)
+
+    $taskHost = Get-WacCanonicalPowerShellHost
+    Assert-True ([bool]$taskHost) 'no machine-trusted PowerShell host exists on this machine'
+
+    # CheckedCount is asserted EXACTLY, not as a lower bound. A lower bound is already satisfied
+    # by the deployed paths alone, so it stays green when the ancestor walk is removed and
+    # therefore proves nothing. The expectation covers BOTH chains: the deployment root and the
+    # PowerShell host the task will run.
+    $ancestors = @()
+    foreach ($chain in @($probe, $taskHost)) {
+        foreach ($ancestor in @(Get-WacPathAncestor -Path $chain)) {
+            if ($ancestors -notcontains $ancestor) { $ancestors += $ancestor }
+        }
+    }
+
+    $strict = @(@(Get-WacDeploymentItem -Root $probe) | Where-Object {
+        (-not $_.IsReparsePoint) -and ($_.IsDirectory -or ($_.Path -match '(?i)\.psm?1$'))
+    })
+
+    # Read-only: the check never writes to, or re-permissions, anything it inspects.
+    $trust = Test-WacDeploymentTrusted -DeploymentRoot $probe
+    $reported = @(@($trust.Untrusted) | ForEach-Object { $_.Path })
+
+    Assert-True $trust.IsTrusted ([string]$trust.Reason + ' :: ' + ($reported -join '; '))
+    Assert-Equal 0 $reported.Count ($reported -join '; ')
+    Assert-True ($ancestors -contains 'C:\') ('the walk did not reach the volume root: ' + ($ancestors -join '; '))
+    Assert-Equal (1 + $strict.Count + $ancestors.Count) $trust.CheckedCount `
+        ('the host and root ancestors were not all checked; ancestors: ' + ($ancestors -join '; '))
+}
+
+Test-Case 'Test-WacAncestorDescriptorIsTrusted refuses every descriptor no fixture can produce' {
+    # These two refusals were unreachable while the decision was welded to Get-Acl. Assigning an
+    # arbitrary owner to a directory needs SeRestorePrivilege, which this session does not hold,
+    # and emptying a DACL is a write this project refuses to make - so every sandbox on this
+    # machine is owned by an administrative account and carries rules, and deleting either guard
+    # left the whole suite green. Feeding the decision a descriptor directly reaches both.
+    $cases = @(
+        @{ Sddl = 'O:AUG:BAD:(A;;FA;;;BA)'
+           Owner = 'S-1-5-11'
+           Reason = 'Owner S-1-5-11 is not an administrative principal'
+           Why = 'a non-administrative owner keeps WRITE_DAC and can grant itself anything' },
+        @{ Sddl = 'G:BAD:(A;;FA;;;BA)'
+           Owner = ''
+           Reason = 'is not an administrative principal'
+           Why = 'an ownerless descriptor names nobody to hold accountable' },
+        @{ Sddl = 'O:BAG:BAD:'
+           Owner = 'S-1-5-32-544'
+           Reason = 'exposes no access rules to evaluate'
+           Why = 'an empty rule set is nothing to evaluate, not proof that nobody can write' },
+        @{ Sddl = 'O:BAG:BAD:NO_ACCESS_CONTROL'
+           Owner = 'S-1-5-32-544'
+           Reason = 'can replace a child of this directory: S-1-1-0'
+           Why = 'a NULL DACL arrives as one Allow(Everyone, every right) ACE' },
+        @{ Sddl = 'O:BAG:BAD:(A;;FA;;;BA)(A;;0x10040;;;AU)'
+           Owner = 'S-1-5-32-544'
+           Reason = 'can replace a child of this directory: S-1-5-11'
+           Why = 'DELETE|FILE_DELETE_CHILD for a non-administrator replaces the deployment' }
+    )
+
+    foreach ($case in $cases) {
+        $decision = Test-WacAncestorDescriptorIsTrusted -SecurityDescriptor (New-TestDirectorySecurity -Sddl $case.Sddl)
+
+        Assert-Equal $false $decision.IsTrusted ('[{0}] was trusted: {1}' -f $case.Sddl, $case.Why)
+        Assert-Equal $case.Owner ([string]$decision.Owner) $case.Sddl
+        Assert-True ([string]$decision.Reason -like ('*{0}*' -f $case.Reason)) `
+            ('[{0}] refused for the wrong reason: {1}' -f $case.Sddl, [string]$decision.Reason)
+    }
+}
+
+Test-Case 'Test-WacAncestorDescriptorIsTrusted still accepts what a healthy ancestor carries' {
+    # Every clause the refusals above must not have broken, in one descriptor: a Deny ACE, the
+    # administrative Allow ACEs, the harmless CreateDirectories grant the real C:\ hands
+    # Authenticated Users, and an INHERIT-ONLY full-control ACE that grants nothing on the
+    # container itself. Asking the strict "can anyone write here at all" question would refuse it.
+    $healthy = 'O:BAG:BAD:(D;;FA;;;AU)(A;;FA;;;BA)(A;;FA;;;SY)(A;;0x4;;;AU)(A;OICIIO;FA;;;AU)'
+    $decision = Test-WacAncestorDescriptorIsTrusted -SecurityDescriptor (New-TestDirectorySecurity -Sddl $healthy)
+
+    Assert-Equal $true $decision.IsTrusted ([string]$decision.Reason)
+    Assert-Equal 'S-1-5-32-544' ([string]$decision.Owner)
+
+    # And the path reader still agrees with the decision it delegates to.
+    $volumeRoot = Test-WacAncestorIsMachineTrusted -Path 'C:\'
+    $direct = Test-WacAncestorDescriptorIsTrusted -SecurityDescriptor (Get-Acl -LiteralPath 'C:\')
+    Assert-Equal $direct.IsTrusted $volumeRoot.IsTrusted ('the reader and the decision disagree about C:\ : ' + [string]$volumeRoot.Reason)
+    Assert-Equal ([string]$direct.Owner) ([string]$volumeRoot.Owner)
+    Assert-Equal ([string]$direct.Reason) ([string]$volumeRoot.Reason)
+}
+
+Test-Case 'Test-WacDeploymentTrusted keeps its findings when no canonical PowerShell host exists' {
+    Invoke-InDeploymentSandbox -Prefix 'dep-nohost' -Body {
+        param($sandbox)
+
+        $source = New-TestCheckout -Path (Join-Path -Path $sandbox -ChildPath 'checkout')
+        $deployment = Install-WacDeployment -SourceRoot $source
+        $root = Get-WacNormalizedPath -Path $deployment.DeploymentRoot
+        Grant-TestEveryoneWrite -Path $root
+
+        $strict = @(@(Get-WacDeploymentItem -Root $root) | Where-Object {
+            (-not $_.IsReparsePoint) -and ($_.IsDirectory -or ($_.Path -match '(?i)\.psm?1$'))
+        })
+        $rootAncestors = @(Get-WacPathAncestor -Path $root)
+
+        $taskHost = Get-WacCanonicalPowerShellHost
+        Assert-True ([bool]$taskHost) 'no machine-trusted PowerShell host exists on this machine'
+        $bothChains = @($rootAncestors)
+        foreach ($ancestor in @(Get-WacPathAncestor -Path $taskHost)) {
+            if ($bothChains -notcontains $ancestor) { $bothChains += $ancestor }
+        }
+
+        # The comparison the early return used to lose. Both readings are taken against the same
+        # tree, so the ONLY difference between them may be the host chain.
+        $withHost = Test-WacDeploymentTrusted -DeploymentRoot $root
+
+        # Get-WacCanonicalPowerShellHost reads %ProgramFiles% and %SystemRoot% and nothing else;
+        # %ProgramFiles% already points into this sandbox, so an empty %SystemRoot% leaves it with
+        # no candidate at all. Restored in the finally, because the whole suite shares this process.
+        $savedSystemRoot = $env:SystemRoot
+        try {
+            $empty = Join-Path -Path $sandbox -ChildPath 'no-windows'
+            [void][System.IO.Directory]::CreateDirectory($empty)
+            $env:SystemRoot = $empty
+            Assert-Equal $null (Get-WacCanonicalPowerShellHost) 'a host was still reachable, so this case proves nothing'
+            $withoutHost = Test-WacDeploymentTrusted -DeploymentRoot $root
+        }
+        finally {
+            $env:SystemRoot = $savedSystemRoot
+        }
+
+        $namedWith = @(@($withHost.Untrusted) | Where-Object { [string]$_.Path -ieq $root })
+        $namedWithout = @(@($withoutHost.Untrusted) | Where-Object { [string]$_.Path -ieq $root })
+        $hostFindings = @(@($withoutHost.Untrusted) | Where-Object { [string]$_.Reason -like '*No machine-trusted PowerShell host*' })
+
+        Assert-Equal $false $withHost.IsTrusted ([string]$withHost.Reason)
+        Assert-Equal $false $withoutHost.IsTrusted ([string]$withoutHost.Reason)
+
+        # The user-writable deployment root is the finding the installer has to print. An early
+        # return discards it and reports UntrustedCount=0, so the installer's loop over
+        # $trust.Untrusted names nothing and the operator is told only that something is wrong.
+        Assert-Equal 1 $namedWith.Count ('the writable root was not reported at all: ' + ($namedWith -join '; '))
+        Assert-Equal 1 $namedWithout.Count 'the writable root was dropped once no host was available'
+        Assert-Equal 1 $hostFindings.Count 'the missing host was not reported as a finding of its own'
+        Assert-Equal '<PowerShell host>' ([string]$hostFindings[0].Path) 'the missing-host finding has no printable path'
+        Assert-Equal 0 @(@($withHost.Untrusted) | Where-Object { [string]$_.Reason -like '*No machine-trusted PowerShell host*' }).Count `
+            'a missing host was reported while a host was available'
+
+        # Exact, not a lower bound: the deployed paths alone already satisfy '-ge', which is how an
+        # ancestor walk can be removed and stay green. Losing the host chain must cost exactly the
+        # ancestors that only the host contributed, and nothing else.
+        Assert-Equal (1 + $strict.Count + $bothChains.Count) $withHost.CheckedCount 'the two chains were not both walked'
+        Assert-Equal (1 + $strict.Count + $rootAncestors.Count) $withoutHost.CheckedCount `
+            'CheckedCount stopped counting the paths that were actually checked'
+        Assert-Equal (@($withHost.Untrusted).Count + 1) @($withoutHost.Untrusted).Count `
+            'the findings collected before the host lookup did not survive it'
+    }
 }
 
 # ---------------------------------------------------------------------------------------------

@@ -12,6 +12,14 @@
     Output is redirected to files rather than pipes: the file length doubles as the progress
     heartbeat, so the runner needs no async pipe pump and cannot deadlock on a full buffer.
 
+    KNOWN BOUNDARY of the leak accounting. leakedSuiteProcesses counts only processes this runner
+    OWNS: the suite process it started and whatever taskkill /T reaches from it. A suite that
+    deliberately launches a process OUT of its own tree - runas.exe, WMI Win32_Process.Create, a
+    scheduled task - creates something that is not a descendant, so /T never sees it and this
+    counter cannot see it either. It is named leakedSuiteProcesses, not leakedProcesses, so the 0
+    is not read as a machine-wide all-clear it never measured; a suite that orphans by design is
+    responsible for bounding its own orphan.
+
 .PARAMETER Filter
     Substring matched against the suite file name.
 
@@ -34,6 +42,9 @@
 
 [CmdletBinding()]
 param(
+    # -Suite is the spelling the project's own docs and task notes use; without the alias that
+    # documented command line fails outright with "A parameter cannot be found".
+    [Alias('Suite')]
     [string]$Filter,
 
     [Alias('Host')]
@@ -332,6 +343,7 @@ finally {
 }
 
 $failures = 0
+$skipped = 0
 foreach ($result in @($results | Sort-Object -Property HostKind, Name)) {
     Write-Host ''
     Write-Host ('--- {0} [{1}] exit={2} {3}s{4}' -f $result.Name, $result.HostKind, $result.ExitCode, $result.DurationS,
@@ -342,6 +354,12 @@ foreach ($result in @($results | Sort-Object -Property HostKind, Name)) {
     }
     foreach ($line in @(($result.ErrorText -split "`r?`n"))) {
         if ($line.Trim()) { Write-Host ('  ! {0}' -f $line) }
+    }
+
+    # Skips are rolled up by name so the tail of a long CI log still shows them. The suite itself
+    # already exited 3 for them, so this only has to COUNT them, never decide the outcome.
+    if ($result.Output -and ($result.Output -match 'TOTAL cases=\d+ passed=\d+ failed=\d+ skipped=(\d+)')) {
+        $skipped += [int]$Matches[1]
     }
 
     if ($result.TimedOut -or $result.ExitCode -ne 0) {
@@ -356,7 +374,20 @@ foreach ($result in @($results | Sort-Object -Property HostKind, Name)) {
 }
 
 Write-Host ''
-Write-Host ('SUMMARY runs={0} failed={1} workers={2} leakedProcesses={3}' -f $results.Count, $failures, $workers, $leaked)
+Write-Host ('SUMMARY runs={0} failed={1} skippedCases={2} workers={3} leakedSuiteProcesses={4}' -f `
+        $results.Count, $failures, $skipped, $workers, $leaked)
+
+# Printed only after a timeout, which is the one outcome where an out-of-tree orphan is plausible:
+# the suite was force-killed mid-flight, so anything it had launched outside its own tree outlived
+# it unseen. Saying so beats letting leakedSuiteProcesses=0 be read as "nothing survived".
+$timedOut = @($results | Where-Object { $_.TimedOut })
+if ($timedOut.Count -gt 0) {
+    Write-Host ('NOTE {0} run(s) were force-killed; leakedSuiteProcesses counts only this runner''s own process tree, so a process a suite launched OUT of that tree is not covered by the number above.' -f $timedOut.Count)
+}
+
+if ($skipped -gt 0) {
+    Write-Host ('ERROR {0} case(s) declared themselves unable to run here; a skip proves nothing and is counted as a failure above.' -f $skipped)
+}
 
 if ($results.Count -ne $totalJobs) {
     Write-Host ('ERROR {0} of {1} suite run(s) produced no result.' -f ($totalJobs - $results.Count), $totalJobs)

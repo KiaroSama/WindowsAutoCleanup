@@ -375,6 +375,202 @@ function Install-WacDeployment {
     }
 }
 
+function Get-WacPathAncestor {
+    <#
+    .SYNOPSIS
+        Every ancestor directory of a path, nearest parent first, up to and including the volume
+        root.
+    .DESCRIPTION
+        The volume root comes back in its rooted 'C:\' form rather than the bare 'C:' form
+        Get-WacNormalizedPath produces. A bare 'X:' is DRIVE-RELATIVE to the FileSystem provider, so
+        Get-Acl -LiteralPath 'C:' reads whichever directory the session happens to sit in - measured
+        on pwsh 7.6.5: after Set-Location C:\Windows it returns the descriptor of C:\Windows. An
+        installer launched from anywhere on C: would otherwise vouch for a root it never looked at.
+    .OUTPUTS
+        A string array, empty when the path is not a supported local path. Callers wrap the call in
+        @( ) because a single-element array returned from a function unwraps on Windows PowerShell.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path)
+
+    $ancestors = New-Object 'System.Collections.Generic.List[string]'
+
+    $current = Get-WacNormalizedPath -Path $Path
+    if (-not $current) { return @($ancestors.ToArray()) }
+
+    while ($true) {
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent)) { break }
+
+        $normalized = Get-WacNormalizedPath -Path $parent
+        if (-not $normalized -or $normalized -ieq $current) { break }
+
+        if ($normalized -match '^[A-Za-z]:$') { [void]$ancestors.Add($normalized + '\') }
+        else { [void]$ancestors.Add($normalized) }
+
+        $current = $normalized
+    }
+
+    return @($ancestors.ToArray())
+}
+
+function Test-WacAncestorDescriptorIsTrusted {
+    <#
+    .SYNOPSIS
+        The ancestor-trust DECISION, taken over a security descriptor the caller already holds.
+    .DESCRIPTION
+        An ancestor is not asked the same question as the deployment itself.
+        Test-WacPathIsMachineTrusted asks "can a non-administrator write anything here at all",
+        which is right for a directory that HOLDS executed code and wrong one level up: the DEFAULT
+        DACL of C:\ on a healthy Windows install grants Authenticated Users CreateDirectories on the
+        folder itself. Measured on this machine: S-1-5-11 Allow 0x00000004 with no inheritance
+        flags, plus a separate INHERIT-ONLY S-1-5-11 0xE0010000 that grants nothing on the root.
+        Asking the strict question there marks every legitimate volume root untrusted and would
+        refuse every correct install.
+
+        Creating a NEW name beside an existing one cannot replace the existing one. Replacing or
+        redirecting an existing child needs one of:
+          * DeleteSubdirectoriesAndFiles - delete or rename a child whatever the child's DACL says;
+          * Delete - rename or delete THIS directory, taking the whole subtree with it;
+          * ChangePermissions or TakeOwnership - grant yourself either of the above;
+          * GENERIC_ALL, which is not decomposed into specific rights inside a raw ACE.
+        GENERIC_WRITE is deliberately absent: on a directory it maps to add-file, add-subdirectory,
+        write-EA, write-attributes and READ_CONTROL, none of which can touch an existing child.
+
+        The OWNER test stays strict, because an owner implicitly keeps WRITE_DAC and can grant
+        itself every right above at any moment. Ownerless, non-administratively owned and
+        rule-less descriptors all leave IsTrusted false so callers fail closed.
+
+        The decision lives apart from the directory that carries it ON PURPOSE. Setting a
+        directory's owner to an arbitrary account needs SeRestorePrivilege, and emptying its DACL
+        needs a write this project refuses to perform, so no on-disk fixture can reach the owner
+        or rule-less refusals - both stayed unproven while they were welded to Get-Acl. A
+        DirectorySecurity built from SDDL reaches every branch. The rules are unchanged; only
+        where the descriptor comes from is.
+    .OUTPUTS
+        IsTrusted / Owner / Reason. The caller supplies the Path.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$SecurityDescriptor)
+
+    $result = [PSCustomObject]@{
+        IsTrusted = $false
+        Owner = $null
+        Reason = $null
+    }
+
+    $ownerSid = $null
+    try { $ownerSid = [string]$SecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { $ownerSid = $null }
+    $result.Owner = $ownerSid
+
+    if (-not (Test-WacSidIsAdministrator -Sid ([string]$ownerSid))) {
+        $result.Reason = ('Owner {0} is not an administrative principal; an owner implicitly keeps WRITE_DAC.' -f $ownerSid)
+        return $result
+    }
+
+    $replaceRights = [int]([System.Security.AccessControl.FileSystemRights]::Delete) -bor
+                     [int]([System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+                     [int]([System.Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
+                     [int]([System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+    $genericAll = 0x10000000
+
+    try {
+        $rules = @($SecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+    }
+    catch {
+        $result.Reason = ('Access rules are unreadable: {0}' -f $_.Exception.Message)
+        return $result
+    }
+
+    # Zero rules is refused rather than read as "nobody can replace anything here". Measured on
+    # both hosts: a genuine NULL DACL does NOT arrive as zero rules - .NET materialises it as one
+    # Allow(S-1-1-0, 0xFFFFFFFF) ACE, which the loop below rejects on its own. Zero rules is an
+    # EMPTY or unreadable DACL, and a descriptor offering nothing to evaluate is not evidence.
+    if ($rules.Count -eq 0) {
+        $result.Reason = 'The security descriptor exposes no access rules to evaluate.'
+        return $result
+    }
+
+    $untrusted = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+
+        # An InheritOnly ACE is a template for children and grants nothing on this container. Both
+        # C:\ and %ProgramFiles% carry one, so skipping it is what keeps the check usable.
+        $propagation = [System.Security.AccessControl.PropagationFlags]::None
+        try { $propagation = $rule.PropagationFlags } catch { $propagation = [System.Security.AccessControl.PropagationFlags]::None }
+        if (([int]$propagation -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+
+        if ((([int]$rule.FileSystemRights -band $replaceRights) -eq 0) -and
+            (([int]$rule.FileSystemRights -band $genericAll) -eq 0)) { continue }
+
+        $sid = [string]$rule.IdentityReference.Value
+        if (Test-WacSidIsAdministrator -Sid $sid) { continue }
+
+        [void]$untrusted.Add($sid)
+    }
+
+    if ($untrusted.Count -gt 0) {
+        $writers = ((@($untrusted.ToArray()) | Sort-Object -Unique) -join ', ')
+        $result.Reason = ('Non-administrative principals can replace a child of this directory: {0}' -f $writers)
+        return $result
+    }
+
+    $result.IsTrusted = $true
+    $result.Reason = 'Owner is administrative and no non-administrative principal can replace a child here.'
+    return $result
+}
+
+function Test-WacAncestorIsMachineTrusted {
+    <#
+    .SYNOPSIS
+        True when no non-administrative principal can REPLACE or REDIRECT a child of this directory.
+    .DESCRIPTION
+        Reads the descriptor off disk and hands it to Test-WacAncestorDescriptorIsTrusted, which
+        owns the decision and documents it. Everything here is I/O: normalising the path,
+        re-rooting a bare drive qualifier, and failing closed on anything unreadable.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{
+        Path = $Path
+        IsTrusted = $false
+        Owner = $null
+        Reason = $null
+    }
+
+    $normalized = Get-WacNormalizedPath -Path $Path
+    if (-not $normalized) {
+        $result.Reason = 'Path is not a supported local path.'
+        return $result
+    }
+
+    # The guard lives inside the helper, not at each call site, so a bare drive-relative 'X:' can
+    # never reach Test-Path or Get-Acl no matter who calls this next.
+    $literal = $normalized
+    if ($literal -match '^[A-Za-z]:$') { $literal = $literal + '\' }
+
+    if (-not (Test-Path -LiteralPath $literal)) {
+        $result.Reason = 'Path does not exist.'
+        return $result
+    }
+
+    try {
+        $acl = Get-Acl -LiteralPath $literal -ErrorAction Stop
+    }
+    catch {
+        $result.Reason = ('Security descriptor is unreadable: {0}' -f $_.Exception.Message)
+        return $result
+    }
+
+    $decision = Test-WacAncestorDescriptorIsTrusted -SecurityDescriptor $acl
+    $result.Owner = $decision.Owner
+    $result.IsTrusted = $decision.IsTrusted
+    $result.Reason = $decision.Reason
+    return $result
+}
+
 function Test-WacDeploymentTrusted {
     <#
     .SYNOPSIS
@@ -383,7 +579,9 @@ function Test-WacDeploymentTrusted {
         Verification only. This function never mutates an ACL, an owner or an inheritance flag -
         that capability was removed (ledger P0-6 / U-2). Every directory and every deployed
         .ps1/.psm1 is checked, because write access to a directory is enough to replace the file
-        inside it. Anything unreadable or unexpected leaves IsTrusted false so callers fail closed.
+        inside it - and so is every ANCESTOR of the deployment root and of the PowerShell host the
+        task will run, up to and including the volume root (ledger R-22). Anything unreadable or
+        unexpected leaves IsTrusted false so callers fail closed.
     #>
     [CmdletBinding()]
     param([string]$DeploymentRoot)
@@ -432,16 +630,67 @@ function Test-WacDeploymentTrusted {
         }
     }
 
-    $checked = $toCheck.Count
+    # Ancestors (ledger R-22). Verifying only the leaf proves less than it looks: write access to a
+    # PARENT is enough to rename the whole deployment aside and drop a different one in its place.
+    #
+    # Only two chains are walked. Every directory INSIDE the deployment is already in $toCheck, so
+    # walking each item's parents would re-check the same handful of directories once per file and
+    # prove nothing new. The two chains overlap (both sit under %ProgramFiles% on a default
+    # install), so a per-invocation set keeps every directory to a single Get-Acl.
+    #
+    # The HOST binary's chain is proved HERE rather than beside Get-WacCanonicalPowerShellHost in
+    # Core, deliberately: this function is the single gate the installer crosses immediately before
+    # it registers the SYSTEM task, so one check here covers the only flow that ever hands a binary
+    # to SYSTEM. The other callers of that function (Run.ps1's elevated relaunch, the uninstaller)
+    # re-launch as the invoking ADMINISTRATOR, who can already rewrite any of those directories, so
+    # its own leaf trust check is the right depth for them. If the ancestor guarantee is ever wanted
+    # for those callers too, the two helpers above move to Core and Get-WacCanonicalPowerShellHost
+    # calls them - never the call sites, which is how a guarantee gets forgotten in one of them.
+    #
+    # A missing host is one more FINDING, not an early return. Returning here threw away every
+    # untrusted path already collected and reported a CheckedCount that excluded them, so the
+    # installer's loop over $trust.Untrusted printed nothing at all and the operator was told only
+    # that something, somewhere, was wrong. Still fails closed - the entry is untrusted.
+    $chains = New-Object 'System.Collections.Generic.List[string]'
+    [void]$chains.Add($root)
+
+    $taskHost = Get-WacCanonicalPowerShellHost
+    if ($taskHost) {
+        [void]$chains.Add($taskHost)
+    }
+    else {
+        [void]$untrusted.Add([PSCustomObject]@{
+            Path = '<PowerShell host>'
+            Reason = 'No machine-trusted PowerShell host exists for the task to run.'
+            Owner = $null
+        })
+    }
+
+    $ancestors = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($chain in $chains) {
+        foreach ($ancestor in @(Get-WacPathAncestor -Path $chain)) {
+            if ($seen.Add($ancestor)) { [void]$ancestors.Add($ancestor) }
+        }
+    }
+
+    foreach ($ancestor in $ancestors) {
+        $trust = Test-WacAncestorIsMachineTrusted -Path $ancestor
+        if (-not $trust.IsTrusted) {
+            [void]$untrusted.Add([PSCustomObject]@{ Path = $ancestor; Reason = $trust.Reason; Owner = $trust.Owner })
+        }
+    }
+
+    $checked = $toCheck.Count + $ancestors.Count
     $result.CheckedCount = $checked
     if ($untrusted.Count -gt 0) {
         $result.Untrusted = @($untrusted.ToArray())
-        $result.Reason = ('{0} of {1} deployed paths are writable by a non-administrative principal or unreadable.' -f $untrusted.Count, $checked)
+        $result.Reason = ('{0} finding(s) against {1} checked paths: writable by a non-administrative principal, unreadable, or absent.' -f $untrusted.Count, $checked)
         return $result
     }
 
     $result.IsTrusted = $true
-    $result.Reason = ('All {0} deployed paths are administrative only.' -f $checked)
+    $result.Reason = ('All {0} checked paths, ancestors up to the volume root included, are administrative only.' -f $checked)
     return $result
 }
 
@@ -780,6 +1029,7 @@ Export-ModuleMember -Function @(
     'Get-WacTaskName', 'Get-WacTaskFolder', 'Get-WacTaskSentinel', 'Get-WacTaskDescription',
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
+    'Get-WacPathAncestor', 'Test-WacAncestorIsMachineTrusted', 'Test-WacAncestorDescriptorIsTrusted',
     'Test-WacDeploymentTrusted',
     'Get-WacTaskScriptPath', 'Test-WacTaskExecuteIsCanonicalHost',
     'Get-WacInstalledTask', 'Test-WacTaskIsOurs', 'Remove-WacInstalledTask',
