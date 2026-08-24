@@ -185,35 +185,6 @@ function Start-ProbeProcess {
     return [System.Diagnostics.Process]::Start($psi)
 }
 
-function Stop-ProbeTree {
-    <#
-    .SYNOPSIS
-        Kills a process and everything it started, by PID.
-    .DESCRIPTION
-        Taken by PID rather than by Process object because the de-elevated wrapper is ORPHANED by
-        design - runas.exe returns before it finishes - so the only handle on that tree is the PID
-        the wrapper recorded for itself.
-    #>
-    param([Parameter(Mandatory = $true)][int]$ProcessId)
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = (Join-Path -Path $env:SystemRoot -ChildPath 'System32\taskkill.exe')
-    $psi.Arguments = '/T /F /PID {0}' -f $ProcessId
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-
-    $killer = $null
-    try { $killer = [System.Diagnostics.Process]::Start($psi) } catch { $killer = $null }
-    if ($killer) {
-        [void]$killer.StandardOutput.ReadToEndAsync()
-        [void]$killer.StandardError.ReadToEndAsync()
-        [void]$killer.WaitForExit(10000)
-        try { $killer.Dispose() } catch { $null = $_ }
-    }
-}
-
 function Wait-ProbeProcess {
     <#
     .SYNOPSIS
@@ -230,7 +201,7 @@ function Wait-ProbeProcess {
     $exited = $Process.WaitForExit($TimeoutMs)
 
     if (-not $exited) {
-        Stop-ProbeTree -ProcessId $Process.Id
+        [void](Stop-WacProcessTree -ProcessId $Process.Id)
         [void]$Process.WaitForExit(10000)
     }
 
@@ -285,34 +256,12 @@ function Get-ProbeValue {
     return $null
 }
 
-# The script runas.exe launches under the restricted token. It is not a probe: it runs the REAL
-# Run.ps1, and everything it reports back travels through files because a de-elevated grandchild
-# inherits neither this process's stdout handles nor its exit code.
+# The script the restricted token runs. It is not a probe: it runs the REAL Run.ps1, and everything
+# it reports back travels through a file, because it is started with no console and no inherited
+# handle, so it has no stdout to write to and its own exit code says nothing about Run.ps1's.
 $script:DeElevatedWrapperBody = @'
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-
-# IDENTITY, not a bare PID, and written first, before anything can block. runas.exe has already
-# returned by now, so this file is the caller's only handle on the tree - but it may be read up to
-# a whole timeout later, by which point Windows can have handed this PID to something else
-# entirely. NAME and START let the caller prove the PID is still THIS process before killing it.
-$self = Get-Process -Id $PID
-[System.IO.File]::WriteAllText($env:WAC_DEELEVATE_PID, ('PID={0}{3}NAME={1}{3}START={2}{3}' -f `
-        $PID, $self.ProcessName, $self.StartTime.Ticks, [Environment]::NewLine))
-
-# SELF-BOUND, and this is the only bound that survives the caller dying. runas orphaned this
-# wrapper, so if the caller is force-killed - by its own test runner's idle deadline, say - nothing
-# left alive knows this process exists. The deadline therefore has to live in here. It runs in its
-# own runspace, which gets its own thread, so it still fires when the main thread is wedged; and it
-# kills the TREE by PID, so the Run.ps1 grandchild goes with it rather than being orphaned again.
-$watchdog = [powershell]::Create()
-[void]$watchdog.AddScript({
-        param($OwnPid, $Ms, $TaskKill)
-        Start-Sleep -Milliseconds $Ms
-        & $TaskKill '/T' '/F' '/PID' $OwnPid | Out-Null
-    }).AddArgument($PID).AddArgument([int]$env:WAC_DEELEVATE_SELF_MS).AddArgument(
-    (Join-Path -Path $env:SystemRoot -ChildPath 'System32\taskkill.exe'))
-[void]$watchdog.BeginInvoke()
 
 $admin = $true
 $code = -1
@@ -355,9 +304,10 @@ catch {
     $note = 'WRAPPER-ERROR ' + $_.Exception.Message
 }
 finally {
-    # Moved into place rather than written in place: the caller polls for this path, and a
-    # half-written file would be read as a finished run. Written from finally so even a wrapper that
-    # threw reports something - silence is the one outcome the caller can only time out on.
+    # Moved into place rather than written in place: the caller kills this tree the moment its
+    # deadline expires, and a kill landing mid-write would leave a torn file that parses as a
+    # finished run. Written from finally so even a wrapper that threw reports something - silence is
+    # the one outcome the caller can only time out on.
     $partial = $env:WAC_DEELEVATE_RESULT + '.partial'
     [System.IO.File]::WriteAllText($partial, ('ADMIN={0}{1}EXIT={2}{1}NOTE={3}{1}' -f `
             $admin, [Environment]::NewLine, $code, $note))
@@ -367,83 +317,10 @@ finally {
 exit 0
 '@
 
-function Stop-DeElevatedOrphan {
-    <#
-    .SYNOPSIS
-        Kills the recorded wrapper tree, but ONLY after proving the PID is still that wrapper.
-    .DESCRIPTION
-        The PID in DeElevate.pid was written by a deliberately orphaned process up to a whole
-        timeout earlier. If that wrapper has since exited, Windows is free to reissue its PID, and
-        handing a recycled PID to taskkill /T /F would force-kill an unrelated process tree on the
-        machine running the tests. So the wrapper records its image name and start time too, and
-        nothing is killed unless both still match. Failing to confirm means NOT killing: the
-        wrapper is self-bounded, so leaving it alone costs at most one bounded wait, whereas
-        killing the wrong tree is unbounded damage.
-    .OUTPUTS
-        A sentence describing what was done, for the caller's Detail line.
-    #>
-    param([Parameter(Mandatory = $true)][string]$PidFile)
-
-    if (-not (Test-Path -LiteralPath $PidFile -PathType Leaf)) {
-        return 'the wrapper recorded no PID, so it had not started; nothing was killed'
-    }
-
-    $recordedPid = 0
-    $recordedName = ''
-    $recordedStart = 0L
-    try {
-        foreach ($line in @([System.IO.File]::ReadAllLines($PidFile))) {
-            if ($line.StartsWith('PID=', [System.StringComparison]::Ordinal)) { $recordedPid = [int]$line.Substring(4).Trim() }
-            elseif ($line.StartsWith('NAME=', [System.StringComparison]::Ordinal)) { $recordedName = $line.Substring(5).Trim() }
-            elseif ($line.StartsWith('START=', [System.StringComparison]::Ordinal)) { $recordedStart = [long]$line.Substring(6).Trim() }
-        }
-    }
-    catch {
-        return ('the recorded wrapper identity could not be read ({0}); nothing was killed' -f $_.Exception.Message)
-    }
-
-    if ($recordedPid -le 0 -or -not $recordedName -or $recordedStart -le 0) {
-        return 'the recorded wrapper identity was incomplete; nothing was killed'
-    }
-
-    $live = @(Get-Process -Id $recordedPid -ErrorAction SilentlyContinue)
-    if ($live.Count -ne 1) {
-        return ('the recorded wrapper PID {0} is no longer running; nothing was killed' -f $recordedPid)
-    }
-
-    $liveName = ''
-    $liveStart = 0L
-    try {
-        $liveName = [string]$live[0].ProcessName
-        $liveStart = [long]$live[0].StartTime.Ticks
-    }
-    catch {
-        return ('PID {0} could not be identified ({1}); nothing was killed' -f $recordedPid, $_.Exception.Message)
-    }
-
-    if (-not [string]::Equals($liveName, $recordedName, [System.StringComparison]::OrdinalIgnoreCase) -or $liveStart -ne $recordedStart) {
-        return ('PID {0} is now [{1}] started at {2}, not the recorded [{3}] started at {4}, so the PID was recycled and nothing was killed' -f `
-                $recordedPid, $liveName, $liveStart, $recordedName, $recordedStart)
-    }
-
-    Stop-ProbeTree -ProcessId $recordedPid
-
-    # Bounded settle: taskkill returns once the kill is issued, and the sandbox cannot be deleted
-    # while the wrapper still holds its script file open.
-    for ($i = 0; $i -lt 30; $i++) {
-        if (@(Get-Process -Id $recordedPid -ErrorAction SilentlyContinue).Count -eq 0) {
-            return ('the recorded wrapper tree (PID {0}, {1}) was identified and killed' -f $recordedPid, $recordedName)
-        }
-        Start-Sleep -Milliseconds 100
-    }
-
-    return ('PID {0} was identified and taskkill /T /F was issued, but it was still alive 3 s later' -f $recordedPid)
-}
-
 function Invoke-InheritedTokenRun {
     <#
     .SYNOPSIS
-        Fallback when runas cannot hand out a restricted token: run Run.ps1 under THIS process's token.
+        Fallback when the machine cannot hand out a restricted token: run Run.ps1 under THIS token.
     .DESCRIPTION
         Legitimate only while this process is itself unprivileged, and then it proves exactly the
         same thing the de-elevated path does - an unelevated -Scheduled run must refuse to clean.
@@ -494,130 +371,87 @@ function Invoke-DeElevatedRun {
     .SYNOPSIS
         Runs Run.ps1 -Scheduled under a genuinely unprivileged token, whatever token this suite holds.
     .DESCRIPTION
-        runas.exe /trustlevel:0x20000 is SAFER_LEVELID_NORMALUSER: the child receives a token whose
+        Start-TestRestrictedProcess hands the wrapper a SAFER_LEVELID_NORMALUSER token: its
         Administrators SID is deny-only, the same shape UAC gives a filtered token. It needs no
         password, no consent prompt, no scheduled task and no elevation of its own, so it runs
         unattended on a developer shell and on the elevated GitHub windows-latest runner alike.
-        Measured cost on both hosts: about 2.6 seconds.
+        Measured cost of the whole case on this machine, 2026-08-24: 1.9 s pwsh / 1.6 s powershell.
 
-        Two runas behaviours shape the rest of this function. It RETURNS IMMEDIATELY, before the
-        command it launched has finished, and it propagates neither that command's exit code nor
-        its output - the grandchild does not inherit the redirected handles. So the wrapper records
-        its PID, runs Run.ps1, and MOVES a result file into place, and this function polls for that
-        file under a deadline and kills the recorded tree if it never appears.
-
-        The inner command's quotes have to be escaped as \" . A plainly nested "..." is rejected the
-        moment the program path contains a space - measured: with C:\Program Files\PowerShell\7\
-        pwsh.exe, runas exits 1 and launches nothing at all, silently.
+        The wrapper is a REAL child, so this function waits on its handle rather than polling for a
+        file, and kills its tree by an id no recycled pid can alias. What still has to travel
+        through a file is what the wrapper LEARNED: it is started with no console and no inherited
+        handle, so it has no stdout, and its own exit code is not Run.ps1's.
 
         Everything it creates lives in the caller's sandbox, so Remove-TestSandbox is the cleanup.
 
-        THE BUDGET, and why it is this small. Measured normal cost of the whole case on this
-        machine, 2026-08-24: 2.8 s pwsh / 3.0 s powershell running the suite alone, and 2.2 s /
-        4.6 s inside a full 26-run both-hosts pass at 8 workers, where it competes for the machine.
-        Run-Tests.ps1 force-kills a suite that produces no output for IdleTimeoutSeconds, default
-        120, and this call prints nothing while it polls - so its entire duration is idle time. A
-        deadline ABOVE that budget is worse than no deadline: the runner wins the race, the caller
-        is killed before its own cleanup, finally never runs, and the orphan and the sandbox both
-        survive. So the default is 40 s, about 9x the worst measured cost and a third of the runner's
-        budget, which leaves the caller's cleanup comfortably inside it. Worst case for the whole
-        case is the still-elevated path: 40 s of polling plus a 25 s fallback run, 65 s, still
-        inside 120. The two derived bounds keep the same ordering: the wrapper gives Run.ps1
-        TimeoutMs-15 s so it can always report a child hang BEFORE this poll gives up, and
-        self-destructs at TimeoutMs+15 s so an orphan nobody kills still dies inside the runner's
-        idle budget.
+        THE BUDGET, and why it is this small. Run-Tests.ps1 force-kills a suite that produces no
+        output for IdleTimeoutSeconds, default 120, and this call prints nothing while it waits - so
+        its entire duration is idle time. A deadline ABOVE that budget is worse than no deadline:
+        the runner wins the race and the caller is killed before its own cleanup, so finally never
+        runs and the sandbox survives. The default is 40 s, about 20x the measured cost and a third
+        of the runner's budget. Worst case for the whole case is the still-elevated path: 40 s of
+        waiting plus a 25 s fallback run, 65 s, still inside 120.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Sandbox,
         [Parameter(Mandatory = $true)][hashtable]$Environment,
-        # The two derived budgets below are only ordered correctly for part of the int range, and a
-        # default value is not an invariant - it is one edit away from being wrong. The bounds make
-        # both relations hold by construction:
+        # The bounds make two relations hold by construction rather than by a default value that is
+        # one edit away from being wrong:
         #   lower 20000 keeps CHILD_MS (TimeoutMs-15 s) genuinely below TimeoutMs, so the wrapper can
-        #     still report a child hang before this poll gives up; under it Math::Max clamps to 5 s
-        #     and CHILD_MS would meet or exceed the poll it is supposed to pre-empt.
-        #   upper 100000 keeps SELF_MS (TimeoutMs+15 s = 115 s) inside Run-Tests.ps1's 120 s default
-        #     idle budget, so a wrapper nobody kills still dies before the runner force-kills the
-        #     suite - which is the exact ordering whose absence leaked an orphan process.
-        # The upper bound is coupled to that runner default: Run-Tests.ps1 accepts
-        # -IdleTimeoutSeconds down to 10, and no ValidateRange here can see it, so lowering the
-        # runner's idle budget below ~115 s reintroduces the leak. The runner prints a NOTE when it
-        # force-kills a suite for exactly that reason.
+        #     still report a hung Run.ps1 before this wait gives up; under it Math::Max clamps to 5 s
+        #     and CHILD_MS would meet or exceed the wait it is supposed to pre-empt.
+        #   upper 100000 keeps the whole call inside Run-Tests.ps1's 120 s default idle budget, so
+        #     this function is always the one that kills the wrapper tree and always reaches its own
+        #     cleanup. The bound is coupled to that runner default: Run-Tests.ps1 accepts
+        #     -IdleTimeoutSeconds down to 10, and no ValidateRange here can see it.
         [ValidateRange(20000, 100000)][int]$TimeoutMs = 40000
     )
 
     $wrapper = Join-Path -Path $Sandbox -ChildPath 'DeElevate.ps1'
     $resultFile = Join-Path -Path $Sandbox -ChildPath 'DeElevate.result'
-    $pidFile = Join-Path -Path $Sandbox -ChildPath 'DeElevate.pid'
     [System.IO.File]::WriteAllText($wrapper, $script:DeElevatedWrapperBody)
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = (Join-Path -Path $env:SystemRoot -ChildPath 'System32\runas.exe')
-    # -WindowStyle Hidden is not cosmetic. runas.exe composes its child's startup info itself, so the
-    # CreateNoWindow set below applies to the runas PROCESS and never reaches the process runas
-    # launches: without this the wrapper opens a real console that pops to the foreground and steals
-    # focus every time this case runs. Asking the host to hide its own window at startup is the only
-    # lever the parent has left once runas is in the middle.
-    $psi.Arguments = '/trustlevel:0x20000 "{0}"' -f (
-        '\"{0}\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{1}\"' -f $script:HostExe, $wrapper)
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.WorkingDirectory = $script:RepoRoot
-    foreach ($key in $Environment.Keys) { $psi.EnvironmentVariables[$key] = [string]$Environment[$key] }
-    $psi.EnvironmentVariables['WAC_DEELEVATE_HOST'] = $script:HostExe
-    $psi.EnvironmentVariables['WAC_DEELEVATE_RUN'] = $script:RunPath
-    $psi.EnvironmentVariables['WAC_DEELEVATE_MUTEX'] = 'Global\WacTest{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 8)
-    $psi.EnvironmentVariables['WAC_DEELEVATE_RESULT'] = $resultFile
-    $psi.EnvironmentVariables['WAC_DEELEVATE_PID'] = $pidFile
-    $psi.EnvironmentVariables['WAC_DEELEVATE_CHILD_MS'] = [string][Math]::Max(5000, $TimeoutMs - 15000)
-    $psi.EnvironmentVariables['WAC_DEELEVATE_SELF_MS'] = [string]($TimeoutMs + 15000)
+    $childEnvironment = @{}
+    foreach ($key in $Environment.Keys) { $childEnvironment[$key] = [string]$Environment[$key] }
+    $childEnvironment['WAC_DEELEVATE_HOST'] = $script:HostExe
+    $childEnvironment['WAC_DEELEVATE_RUN'] = $script:RunPath
+    $childEnvironment['WAC_DEELEVATE_MUTEX'] = 'Global\WacTest{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $childEnvironment['WAC_DEELEVATE_RESULT'] = $resultFile
+    $childEnvironment['WAC_DEELEVATE_CHILD_MS'] = [string][Math]::Max(5000, $TimeoutMs - 15000)
 
-    $launchCode = -1
-    $launchText = ''
-    $launcher = $null
+    $started = Start-TestRestrictedProcess -FilePath $script:HostExe -Environment $childEnvironment `
+        -WorkingDirectory $script:RepoRoot -Arguments (ConvertTo-WacCommandLine -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $wrapper))
+
+    if (-not $started.Child) {
+        # This machine cannot hand out a restricted token at all. That is a property of the MACHINE,
+        # not of Run.ps1, so rather than proving nothing this degrades to the token this suite
+        # already holds - which still asserts the contract whenever that token is unprivileged.
+        return (Invoke-InheritedTokenRun -Environment $Environment -Reason (
+                'no restricted token could be produced here: {0}' -f $started.Error))
+    }
+
+    $exited = $false
     try {
-        $launcher = [System.Diagnostics.Process]::Start($psi)
-        $outTask = $launcher.StandardOutput.ReadToEndAsync()
-        $errTask = $launcher.StandardError.ReadToEndAsync()
-
-        if ($launcher.WaitForExit(30000)) {
-            try { $launchCode = [int]$launcher.ExitCode } catch { $launchCode = -1 }
+        $exited = $started.Child.WaitForExit($TimeoutMs)
+        if (-not $exited) {
+            # Killed by handle-pinned id: this process has held the child's handle since it was
+            # created, so Windows cannot have reissued that id to anything else.
+            [void](Stop-WacProcessTree -ProcessId $started.Child.Id)
+            [void]$started.Child.WaitForExit(10000)
         }
-        else {
-            Stop-ProbeTree -ProcessId $launcher.Id
-        }
-
-        [void]$outTask.Wait(5000)
-        [void]$errTask.Wait(5000)
-        $launchText = ('{0} {1}' -f `
-                $(if ($outTask.IsCompleted) { [string]$outTask.Result } else { '' }),
-            $(if ($errTask.IsCompleted) { [string]$errTask.Result } else { '' })).Trim()
     }
     finally {
-        if ($launcher) { try { $launcher.Dispose() } catch { $null = $_ } }
-    }
-
-    if ($launchCode -ne 0) {
-        # runas could not produce a restricted token at all. That is a property of the MACHINE, not
-        # of Run.ps1, so rather than proving nothing this degrades to the token this suite already
-        # holds - which still asserts the contract whenever that token is unprivileged.
-        return (Invoke-InheritedTokenRun -Environment $Environment -Reason (
-                'runas.exe /trustlevel:0x20000 exited {0} and started nothing: [{1}]' -f $launchCode, $launchText))
-    }
-
-    $deadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
-    while ([datetime]::UtcNow -lt $deadline -and -not (Test-Path -LiteralPath $resultFile -PathType Leaf)) {
-        Start-Sleep -Milliseconds 200
+        try { $started.Child.Dispose() } catch { $null = $_ }
     }
 
     if (-not (Test-Path -LiteralPath $resultFile -PathType Leaf)) {
         return [PSCustomObject]@{
             Status    = 'timeout'
             ExitCode  = -1
-            Mechanism = 'runas-trustlevel-0x20000'
-            Detail    = ('the de-elevated run wrote no result inside {0} ms; {1}' -f $TimeoutMs, (Stop-DeElevatedOrphan -PidFile $pidFile))
+            Mechanism = 'safer-normaluser-createprocessasuser'
+            Detail    = ('the de-elevated run wrote no result inside {0} ms; the wrapper {1}' -f `
+                    $TimeoutMs, $(if ($exited) { 'exited without writing one' } else { 'never exited, so its tree was killed' }))
         }
     }
 
@@ -643,7 +477,7 @@ function Invoke-DeElevatedRun {
         return [PSCustomObject]@{
             Status    = 'timeout'
             ExitCode  = -1
-            Mechanism = 'runas-trustlevel-0x20000'
+            Mechanism = 'safer-normaluser-createprocessasuser'
             Detail    = ('the de-elevated wrapper reported [{0}] instead of a clean Run.ps1 exit' -f $note)
         }
     }
@@ -651,7 +485,7 @@ function Invoke-DeElevatedRun {
     return [PSCustomObject]@{
         Status    = 'ok'
         ExitCode  = $exitCode
-        Mechanism = 'runas-trustlevel-0x20000'
+        Mechanism = 'safer-normaluser-createprocessasuser'
         Detail    = ''
     }
 }
@@ -940,16 +774,25 @@ Test-Case 'A scheduled run that is not elevated fails instead of cleaning' {
     # mechanism actually used and the exit code the child returned, so ONE elevated run of this
     # suite settles which path was taken instead of leaving it to be argued.
     #
-    # RISK, stated plainly. If runas /trustlevel:0x20000 ever fails to hand out a restricted token
-    # on an elevated GitHub windows-latest runner, Invoke-DeElevatedRun degrades to the token this
-    # suite already holds - but on an elevated runner there is no unprivileged token to degrade to,
-    # so the case SKIPS, which exits the suite 3 and turns the whole CI run red. That is accepted
-    # deliberately: the only other option on an elevated host is to start Run.ps1 -Scheduled with a
-    # full token, which would perform a real cleanup of the runner. A red run saying "this machine
-    # could not produce an unprivileged token" is a correct report; a green run that proved nothing
-    # is what R-23 was. The obvious dependency scare does not apply: Secondary Logon (seclogon) is
-    # Stopped/Manual on the machine these numbers came from and runas /trustlevel:0x20000 still
-    # worked, so the mechanism does not need that service running.
+    # RISK, stated plainly. The token now comes from SaferCreateLevel + SaferComputeTokenFromLevel
+    # called here, and the process from CreateProcessAsUser - the same API runas /trustlevel:0x20000
+    # uses internally, but WITHOUT runas, which is the only way to pass CREATE_NO_WINDOW and stop a
+    # console (and, where Windows Terminal is the default terminal, a window that steals focus) from
+    # being created at all. runas is proven on a hosted runner and this call is not, so if either
+    # Safer call or CreateProcessAsUser behaves differently there, Invoke-DeElevatedRun degrades to
+    # the FALLBACK: Run.ps1 under the token this suite already holds, which proves exactly the same
+    # contract whenever that token is unprivileged, and on an elevated runner proves nothing and
+    # therefore SKIPS - which exits the suite 3 and turns the whole CI run red.
+    #
+    # That is accepted deliberately: the only other option on an elevated host is to start Run.ps1
+    # -Scheduled with a full token, which would perform a real cleanup of the runner. A red run
+    # saying "this machine could not produce an unprivileged token" is a correct report; a green run
+    # that proved nothing is what R-23 was. Nor is the token trusted on the API's word: the wrapper
+    # reports the token it actually holds, and a token that came back privileged takes the same
+    # fallback rather than letting an elevated -Scheduled run masquerade as a de-elevated one.
+    # The obvious dependency scare does not apply: Secondary Logon (seclogon) is Stopped/Manual on
+    # the machine these numbers came from and the Safer path still worked, so the mechanism does not
+    # need that service running.
     $sandbox = New-TestSandbox -Prefix 'orch-scheduled'
     try {
         # An UNELEVATED run logs under the user's own profile on purpose: whoever CREATES
