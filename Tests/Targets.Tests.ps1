@@ -335,6 +335,75 @@ Test-Case 'Get-WacEdgeProfilePath never returns a reparse point' {
     }
 }
 
+# ---------------------------------------------------------------------------------------------
+# Locations a running service owns are not in the allow-list at all
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'no Windows Update or Delivery Optimization service location is in the allow-list' {
+    # Raw deletion there races the service that owns the files, and the documented Windows Update
+    # repair procedure stops wuauserv (and bits and cryptsvc) and RENAMES the folder rather than
+    # deleting it. This tool stops no service, so it does not go there at all: Delivery Optimization
+    # is purged through its own supported cmdlet instead.
+    $forbidden = @($script:AllTarget | Where-Object { $_.Path -match '(?i)\\SoftwareDistribution\\|\\DeliveryOptimization\\' })
+    Assert-Equal 0 $forbidden.Count ('a service-owned location reached the allow-list: {0}' -f (($forbidden | ForEach-Object { $_.Path }) -join '; '))
+
+    foreach ($category in @('Delivery Optimization cache', 'Windows Update download cache contents')) {
+        $named = @($script:AllTarget | Where-Object { $_.Category -eq $category })
+        Assert-Equal 0 $named.Count ('the {0} category is still emitted' -f $category)
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The bounded allow-list
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'the bounded allow-list is the same list the unbounded builder produces' {
+    $set = Get-WacCleanupTargetSet
+
+    Assert-Equal 'Succeeded' $set.Outcome $set.Detail
+    Assert-Equal $script:AllTarget.Count (@($set.Target)).Count ('bounded: {0}' -f $set.Detail)
+
+    $expected = @($script:AllTarget | ForEach-Object { '{0}|{1}' -f $_.Mode, $_.Path } | Sort-Object)
+    $actual = @($set.Target | ForEach-Object { '{0}|{1}' -f $_.Mode, $_.Path } | Sort-Object)
+    Assert-Equal ($expected -join "`n") ($actual -join "`n") 'the bounded builder returned a different allow-list'
+
+    # A second run over the same machine state stays exactly as benign as the first.
+    $second = Get-WacCleanupTargetSet
+    Assert-Equal 'Succeeded' $second.Outcome $second.Detail
+    Assert-Equal $script:AllTarget.Count (@($second.Target)).Count
+}
+
+Test-Case 'the bounded allow-list carries SkipCategory across the bound' {
+    $set = Get-WacCleanupTargetSet -SkipCategory @('Windows Prefetch contents', 'Windows.old folder')
+
+    Assert-Equal 'Succeeded' $set.Outcome $set.Detail
+    Assert-Equal 0 (@($set.Target | Where-Object { $_.Category -eq 'Windows Prefetch contents' })).Count 'a skipped category survived the bound'
+    Assert-Equal 0 (@($set.Target | Where-Object { $_.DeleteRoot })).Count 'skipping Windows.old must remove the only DeleteRoot target'
+    Assert-True ((@($set.Target)).Count -lt $script:AllTarget.Count) 'the skip list was dropped on the way into the bound'
+}
+
+Test-Case 'an exhausted run budget makes the allow-list Incomplete rather than empty' {
+    # Not a stub: the real bound refuses to SCHEDULE work once the budget is gone, which is the
+    # behaviour that matters - an empty allow-list and an allow-list that was never built look
+    # identical to the caller, and only one of them means "nothing to clean".
+    Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddSeconds(-5))
+    try {
+        $set = Get-WacCleanupTargetSet
+
+        Assert-Equal 'Incomplete' $set.Outcome $set.Detail
+        Assert-Equal 0 (@($set.Target)).Count 'targets were produced after the budget expired'
+        Assert-True ($set.Detail -match 'could not be built') $set.Detail
+    }
+    finally {
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddDays(30))
+    }
+
+    # And the budget is the only thing that was wrong: the very next call is clean again.
+    $recovered = Get-WacCleanupTargetSet
+    Assert-Equal 'Succeeded' $recovered.Outcome $recovered.Detail
+    Assert-True ((@($recovered.Target)).Count -gt 0)
+}
+
 Test-Case 'Get-WacEdgeProfilePath returns nothing for a missing or file-shaped User Data root' {
     $sandbox = New-TestSandbox -Prefix 'tg-edgemissing'
     try {

@@ -16,7 +16,10 @@
     There are two classes of scenario and the summary keeps them apart.
 
     SANDBOXED - EXIT5, EXIT3, EXIT2. Each runs the REAL Run.ps1 as a bounded child process whose
-    %ProgramData%, %LOCALAPPDATA%, %TEMP% and %TMP% are redirected into a disposable sandbox, so the
+    %ProgramData%, %LOCALAPPDATA%, %TEMP% and %TMP% are redirected into a disposable sandbox under
+    %ProgramData%\WindowsAutoCleanup\Verification\Sandbox - NOT under %TEMP%, because an elevated
+    child refuses a state directory that is not machine-trusted and a per-user temp directory is
+    not one. The harness proves that root is trusted before it starts anything. So the
     run log, the machine state directory and every cleanup target derived from those roots land
     inside the sandbox instead of on the operator's machine. Every allow-list category except the
     single sandbox-confined one the scenario needs is disabled with -SkipCategory, the Recycle Bin
@@ -345,6 +348,34 @@ function Get-MatchingLine {
         }
     }
     return @($found.ToArray())
+}
+
+# Every documented Run.ps1 exit code, so a mismatch names what the child actually reported rather
+# than leaving a bare number to be looked up. 6 and 7 were added with the outcome contract: a
+# scenario that suddenly reports one of them is usually the harness's own environment - an
+# untrusted sandbox root or a budget that expired - and not the behaviour it was checking.
+$script:RunExitCodeName = @{
+    0 = 'success'
+    1 = 'error, missing privileges, or an unhandled failure'
+    2 = 'completed with at least one failure'
+    3 = 'another run holds the machine-wide lock'
+    4 = 'elevation was cancelled or failed'
+    5 = 'unsupported system drive'
+    6 = 'incomplete - the budget expired, a deadline was hit, or no durable audit log was produced'
+    7 = 'security refusal - a safety check refused to proceed on evidence'
+}
+
+function Get-RunExitDetail {
+    <#
+    .SYNOPSIS
+        An exit code with the meaning Run.ps1 documents for it.
+    #>
+    param([Parameter(Mandatory = $true)][int]$ExitCode)
+
+    if ($script:RunExitCodeName.ContainsKey($ExitCode)) {
+        return ('{0} [{1}]' -f $ExitCode, $script:RunExitCodeName[$ExitCode])
+    }
+    return ('{0} [not a documented Run.ps1 exit code]' -f $ExitCode)
 }
 
 function Test-KeyValue {
@@ -684,7 +715,7 @@ function Invoke-Exit5Scenario {
                 [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
             }
             if ($result.ExitCode -ne 5) {
-                [void]$problem.Add(('expected exit 5, got {0}. stderr: {1}' -f $result.ExitCode, $result.ErrorText.Trim()))
+                [void]$problem.Add(('expected exit 5, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
             }
 
             $text = Get-SandboxLogText -Sandbox $sandbox
@@ -803,7 +834,7 @@ function Invoke-Exit3Scenario {
                 }
                 if ($secondResult.ExitCode -ne 3) {
                     [void]$problem.Add(('expected the second run to exit 3, got {0}. stderr: {1}' -f `
-                        $secondResult.ExitCode, $secondResult.ErrorText.Trim()))
+                        (Get-RunExitDetail -ExitCode $secondResult.ExitCode), $secondResult.ErrorText.Trim()))
                 }
 
                 $secondText = Get-SandboxLogText -Sandbox $secondSandbox
@@ -932,7 +963,7 @@ function Invoke-Exit2Scenario {
                 [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
             }
             if ($result.ExitCode -ne 2) {
-                [void]$problem.Add(('expected exit 2, got {0}. stderr: {1}' -f $result.ExitCode, $result.ErrorText.Trim()))
+                [void]$problem.Add(('expected exit 2, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
             }
 
             $text = Get-SandboxLogText -Sandbox $sandbox
@@ -968,7 +999,9 @@ function Invoke-Exit2Scenario {
                 }
             }
 
-            [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $text -Needle 'completed with failures')
+            # The footer records the run's OUTCOME by name now, not a sentence: status=Failed is
+            # what maps to exit 2, and its absence means the 2 came from somewhere else.
+            [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $text -Needle 'status=Failed')
 
             if (Test-Path -LiteralPath $deletable -PathType Leaf) {
                 [void]$problem.Add('the deletable bait file survived, so the sweep never really ran')
@@ -1110,6 +1143,82 @@ function Compare-StateFlagSnapshot {
 # Scenario DRIVERS - a real -PruneSupersededDrivers run (CHANGES THE MACHINE)
 # ------------------------------------------------------------------------------------------------
 
+function ConvertTo-VerificationUtcText {
+    <#
+    .SYNOPSIS
+        A manifest timestamp as ISO-8601 UTC text, whatever ConvertFrom-Json made of it.
+    .DESCRIPTION
+        Measured on this project's two hosts: PowerShell 7's ConvertFrom-Json turns an ISO-8601
+        string into a [datetime] and Windows PowerShell 5.1 leaves it a string, so a bare [string]
+        cast yields '2026-08-24T00:00:05Z' on one host and a locale-formatted '08/24/2026
+        00:00:05' on the other. Evidence that differs by host is evidence nobody can compare.
+    #>
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [datetime]) { return ([datetime]$Value).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    return [string]$Value
+}
+
+function Get-DriverBackupRecord {
+    <#
+    .SYNOPSIS
+        Every wac-driver-backup.json under the backup root, with the directory holding it.
+    .DESCRIPTION
+        A backup directory is CONTENT-ADDRESSED - <stem>_<version>_<hash16> - because oem<n>.inf is
+        a recyclable name that Windows hands to an unrelated package after a removal. So the oem
+        name cannot be turned back into a path: Join-Path <backupRoot> <oem name> can never exist,
+        and a check built on it reports 'no recoverable export' for every package that really was
+        deleted. The manifest is the only thing that maps a directory back to the package it came
+        from, so this reads that instead, and reports what it could not read rather than skipping.
+    #>
+    param([Parameter(Mandatory = $true)][string]$BackupRoot)
+
+    $record = New-Object 'System.Collections.Generic.List[object]'
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return @($record.ToArray()) }
+
+    foreach ($directory in @(Get-ChildItem -LiteralPath $BackupRoot -Directory -ErrorAction SilentlyContinue)) {
+        $manifestPath = Join-Path -Path $directory.FullName -ChildPath 'wac-driver-backup.json'
+        $manifest = $null
+        $unreadable = ''
+
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            $unreadable = 'it holds no wac-driver-backup.json'
+        }
+        else {
+            try { $manifest = ConvertFrom-Json ([System.IO.File]::ReadAllText($manifestPath, [System.Text.Encoding]::UTF8)) }
+            catch { $unreadable = 'its manifest could not be parsed: {0}' -f $_.Exception.Message }
+        }
+
+        $driverName = ''
+        $originalName = ''
+        $deletedUtc = ''
+        if ($manifest) {
+            $property = @($manifest.PSObject.Properties.Name)
+            if ($property -ccontains 'DriverName') { $driverName = [string]$manifest.DriverName }
+            if ($property -ccontains 'OriginalName') { $originalName = [string]$manifest.OriginalName }
+            if ($property -ccontains 'DeletedUtc') { $deletedUtc = ConvertTo-VerificationUtcText -Value $manifest.DeletedUtc }
+            if (-not $driverName) { $unreadable = 'its manifest names no DriverName' }
+        }
+
+        # The manifest itself is not an export: a directory holding nothing else is not a
+        # recoverable copy of anything.
+        $fileCount = @(Get-ChildItem -LiteralPath $directory.FullName -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ine 'wac-driver-backup.json' }).Count
+
+        [void]$record.Add([PSCustomObject]@{
+            Directory    = $directory.FullName
+            DriverName   = $driverName
+            OriginalName = $originalName
+            DeletedUtc   = $deletedUtc
+            FileCount    = $fileCount
+            Unreadable   = $unreadable
+        })
+    }
+
+    return @($record.ToArray())
+}
+
 function Invoke-DriversScenario {
     <#
     .SYNOPSIS
@@ -1165,7 +1274,7 @@ function Invoke-DriversScenario {
                     [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
                 }
                 if ($result.ExitCode -ne 0) {
-                    [void]$problem.Add(('expected exit 0, got {0}. stderr: {1}' -f $result.ExitCode, $result.ErrorText.Trim()))
+                    [void]$problem.Add(('expected exit 0, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
                 }
 
                 # The machine-state assertions come FIRST, on purpose. Get-SandboxLogText throws
@@ -1194,18 +1303,36 @@ function Invoke-DriversScenario {
                         $keepSandbox = $true
                         [void]$evidence.Add(('the sandbox is PRESERVED: {0} holds the only recoverable copy of every deleted package' -f $backupRoot))
 
+                        $backup = @(Get-DriverBackupRecord -BackupRoot $backupRoot)
+                        [void]$evidence.Add(('backup directories under {0}: {1}' -f $backupRoot, $backup.Count))
+                        foreach ($broken in @($backup | Where-Object { $_.Unreadable })) {
+                            [void]$problem.Add(('the backup directory {0} cannot be identified - {1}' -f $broken.Directory, $broken.Unreadable))
+                        }
+
                         foreach ($name in $removed) {
-                            $exportDirectory = Join-Path -Path $backupRoot -ChildPath $name
-                            $exported = @()
-                            if (Test-Path -LiteralPath $exportDirectory -PathType Container) {
-                                $exported = @(Get-ChildItem -LiteralPath $exportDirectory -File -Recurse -ErrorAction SilentlyContinue)
+                            $match = @($backup | Where-Object { [string]$_.DriverName -ieq $name })
+                            if ($match.Count -eq 0) {
+                                [void]$problem.Add(('BLOCKER: {0} left the driver store and no manifest under {1} claims it, so nothing recoverable was exported' -f $name, $backupRoot))
+                                continue
+                            }
+                            if ($match.Count -gt 1) {
+                                [void]$problem.Add(('{0} is claimed by {1} backup directories, so which one is the recoverable copy is ambiguous' -f $name, $match.Count))
                             }
 
-                            if ($exported.Count -eq 0) {
-                                [void]$problem.Add(('BLOCKER: {0} left the driver store with no recoverable export under {1}' -f $name, $exportDirectory))
+                            $exported = $match[0]
+                            if ($exported.FileCount -lt 1) {
+                                [void]$problem.Add(('BLOCKER: the backup for {0} at {1} holds nothing but its manifest' -f $name, $exported.Directory))
                             }
-                            else {
-                                [void]$evidence.Add(('{0} deleted, {1} file(s) exported to {2}' -f $name, $exported.Count, $exportDirectory))
+                            # DeletedUtc is what tells a backup apart from an export of a package
+                            # that is still installed. Empty here means the manifest still claims
+                            # the package is in the store, which a restore would read as "no copy
+                            # of a deleted package".
+                            if (-not $exported.DeletedUtc) {
+                                [void]$problem.Add(('{0} was removed from the driver store but its manifest at {1} never recorded DeletedUtc' -f $name, $exported.Directory))
+                            }
+                            if ($exported.FileCount -ge 1 -and $exported.DeletedUtc) {
+                                [void]$evidence.Add(('{0} ({1}) deleted at {2}; {3} file(s) exported to {4}' -f `
+                                    $name, $exported.OriginalName, $exported.DeletedUtc, $exported.FileCount, $exported.Directory))
                             }
                         }
                     }
@@ -1307,7 +1434,7 @@ function Invoke-CleanmgrScenario {
                 [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
             }
             if ($result.ExitCode -ne 0) {
-                [void]$problem.Add(('expected exit 0, got {0}. stderr: {1}' -f $result.ExitCode, $result.ErrorText.Trim()))
+                [void]$problem.Add(('expected exit 0, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
             }
 
             # The restore assertion runs FIRST: it is the machine state this scenario exists to
@@ -1382,13 +1509,35 @@ if (-not (Test-WacIsAdministrator)) {
 if (-not (Initialize-VerificationLock)) { exit 2 }
 
 $script:HostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-$script:SandboxRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+# NOT %TEMP%, which is where this used to live. Each sandbox becomes the child's %ProgramData%,
+# and an ELEVATED child verifies that its state directory is machine-trusted: measured on a stock
+# Windows 11 install, a sandbox under a per-user temp directory answers untrusted at every level
+# of the chain, so every scenario that reached the footer would exit 7 (security refusal) instead
+# of the code it was checking. %ProgramData%\WindowsAutoCleanup is trusted, and it is also a safer
+# home for the DRIVERS sandbox, which is KEPT when it holds the only recoverable copy of a deleted
+# driver package - a temp cleaner is exactly what must not reach that.
+$script:SandboxRoot = [System.IO.Path]::GetFullPath((Join-Path -Path (Get-WacDataRoot) -ChildPath 'Verification\Sandbox'))
+try { [void][System.IO.Directory]::CreateDirectory($script:SandboxRoot) }
+catch {
+    Write-Host ('REFUSED: the sandbox root {0} could not be created: {1}' -f $script:SandboxRoot, $_.Exception.Message)
+    exit 2
+}
 
 # Run.ps1 only ever builds targets on C:, so a sandbox anywhere else would produce no target at all
 # and every scenario would pass for the wrong reason.
 if (-not (Test-WacIsOnTargetDrive -Path $script:SandboxRoot)) {
-    Write-Host ('REFUSED: the temp directory {0} is not on {1}, so no sandbox path could ever become an allow-list target.' -f `
+    Write-Host ('REFUSED: the sandbox root {0} is not on {1}, so no sandbox path could ever become an allow-list target.' -f `
         $script:SandboxRoot, (Get-WacTargetDrive))
+    exit 2
+}
+
+# Refuse loudly rather than let every scenario report a security refusal the harness itself caused.
+# This is the same check the child makes on its own state directory, made here on the directory
+# the child's %ProgramData% will live in.
+$script:SandboxTrust = Test-WacStatePathIsTrusted -Path $script:SandboxRoot
+if (-not $script:SandboxTrust.IsTrusted) {
+    Write-Host ('REFUSED: the sandbox root {0} is not machine-trusted, so every child would exit 7 (security refusal) whatever else it did.' -f $script:SandboxRoot)
+    Write-Host ('         {0}' -f $script:SandboxTrust.Reason)
     exit 2
 }
 

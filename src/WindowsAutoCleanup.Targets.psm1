@@ -19,12 +19,32 @@
     What is deliberately NOT here: browser history, cookies, saved passwords, WebCache, Recent items,
     Quick Access, pinned or frequent destinations, and the Chromium profile root itself. Only
     regenerable caches are listed.
+
+    Also deliberately NOT here: SoftwareDistribution\Download and the Delivery Optimization cache
+    directories. Both belong to running services. The documented Windows Update repair procedure
+    stops wuauserv (and bits and cryptsvc) and RENAMES the folder rather than deleting it, and this
+    tool stops no service: it cannot record every original state and start mode, bound every wait
+    and guarantee a verified restoration, so it does not start. Delivery Optimization is purged
+    through its own supported cmdlet instead (Clear-WacDeliveryOptimizationCache), which coordinates
+    with the service that owns the files, and the cleanmgr 'Delivery Optimization Files' handler
+    remains available behind the opt-in legacy step.
+
+    Building this list walks the filesystem and queries Win32_UserProfile, so callers that need the
+    run budget enforced over it use Get-WacCleanupTargetSet, which returns an outcome alongside the
+    list. Get-WacCleanupTarget itself stays unbounded: it is the worker the bound runs.
 #>
 
 Set-StrictMode -Version 2.0
 
 # No -Force: force-reloading a nested module tears it out of the CALLER's session too.
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Core.psm1') -DisableNameChecking -ErrorAction Stop
+
+# Captured at import: inside a module $PSCommandPath is this .psm1, and Invoke-WacBounded needs a
+# real path to import into the runspace it creates.
+$script:TargetsModulePath = $PSCommandPath
+
+# A ceiling, not an expected duration: a healthy machine builds the list in well under a second.
+$script:TargetBuildTimeoutMs = 1000 * 60 * 2
 
 # Per-user cache directories, relative to a profile root. Order is the cleanup order.
 $script:UserCacheTarget = @(
@@ -209,19 +229,15 @@ function Get-WacCleanupTarget {
             Add-WacTarget @common -Mode Directory -Category 'Defender scan history' -Path (Join-Path -Path $programData -ChildPath ('Microsoft\Windows Defender\Scans\History\' + $historyLeaf))
         }
 
-        Add-WacTarget @common -Mode Directory -Category 'Delivery Optimization cache' -Path (Join-Path -Path $programData -ChildPath 'Microsoft\Windows\DeliveryOptimization\Cache')
         Add-WacTarget @common -Mode Directory -Category 'Location Privacy cache' -Path (Join-Path -Path $programData -ChildPath 'Microsoft\Windows\lfsvc\Cache')
         Add-WacTarget @common -Mode Directory -Category 'Location Privacy cache' -Path (Join-Path -Path $programData -ChildPath 'Microsoft\Windows\LocationProvider')
     }
 
     if ($windowsRoot) {
-        # SoftwareDistribution\Download is documented only as a last-resort Windows Update repair
-        # action whose procedure stops the servicing services first. Coordinating that is the
-        # orchestrator's job (ledger P1-14); this list only names the location.
-        Add-WacTarget @common -Mode Directory -Category 'Windows Update download cache contents' -Path (Join-Path -Path $windowsRoot -ChildPath 'SoftwareDistribution\Download')
+        # SoftwareDistribution\Download and the Delivery Optimization cache directories used to be
+        # listed here. They are gone on purpose: see the module header. Nothing in this list may be
+        # a location a running service owns and this tool cannot quiesce.
         Add-WacTarget @common -Mode Directory -Category 'Downloaded Program Files' -Path (Join-Path -Path $windowsRoot -ChildPath 'Downloaded Program Files')
-        Add-WacTarget @common -Mode Directory -Category 'Delivery Optimization cache' -Path (Join-Path -Path $windowsRoot -ChildPath 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache')
-        Add-WacTarget @common -Mode Directory -Category 'Delivery Optimization cache' -Path (Join-Path -Path $windowsRoot -ChildPath 'SoftwareDistribution\DeliveryOptimization\Cache')
         Add-WacTarget @common -Mode Directory -Category 'Windows Prefetch contents' -Path (Join-Path -Path $windowsRoot -ChildPath 'Prefetch')
     }
 
@@ -231,4 +247,53 @@ function Get-WacCleanupTarget {
     return @($targets.ToArray())
 }
 
-Export-ModuleMember -Function @('Get-WacCleanupTarget', 'Get-WacEdgeProfilePath', 'Add-WacTarget')
+function Get-WacCleanupTargetSet {
+    <#
+    .SYNOPSIS
+        The allow-list built under a wall-clock bound, with an outcome instead of a silent empty list.
+    .DESCRIPTION
+        Building the list walks the filesystem - every profile's Edge 'User Data', every candidate
+        cache directory - and queries Win32_UserProfile through CIM. Both block in the OS, and a
+        call that blocks in the OS blocks every cooperative deadline check sitting behind it, so
+        this work runs through Invoke-WacBounded.
+
+        The distinction that matters is the one the bare list cannot express: an EMPTY allow-list
+        and an allow-list that was never finished look identical to a caller, and the second one
+        must not be reported as "nothing to clean". An expired or exceeded bound returns Incomplete
+        with an empty Target, which the shared contract maps to a non-zero exit code.
+    .OUTPUTS
+        Outcome (Succeeded | Incomplete | Failed), Target, Detail, DurationMs.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$SkipCategory = @())
+
+    # @(, ...) keeps the array ONE argument: Invoke-WacBounded adds each element of -ArgumentList as
+    # its own positional argument, so an unwrapped array arrives as N of them.
+    $bounded = Invoke-WacBounded -Component 'Targets' -TimeoutMs $script:TargetBuildTimeoutMs `
+        -ImportModule @($script:TargetsModulePath) -ArgumentList @(, [string[]]@($SkipCategory)) -ScriptBlock {
+            param($SkipCategory)
+            @(Get-WacCleanupTarget -SkipCategory ([string[]]@($SkipCategory)))
+        }
+
+    $target = @()
+    $detail = ''
+    if ($bounded.Outcome -ceq 'Succeeded') {
+        $target = @($bounded.Output)
+        $detail = 'The allow-list holds {0} target(s).' -f $target.Count
+    }
+    else {
+        $detail = 'The cleanup allow-list could not be built: {0}' -f $bounded.Error
+        Write-WacLog -Level WARNING -Component 'Targets' -Message 'The cleanup allow-list could not be built, so no target was attempted.' -Data @{
+            outcome = $bounded.Outcome; error = $bounded.Error
+        }
+    }
+
+    return [PSCustomObject]@{
+        Outcome    = $bounded.Outcome
+        Target     = $target
+        Detail     = $detail
+        DurationMs = [int]$bounded.DurationMs
+    }
+}
+
+Export-ModuleMember -Function @('Get-WacCleanupTarget', 'Get-WacCleanupTargetSet', 'Get-WacEdgeProfilePath', 'Add-WacTarget')

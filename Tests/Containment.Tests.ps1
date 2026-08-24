@@ -136,8 +136,93 @@ Test-Case 'Remove-WacLeaf refuses a path that resolves outside its root' {
             'the sentinel outside the allow-listed root was deleted'
         Assert-Equal 0 ([int]$stats.FilesDeleted) 'something was counted as deleted'
         Assert-Equal 0 ([int]$stats.Failed) 'the refusal was recorded as a failure'
-        Assert-True ($stats.SkippedReparse -ge 1) `
-            'the refusal was not recorded as a redirection, so the log would not explain it'
+
+        # RefusedIdentity, not SkippedReparse. The two used to share a counter, which made the whole
+        # family useless for an exit code: an ordinary run legitimately skips reparse roots (a real
+        # elevated run scored skipReparse=3, all of them the per-profile Temporary Internet Files
+        # junction), so a refusal had to get a counter no ordinary run can touch.
+        Assert-Equal 1 ([int]$stats.RefusedIdentity) `
+            'the refusal was not recorded as an identity refusal, so the exit code cannot see it'
+        Assert-Equal 0 ([int]$stats.SkippedReparse) 'a refusal is still being counted as a benign skip'
+
+        # The individual counter is not the field the exit code reads - the roll-up is, and nothing
+        # pinned it. Get-WacRefusedTotal could return a constant 0 and every other Refused assertion
+        # in this tree still passed, because every one of them expects 0.
+        Assert-Equal 1 (Get-WacRefusedTotal -Stats $stats) `
+            'the refusal roll-up does not see an identity refusal'
+    }
+    finally {
+        Remove-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'allowlisted\swapped')
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A path that canonicalises outside the root is refused on the out-of-root counter' {
+    <#
+        The other half of the split, and the half nothing else in this file reaches: the escaping
+        path in the case above is LEXICALLY inside the root (it goes through a junction), so it lands
+        on RefusedIdentity. A counter no test can produce is a counter nobody can trust, and this one
+        feeds an exit code.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'contain-outofroot'
+    try {
+        $root = Join-Path -Path $sandbox -ChildPath 'allowlisted'
+        $outside = Join-Path -Path $sandbox -ChildPath 'outside'
+        [void][System.IO.Directory]::CreateDirectory($root)
+        [void][System.IO.Directory]::CreateDirectory($outside)
+        $sentinel = Join-Path -Path $outside -ChildPath 'SENTINEL.dll'
+        [System.IO.File]::WriteAllText($sentinel, 'MUST SURVIVE')
+
+        $stats = New-WacDeletionStats
+        Remove-WacLeaf -Path $sentinel -RootPath $root -Stats $stats
+
+        Assert-True ([System.IO.File]::Exists($sentinel)) 'a file outside the root was deleted'
+        Assert-Equal 1 ([int]$stats.RefusedOutOfRoot) 'the containment refusal was counted somewhere else'
+        Assert-Equal 0 ([int]$stats.SkippedOutOfRoot) 'a real escape was filed as a benign skip'
+        Assert-Equal 0 ([int]$stats.FilesDeleted)
+        Assert-Equal 1 (Get-WacRefusedTotal -Stats $stats) `
+            'the refusal roll-up does not see an out-of-root refusal'
+
+        # ...and it has to survive the trip through the object the orchestrator actually reads.
+        $result = New-WacTreeResult -Category 'outofroot' -Path $root -Stats $stats -Attempted $true
+        Assert-Equal 1 ([int]$result.RefusedOutOfRoot)
+        Assert-Equal 1 ([int]$result.Refused) 'New-WacTreeResult dropped the refusal on the way out'
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'Remove-WacTree refuses a root reached only through a junction' {
+    <#
+        The whole-target shape of the identity refusal, and the only case that proves Refused is
+        wired all the way out to the caller. The target is not itself a reparse point - so the cheap
+        attribute test at the top of Remove-WacTree cannot catch it - but its path reaches the object
+        only through one, so the handle check has to. Everything above pins refusals on a raw stats
+        object, which left New-WacTreeResult free to drop the roll-up the exit code keys off.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'contain-rootswap'
+    try {
+        $fixture = New-EscapeFixture -Sandbox $sandbox
+
+        $realSub = Join-Path -Path $fixture.Outside -ChildPath 'nested'
+        [void][System.IO.Directory]::CreateDirectory($realSub)
+        $victim = Join-Path -Path $realSub -ChildPath 'SENTINEL.dll'
+        [System.IO.File]::WriteAllText($victim, 'MUST SURVIVE')
+
+        $target = Join-Path -Path $fixture.Link -ChildPath 'nested'
+        Assert-False (Test-WacIsReparsePoint -Path $target) `
+            'the fixture is wrong: the target itself must not be a reparse point'
+
+        $result = Remove-WacTree -Category 'rootswap' -Path $target
+
+        Assert-False $result.Attempted 'a redirected root was swept'
+        Assert-Equal 1 ([int]$result.RefusedIdentity) 'a redirected root was not counted as an identity refusal'
+        Assert-Equal 1 ([int]$result.Refused) 'the refusal never reached the field the exit code reads'
+        Assert-Equal 0 ([int]$result.SkippedVanished) 'a live redirected root was written off as vanished'
+        Assert-Equal 0 ([int]$result.SkippedReparse) 'a refusal was filed as a routine reparse skip'
+        Assert-Equal 0 ([int]$result.FilesDeleted)
+        Assert-True ([System.IO.File]::Exists($victim)) 'the sweep ran out through the junction'
     }
     finally {
         Remove-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'allowlisted\swapped')
@@ -188,6 +273,7 @@ Test-Case 'The containment guard does not refuse ordinary deletions' {
         Assert-Equal 1 ([int]$stats.FilesDeleted) 'a normal file inside the root was not deleted'
         Assert-False ([System.IO.File]::Exists($ordinary))
         Assert-Equal 0 ([int]$stats.SkippedReparse)
+        Assert-Equal 0 (Get-WacRefusedTotal -Stats $stats) 'an ordinary deletion was reported as a refusal'
     }
     finally {
         Remove-TestSandbox -Path $sandbox
@@ -202,7 +288,7 @@ Test-Case 'A nested junction is deleted as a link and its target survives' {
         # A reparse point is exempt from the handle check on purpose: removing the LINK is the
         # intended outcome, and resolving it would make the check refuse its own job.
         $stats = New-WacDeletionStats
-        Remove-WacLeaf -Path $fixture.Link -RootPath $fixture.Root -Stats $stats -IsDirectory -IsReparsePoint -NoPendingDelete
+        Remove-WacLeaf -Path $fixture.Link -RootPath $fixture.Root -Stats $stats -IsDirectory -IsReparsePoint
 
         Assert-Equal 1 ([int]$stats.ReparsePointsDeleted) 'the junction itself was not removed'
         Assert-False (Test-Path -LiteralPath $fixture.Link)
@@ -294,6 +380,329 @@ Test-Case 'A junction AT the root is refused before anything is enumerated' {
     }
     finally {
         Remove-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'rootlink')
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The ancestor-swap race (ledger B2-2 / T-3)
+#
+# The claim under test is NOT "this is race-free". It cannot be: the delete is issued by pathname
+# and the identity check is a separate resolution of the same name, and .NET offers no delete that
+# takes a handle on either host. What is claimed, and what these cases pin, is that a swap already
+# in place when the check runs is refused, that the refusal is counted where an exit code can see
+# it, and that the window left over is the sub-millisecond one between the check and the syscall
+# rather than the multi-second one the predecessor design left open per directory.
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'A swap after the path was captured kills a sentinel unguarded, and is refused guarded' {
+    <#
+        Two runs of the identical sequence over the identical fixture, differing only in which
+        deleter is used. The first is the positive control: without it, "the sentinel survived" would
+        also be true of a fixture that was never lethal, and every other case in this file would pass
+        against a guard that does nothing.
+    #>
+
+    # 1. UNGUARDED. Capture the pathname the way enumeration does, let the ancestor be swapped, then
+    #    delete by that captured name. This is the attack, and it must succeed here.
+    $control = New-TestSandbox -Prefix 'contain-swap-control'
+    try {
+        $root = Join-Path -Path $control -ChildPath 'allowlisted'
+        $spool = Join-Path -Path $root -ChildPath 'spool'
+        $outside = Join-Path -Path $control -ChildPath 'outside'
+        [void][System.IO.Directory]::CreateDirectory($spool)
+        [void][System.IO.Directory]::CreateDirectory($outside)
+
+        $captured = Join-Path -Path $spool -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($captured, 'inside the root')
+        $sentinel = Join-Path -Path $outside -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($sentinel, 'MUST SURVIVE')
+
+        # the swap
+        [System.IO.File]::Delete($captured)
+        [System.IO.Directory]::Delete($spool, $false)
+        New-TestJunction -Link $spool -Target $outside
+
+        [System.IO.File]::Delete($captured)
+        Assert-False ([System.IO.File]::Exists($sentinel)) `
+            'the fixture is not lethal, so nothing in this file proves the guard does anything'
+    }
+    finally {
+        Remove-TestJunction -Link (Join-Path -Path $control -ChildPath 'allowlisted\spool')
+        Remove-TestSandbox -Path $control
+    }
+
+    # 2. GUARDED. Same fixture, same sequence, same captured pathname - routed through the module.
+    $guarded = New-TestSandbox -Prefix 'contain-swap-guarded'
+    try {
+        $root = Join-Path -Path $guarded -ChildPath 'allowlisted'
+        $spool = Join-Path -Path $root -ChildPath 'spool'
+        $outside = Join-Path -Path $guarded -ChildPath 'outside'
+        [void][System.IO.Directory]::CreateDirectory($spool)
+        [void][System.IO.Directory]::CreateDirectory($outside)
+
+        $captured = Join-Path -Path $spool -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($captured, 'inside the root')
+        $sentinel = Join-Path -Path $outside -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($sentinel, 'MUST SURVIVE')
+
+        [System.IO.File]::Delete($captured)
+        [System.IO.Directory]::Delete($spool, $false)
+        New-TestJunction -Link $spool -Target $outside
+
+        $stats = New-WacDeletionStats
+        Remove-WacLeaf -Path $captured -RootPath $root -Stats $stats
+
+        Assert-True ([System.IO.File]::Exists($sentinel)) 'the swap reached the sentinel through the guard'
+        Assert-Equal 'MUST SURVIVE' ([System.IO.File]::ReadAllText($sentinel))
+        Assert-Equal 0 ([int]$stats.FilesDeleted)
+        Assert-Equal 1 ([int]$stats.RefusedIdentity) 'the swap was not counted as an identity refusal'
+        Assert-Equal 0 ([int]$stats.SkippedVanished) 'a live redirected path was written off as vanished'
+    }
+    finally {
+        Remove-TestJunction -Link (Join-Path -Path $guarded -ChildPath 'allowlisted\spool')
+        Remove-TestSandbox -Path $guarded
+    }
+}
+
+Test-Case 'A concurrent junction-swap adversary never reaches a sentinel outside the swept tree' {
+    <#
+        The real shape of the attack: a second thread races the sweep, emptying and re-pointing a
+        directory the sweep is walking, for as long as the sweep runs. Sentinels live in a SEPARATE
+        sandbox that the sweep has no path to, and they are named to collide with the files inside
+        the swept tree, so a delete that resolved through a swapped ancestor lands on one of them.
+
+        Bounded by an iteration count AND a wall deadline; synchronised by an event and a stop flag,
+        never by a sleep; the adversary is torn down and disposed in the finally.
+
+        WHAT THIS CASE IS NOT. It is live-fire assurance, not a regression detector. Measured: with
+        Remove-WacLeaf's identity re-check, the descend re-check AND the entry within-root check all
+        replaced by 'if ($false)', this case still PASSED on both hosts (37 and 61 swaps, zero
+        refusals) - the adversary simply never landed a swap in the sub-millisecond window where a
+        colliding name was about to be deleted. That is itself the measurement of how narrow the
+        residual window is, but it means a future regression will be caught by the deterministic
+        case above, which fails on both hosts under the same mutation, and not by this one. Do not
+        delete that case and keep this one.
+    #>
+    $swept = New-TestSandbox -Prefix 'contain-race'
+    $keep = New-TestSandbox -Prefix 'contain-race-keep'
+    $runspace = $null
+    $shell = $null
+    $async = $null
+    $ready = New-Object System.Threading.ManualResetEventSlim($false)
+    $state = [hashtable]::Synchronized(@{ stop = $false; swaps = 0; errors = 0 })
+
+    $root = Join-Path -Path $swept -ChildPath 'allowlisted'
+    $spool = Join-Path -Path $root -ChildPath 'spool'
+
+    try {
+        [void][System.IO.Directory]::CreateDirectory($root)
+
+        $names = New-Object 'System.Collections.Generic.List[string]'
+        [void]$names.Add('SENTINEL.dll')
+        for ($i = 0; $i -lt 40; $i++) { [void]$names.Add(('f{0:000}.tmp' -f $i)) }
+        foreach ($name in $names) {
+            [System.IO.File]::WriteAllText((Join-Path -Path $keep -ChildPath $name), 'MUST SURVIVE')
+        }
+        $expected = $names.Count
+
+        $adversary = {
+            param($SpoolPath, $EscapeTarget, $State, $Ready)
+
+            $Ready.Set()
+            while (-not $State['stop']) {
+                try {
+                    if ([System.IO.Directory]::Exists($SpoolPath)) {
+                        $isLink = $false
+                        try {
+                            $isLink = ((([int][System.IO.File]::GetAttributes($SpoolPath)) -band
+                                        ([int][System.IO.FileAttributes]::ReparsePoint)) -ne 0)
+                        }
+                        catch { $isLink = $false }
+
+                        if (-not $isLink) {
+                            foreach ($file in [System.IO.Directory]::GetFiles($SpoolPath)) {
+                                try { [System.IO.File]::Delete($file) } catch { $null = $_ }
+                            }
+                        }
+                        # Directory.Delete removes a junction as a link and a real directory only
+                        # when it is empty, which is exactly the two behaviours wanted here.
+                        try { [System.IO.Directory]::Delete($SpoolPath, $false) } catch { $null = $_ }
+                    }
+                    else {
+                        New-Item -ItemType Junction -Path $SpoolPath -Target $EscapeTarget -ErrorAction Stop | Out-Null
+                        $State['swaps'] = [int]$State['swaps'] + 1
+                    }
+                }
+                catch {
+                    $State['errors'] = [int]$State['errors'] + 1
+                }
+            }
+        }
+
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.Open()
+        $shell = [powershell]::Create()
+        $shell.Runspace = $runspace
+        [void]$shell.AddScript([string]$adversary)
+        [void]$shell.AddArgument($spool)
+        [void]$shell.AddArgument($keep)
+        [void]$shell.AddArgument($state)
+        [void]$shell.AddArgument($ready)
+        $async = $shell.BeginInvoke()
+
+        Assert-True ($ready.Wait(10000)) 'the adversary runspace never started'
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $iterations = 0
+        $refusals = 0L
+        while ($iterations -lt 10 -and $watch.Elapsed.TotalMilliseconds -lt 8000) {
+            $iterations++
+
+            # Rebuilding the bait races the adversary by design, so every step of it is tolerant.
+            try {
+                if (-not [System.IO.Directory]::Exists($spool)) {
+                    [void][System.IO.Directory]::CreateDirectory($spool)
+                }
+                foreach ($name in $names) {
+                    try { [System.IO.File]::WriteAllText((Join-Path -Path $spool -ChildPath $name), 'delete me') }
+                    catch { $null = $_ }
+                }
+            }
+            catch {
+                $null = $_
+            }
+
+            $result = Remove-WacTree -Category 'race' -Path $root
+            $refusals += [int64]$result.Refused
+
+            # THE assertion. Nothing in the other sandbox may be touched, on any iteration, ever.
+            $survivors = 0
+            try { $survivors = @([System.IO.Directory]::GetFiles($keep)).Count } catch { $survivors = -1 }
+            Assert-Equal $expected $survivors `
+                ('iteration ' + $iterations + ': the sweep reached outside the swept sandbox (swaps=' +
+                 $state['swaps'] + ' refusals=' + $refusals + ')')
+        }
+        $watch.Stop()
+
+        # Without this the case would pass against an adversary that never managed a single swap.
+        Assert-True ([int]$state['swaps'] -ge 1) `
+            ('the adversary never installed a junction, so nothing was actually raced (errors=' +
+             $state['errors'] + ')')
+        Assert-True ($iterations -ge 1)
+
+        Write-Host ('      race evidence: iterations={0} swaps={1} refusals={2} elapsedMs={3}' -f `
+            $iterations, $state['swaps'], $refusals, [int]$watch.Elapsed.TotalMilliseconds)
+    }
+    finally {
+        $state['stop'] = $true
+        if ($async -and $shell) {
+            try {
+                if (-not $async.AsyncWaitHandle.WaitOne(10000)) { $shell.Stop() }
+                else { [void]$shell.EndInvoke($async) }
+            }
+            catch { $null = $_ }
+        }
+        if ($shell) { try { $shell.Dispose() } catch { $null = $_ } }
+        if ($runspace) { try { $runspace.Dispose() } catch { $null = $_ } }
+        try { $ready.Dispose() } catch { $null = $_ }
+        Remove-TestJunction -Link $spool
+        Remove-TestSandbox -Path $swept
+        Remove-TestSandbox -Path $keep
+    }
+}
+
+Test-Case 'Delayed deletion is never used, because no check made now can bind the name resolved at boot' {
+    <#
+        MoveFileEx(..., MOVEFILE_DELAY_UNTIL_REBOOT) stores the literal path STRING and Session
+        Manager resolves it at the next boot. Part 2 below measures precisely why a pre-registration
+        check cannot help: the same string, authorised while it named a file inside the root, names a
+        file outside it a moment later. Nothing is registered with the OS by this case - queueing a
+        real deletion against the machine running the suite is exactly what must never happen.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'contain-delayed'
+    $handle = $null
+    try {
+        $root = Join-Path -Path $sandbox -ChildPath 'allowlisted'
+        $spool = Join-Path -Path $root -ChildPath 'spool'
+        $outside = Join-Path -Path $sandbox -ChildPath 'outside'
+        [void][System.IO.Directory]::CreateDirectory($spool)
+        [void][System.IO.Directory]::CreateDirectory($outside)
+
+        $locked = Join-Path -Path $spool -ChildPath 'locked.bin'
+        [System.IO.File]::WriteAllText($locked, 'inside the root')
+        [System.IO.File]::WriteAllText((Join-Path -Path $outside -ChildPath 'locked.bin'), 'MUST SURVIVE')
+
+        # 1. A locked file is accounted as locked. It is not queued, at any privilege level.
+        $handle = New-Object System.IO.FileStream(
+            $locked, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+
+        $result = Remove-WacTree -Category 'delayed' -Path $root
+
+        Assert-Equal 0 ([int]$result.PendingDeletes) 'a path was queued for deletion at the next boot'
+        Assert-Equal 1 ([int]$result.SkippedLocked) `
+            ('locked=' + $result.SkippedLocked + ' denied=' + $result.SkippedDenied)
+        Assert-True ([System.IO.File]::Exists($locked))
+
+        # 2. The reason. Core would have authorised this exact path a moment ago...
+        Assert-True (Test-WacIsDeleteOnRebootAllowed -Path $locked) `
+            'the premise changed: the registration guard now refuses an ordinary in-root file'
+
+        $handle.Dispose()
+        $handle = $null
+
+        # ...and here is the swap an attacker has until the next restart to perform.
+        [System.IO.File]::Delete($locked)
+        [System.IO.Directory]::Delete($spool, $false)
+        New-TestJunction -Link $spool -Target $outside
+
+        # Same string. Different file. Outside the root. Nothing re-checks it at boot.
+        Assert-Equal 'MUST SURVIVE' ([System.IO.File]::ReadAllText($locked)) `
+            'the fixture failed to re-point the path, so this proves nothing'
+        Assert-False (Test-WacIsDeleteOnRebootAllowed -Path $locked) `
+            'the guard cannot even see the redirection when asked again'
+    }
+    finally {
+        if ($handle) { try { $handle.Dispose() } catch { $null = $_ } }
+        Remove-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'allowlisted\spool')
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'An ordinary reparse-point root is a skip and never a refusal' {
+    <#
+        The counter that decides the exit code has to stay quiet on the shapes a real run meets. A
+        real elevated run reported skipReparse=3, every one of them the 'Temporary Internet Files'
+        junction that ships in every Windows profile. If that scored as a refusal the tool would
+        report a security event on every machine, every day.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'contain-benign'
+    try {
+        $outside = Join-Path -Path $sandbox -ChildPath 'INetCache'
+        [void][System.IO.Directory]::CreateDirectory($outside)
+        [System.IO.File]::WriteAllText((Join-Path -Path $outside -ChildPath 'cached.dat'), 'must survive')
+
+        $link = Join-Path -Path $sandbox -ChildPath 'Temporary Internet Files'
+        New-TestJunction -Link $link -Target $outside
+
+        $tree = Remove-WacTree -Category 'Internet cache (Temporary Internet Files)' -Path $link
+        Assert-False $tree.Attempted
+        Assert-Equal 1 ([int]$tree.SkippedReparse)
+        Assert-Equal 0 ([int]$tree.RefusedIdentity)
+        Assert-Equal 0 ([int]$tree.RefusedOutOfRoot)
+        Assert-Equal 0 ([int]$tree.Refused) 'a routine reparse-point root was reported as a security refusal'
+
+        $pattern = Remove-WacFilesByPattern -Category 'thumbs' -Path $link -Pattern @('*.dat')
+        Assert-False $pattern.Attempted
+        Assert-Equal 1 ([int]$pattern.SkippedReparse)
+        Assert-Equal 0 ([int]$pattern.RefusedIdentity)
+        Assert-Equal 0 ([int]$pattern.RefusedOutOfRoot)
+        Assert-Equal 0 ([int]$pattern.Refused) 'a routine reparse-point pattern root was reported as a refusal'
+
+        Assert-True ([System.IO.File]::Exists((Join-Path -Path $outside -ChildPath 'cached.dat')))
+    }
+    finally {
+        Remove-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'Temporary Internet Files')
         Remove-TestSandbox -Path $sandbox
     }
 }

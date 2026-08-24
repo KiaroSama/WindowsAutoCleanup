@@ -148,4 +148,126 @@ Test-Case 'An exhausted budget yields a zero timeout and an expired verdict' {
     }
 }
 
+# ---------------------------------------------------------------------------------------------
+# In-process work (ledger B2-6 part B)
+# ---------------------------------------------------------------------------------------------
+#
+# The budget used to cover external tools and the traversal only. The Delivery Optimization cmdlet,
+# a CIM profile query, registry work, a Recycle Bin scan, target construction and the deployment
+# walk all run INSIDE this process, and a call blocked in the OS blocks every deadline check queued
+# behind it. These cases pin the mechanism that bounds them.
+
+Test-Case 'Invoke-WacBounded returns the block output and succeeds inside its bound' {
+    try {
+        Reset-WacTestDeadline
+        $result = Invoke-WacBounded -ScriptBlock { param($a, $b) $a + $b } -ArgumentList @(2, 5) -TimeoutMs 30000
+
+        Assert-Equal 'Succeeded' $result.Outcome
+        Assert-True $result.Started
+        Assert-False $result.TimedOut
+        Assert-False $result.HadErrors
+        Assert-Equal 7 ([int]$result.Output[0])
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+Test-Case 'Invoke-WacBounded cuts off in-process work that blocks, and calls it Incomplete' {
+    try {
+        Reset-WacTestDeadline
+
+        # Thread.Sleep, not Start-Sleep: a cooperative check cannot see this, which is exactly the
+        # class of call the run budget used to miss. Kept to four seconds so the abandoned runspace
+        # thread finishes on its own well inside the suite.
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = Invoke-WacBounded -ScriptBlock { [System.Threading.Thread]::Sleep(4000); 'never' } -TimeoutMs 500
+        $watch.Stop()
+
+        Assert-Equal 'Incomplete' $result.Outcome 'blocked work that was cut off must never read as success'
+        Assert-True $result.Started
+        Assert-True $result.TimedOut
+        Assert-Equal 0 @($result.Output).Count
+        Assert-True ($watch.Elapsed.TotalMilliseconds -lt 3500) `
+            ('the bound was not enforced: ' + [int]$watch.Elapsed.TotalMilliseconds + ' ms')
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+Test-Case 'An expired run budget refuses to schedule new in-process work' {
+    try {
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(-1))
+
+        $result = Invoke-WacBounded -ScriptBlock { 'ran anyway' } -TimeoutMs 30000
+
+        Assert-Equal 'Incomplete' $result.Outcome
+        Assert-False $result.Started 'work was scheduled after the run budget expired'
+        Assert-True $result.TimedOut
+        Assert-Equal 0 @($result.Output).Count
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+Test-Case 'A bounded rollback can still run after the budget is gone' {
+    # Expiry has to stop NEW work without stopping the cleanup that expiry itself makes necessary,
+    # so rollback carries its own explicit bound.
+    try {
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(-1))
+
+        $result = Invoke-WacBounded -ScriptBlock { 'rolled back' } -TimeoutMs 30000 -IgnoreRunBudget
+
+        Assert-Equal 'Succeeded' $result.Outcome
+        Assert-True $result.Started
+        Assert-Equal 'rolled back' ([string]$result.Output[0])
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+Test-Case 'A terminating error inside bounded work is Failed, never Succeeded' {
+    try {
+        Reset-WacTestDeadline
+        $result = Invoke-WacBounded -ScriptBlock { throw 'the step broke' } -TimeoutMs 30000
+
+        Assert-Equal 'Failed' $result.Outcome
+        Assert-True $result.Started
+        Assert-False $result.TimedOut
+        Assert-True ($result.Error -match 'the step broke') ('error was: ' + $result.Error)
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+Test-Case 'Bounded work reaches this module, and a non-terminating error is reported not swallowed' {
+    try {
+        Reset-WacTestDeadline
+
+        # The module import is the default, so a block can call the project's own helpers.
+        $resolved = Invoke-WacBounded -ScriptBlock { param($p) Get-WacNormalizedPath -Path $p } `
+            -ArgumentList @('c:\temp\') -TimeoutMs 30000
+        Assert-Equal 'Succeeded' $resolved.Outcome ('error was: ' + $resolved.Error)
+        Assert-Equal 'C:\temp' ([string]$resolved.Output[0]) 'the block could not reach the module'
+
+        # A non-terminating error did not stop the work, so the outcome stays Succeeded - but it is
+        # handed back rather than dropped, which is what lets the caller decide.
+        $noisy = Invoke-WacBounded -TimeoutMs 30000 -ScriptBlock {
+            Get-Item -LiteralPath 'C:\wac-does-not-exist-4f2a' -ErrorAction Continue
+            'finished anyway'
+        }
+        Assert-Equal 'Succeeded' $noisy.Outcome
+        Assert-True $noisy.HadErrors 'the error stream was swallowed'
+        Assert-True ([bool]$noisy.Error) 'an error was recorded with no text to explain it'
+        Assert-Equal 'finished anyway' ([string]$noisy.Output[0])
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
 Complete-TestRun
