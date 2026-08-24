@@ -897,7 +897,8 @@ Test-Case 'Get-Help renders every parameter and the exit-code table' {
 
         $notes = [string](Get-ProbeValue -Output $result.Output -Key 'NOTES')
         Assert-True ($notes -match 'Exit codes') $notes
-        foreach ($pair in @('0 success', '1 error', '2 completed', '3 another run', '4 elevation', '5 unsupported')) {
+        foreach ($pair in @('0 success', '1 error', '2 completed', '3 another run', '4 elevation', '5 unsupported',
+                '6 incomplete', '7 security refusal')) {
             Assert-True ($notes.Contains($pair)) ('the exit-code table is missing "' + $pair + '": ' + $notes)
         }
 
@@ -942,6 +943,708 @@ Test-Case 'The five modules import together and every Wac command Run.ps1 calls 
             Assert-True ($result.Output.Contains('IMPORTED=' + $module)) ('module ' + $module + ' did not import: ' + $result.ErrorText)
         }
         Assert-Equal '' $result.ErrorText 'a module wrote to stderr while importing'
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The exit-code contract, end to end through the REAL Run.ps1
+#
+# Run.ps1 is COPIED byte for byte into a sandbox that also holds a src\ of shim modules, and the
+# copy is the file the child executes. Each shim is the shipped module text with a few overrides
+# appended, so New-WacTreeResult, New-WacStepResult, New-WacDriverStepResult, Write-WacTreeResult
+# and Write-WacStepResult stay the SHIPPED code and only the functions that would touch the machine
+# - the sweep, DISM, pnpclean, pnputil, cleanmgr, the Recycle Bin - return a scripted result
+# instead. Nothing here deletes anything, runs a system tool or reads the real allow-list, which is
+# what makes it safe to run on a developer workstation.
+#
+# Three environmental facts a sandboxed run cannot have are replaced in the Core shim and nothing
+# else is: Test-WacIsAdministrator (the whole run body is behind the elevation gate),
+# Test-WacSystemDriveSupported, and the ACL verdict for the sandbox state directory - a redirected
+# %ProgramData% under TEMP is genuinely user-writable, so the real check answers "untrusted" there
+# (measured) and every scenario would exit 7 for a reason unrelated to the case under test. The
+# degraded log and the expired budget are NOT faked: the shim calls the real Set-WacLogDegraded and
+# moves the real deadline, so the mapping reads exactly the module state a real one produces.
+# ---------------------------------------------------------------------------------------------
+
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+# One plan file drives every shim. Read lazily and cached, so a scenario is one JSON write.
+$script:PlanReaderBody = @'
+$script:TestPlan = $null
+
+function Get-WacTestPlan {
+    if ($null -ne $script:TestPlan) { return $script:TestPlan }
+
+    $table = @{
+        stateEvaluated = $true
+        stateTrusted = $true
+        logDegraded = $false
+        deadlineExpired = $false
+        targets = @()
+        dismOutcome = 'Succeeded'
+        deliveryOutcome = 'SafeSkip'
+        pnpOutcome = 'Succeeded'
+        pruneOutcome = 'SafeSkip'
+        stripStepOutcome = $false
+    }
+
+    $path = [string]$env:WAC_TEST_PLAN
+    if ($path -and [System.IO.File]::Exists($path)) {
+        $parsed = ConvertFrom-Json ([System.IO.File]::ReadAllText($path))
+        foreach ($property in $parsed.PSObject.Properties) { $table[$property.Name] = $property.Value }
+    }
+
+    $script:TestPlan = $table
+    return $script:TestPlan
+}
+'@
+
+$script:ShimBody = @{}
+
+$script:ShimBody['Core'] = @'
+. (Join-Path -Path $PSScriptRoot -ChildPath '_Plan.ps1')
+$script:RealInitializeWacRun = ${function:Initialize-WacRun}
+
+function Test-WacIsAdministrator { return $true }
+function Test-WacSystemDriveSupported { return $true }
+
+function Test-WacStatePathIsTrusted {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path, [int]$MaxDepth = 64)
+
+    $null = $MaxDepth
+    return [PSCustomObject]@{
+        Path = $Path
+        IsTrusted = [bool](Get-WacTestPlan).stateTrusted
+        Reason = 'test shim verdict'
+        Checked = @(); Failures = @(); Writers = @()
+    }
+}
+
+function Initialize-WacRun {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseName,
+        [string[]]$CandidateRoot,
+        [ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$LogLevel = 'INFO',
+        [int]$BudgetMinutes = 210,
+        [string]$BootstrapLogPath
+    )
+
+    $ok = & $script:RealInitializeWacRun @PSBoundParameters
+    if (-not $ok) { return $ok }
+
+    $plan = Get-WacTestPlan
+    # Real module state, not a faked return value: Get-WacLogHealth, Get-WacStateTrust and
+    # Test-WacDeadlineExpired stay the shipped functions reading the shipped variables.
+    if ($plan.logDegraded) { Set-WacLogDegraded -Reason 'test shim: a log write failed' }
+    if ($plan.deadlineExpired) { $script:DeadlineUtc = (Get-Date).ToUniversalTime().AddMinutes(-1) }
+    if (-not $plan.stateEvaluated) { $script:StateTrust = $null }
+
+    return $ok
+}
+'@
+
+$script:ShimBody['FileSystem'] = @'
+. (Join-Path -Path $PSScriptRoot -ChildPath '_Plan.ps1')
+
+function Get-WacTestTargetResult {
+    param([Parameter(Mandatory = $true)][string]$Category, [Parameter(Mandatory = $true)][string]$Path)
+
+    $stats = New-WacDeletionStats
+    $attempted = $false
+
+    foreach ($spec in @((Get-WacTestPlan).targets)) {
+        if ([string]$spec.category -cne $Category) { continue }
+        foreach ($property in $spec.PSObject.Properties) {
+            if ($property.Name -ceq 'category' -or $property.Name -ceq 'path') { continue }
+            if ($property.Name -ceq 'attempted') { $attempted = [bool]$property.Value; continue }
+            $stats.($property.Name) = [int64]$property.Value
+        }
+    }
+
+    return (New-WacTreeResult -Category $Category -Path $Path -Stats $stats -Attempted $attempted)
+}
+
+function Remove-WacTree {
+    param([Parameter(Mandatory = $true)][string]$Category, [Parameter(Mandatory = $true)][string]$Path, [switch]$DeleteRoot)
+    $null = $DeleteRoot
+    return (Get-WacTestTargetResult -Category $Category -Path $Path)
+}
+
+function Remove-WacFilesByPattern {
+    param([Parameter(Mandatory = $true)][string]$Category, [Parameter(Mandatory = $true)][string]$Path, [string[]]$Pattern = @())
+    $null = $Pattern
+    return (Get-WacTestTargetResult -Category $Category -Path $Path)
+}
+'@
+
+$script:ShimBody['Targets'] = @'
+. (Join-Path -Path $PSScriptRoot -ChildPath '_Plan.ps1')
+
+function Get-WacCleanupTarget {
+    param([string[]]$SkipCategory = @())
+
+    $skip = @($SkipCategory)
+    foreach ($spec in @((Get-WacTestPlan).targets)) {
+        $category = [string]$spec.category
+        if ($skip -contains $category) { continue }
+        [PSCustomObject]@{ Category = $category; Path = [string]$spec.path; Mode = 'Tree'; Pattern = @(); DeleteRoot = $false }
+    }
+}
+'@
+
+$script:ShimBody['Steps'] = @'
+. (Join-Path -Path $PSScriptRoot -ChildPath '_Plan.ps1')
+
+function New-WacTestStepResult {
+    <#
+    .SYNOPSIS
+        A step result in whichever shape New-WacStepResult currently offers.
+    .DESCRIPTION
+        No .Outcome is added here on purpose: this is the LEGACY shape, so these steps prove
+        Get-WacStepOutcome's boolean fallback. The Drivers shim returns the Outcome-carrying shape.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Category, [Parameter(Mandatory = $true)][string]$Outcome)
+
+    $argument = @{ Category = $Category; Attempted = $true; Detail = ('test shim: ' + $Outcome) }
+    if ((Get-Command -Name 'New-WacStepResult').Parameters.ContainsKey('Outcome')) {
+        $argument['Outcome'] = $Outcome
+    }
+    else {
+        $argument['Succeeded'] = ($Outcome -ceq 'Succeeded')
+        $argument['Skipped'] = ($Outcome -ceq 'SafeSkip')
+        $argument['Failed'] = ($Outcome -ceq 'Failed' -or $Outcome -ceq 'Incomplete' -or $Outcome -ceq 'SecurityRefusal')
+    }
+
+    return (Write-WacStepResult -Result (New-WacStepResult @argument) -Component 'TestStep')
+}
+
+function Invoke-WacComponentCleanup {
+    param([switch]$ResetBase)
+    $null = $ResetBase
+    return (New-WacTestStepResult -Category 'Component store cleanup' -Outcome ([string](Get-WacTestPlan).dismOutcome))
+}
+
+function Clear-WacTestOutcomeFreeResult {
+    <#
+    .SYNOPSIS
+        The same result with .Outcome removed - a step from before the outcome contract.
+    #>
+    param([Parameter(Mandatory = $true)]$Result)
+
+    $copy = New-Object PSObject
+    foreach ($property in $Result.PSObject.Properties) {
+        if ($property.Name -ceq 'Outcome') { continue }
+        Add-Member -InputObject $copy -MemberType NoteProperty -Name $property.Name -Value $property.Value
+    }
+    return $copy
+}
+
+function Clear-WacDeliveryOptimizationCache {
+    $result = New-WacTestStepResult -Category 'Delivery Optimization cache' -Outcome ([string](Get-WacTestPlan).deliveryOutcome)
+    if ((Get-WacTestPlan).stripStepOutcome) { return (Clear-WacTestOutcomeFreeResult -Result $result) }
+    return $result
+}
+
+function Invoke-WacLegacyDiskCleanup {
+    param([switch]$Enabled, [AllowEmptyCollection()][string[]]$Category = @(), [int]$SageId = 9999)
+    $null = $Enabled; $null = $Category; $null = $SageId
+    return (New-WacTestStepResult -Category 'Legacy Disk Cleanup' -Outcome 'SafeSkip')
+}
+
+function Clear-WacRecycleBin {
+    return (New-WacTestStepResult -Category 'Recycle Bin' -Outcome 'Succeeded')
+}
+'@
+
+$script:ShimBody['Drivers'] = @'
+. (Join-Path -Path $PSScriptRoot -ChildPath '_Plan.ps1')
+
+function New-WacTestDriverStepResult {
+    param([Parameter(Mandatory = $true)][string]$Category, [Parameter(Mandatory = $true)][string]$Outcome)
+
+    # The SHIPPED bridge, so these results carry .Outcome exactly as the real driver steps do.
+    return (Write-WacStepResult -Component 'TestStep' -Result (New-WacDriverStepResult `
+        -Category $Category -Outcome $Outcome -Attempted $true -Detail ('test shim: ' + $Outcome)))
+}
+
+function Invoke-WacPnpCleanHandler {
+    return (New-WacTestDriverStepResult -Category 'Driver package cleanup' -Outcome ([string](Get-WacTestPlan).pnpOutcome))
+}
+
+function Invoke-WacDriverPackagePrune {
+    param([switch]$Enabled, [string]$BackupRoot)
+    $null = $Enabled; $null = $BackupRoot
+    return (New-WacTestDriverStepResult -Category 'Driver package prune' -Outcome ([string](Get-WacTestPlan).pruneOutcome))
+}
+'@
+
+function New-RunRig {
+    <#
+    .SYNOPSIS
+        A sandbox holding a byte-identical copy of Run.ps1 and a src\ of shim modules.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Prefix)
+
+    $sandbox = New-TestSandbox -Prefix $Prefix
+    $app = Join-Path -Path $sandbox -ChildPath 'app'
+    $src = Join-Path -Path $app -ChildPath 'src'
+    [void][System.IO.Directory]::CreateDirectory($src)
+    foreach ($leaf in @('PD', 'LA', 'TMP')) {
+        [void][System.IO.Directory]::CreateDirectory((Join-Path -Path $sandbox -ChildPath $leaf))
+    }
+
+    $runCopy = Join-Path -Path $app -ChildPath 'Run.ps1'
+    [System.IO.File]::Copy($script:RunPath, $runCopy)
+    if ((New-Object System.IO.FileInfo($runCopy)).Length -ne (New-Object System.IO.FileInfo($script:RunPath)).Length) {
+        throw 'the copied Run.ps1 is not the shipped one'
+    }
+
+    [System.IO.File]::WriteAllText((Join-Path -Path $src -ChildPath '_Plan.ps1'), $script:PlanReaderBody, $script:Utf8NoBom)
+    foreach ($name in @('Core', 'FileSystem', 'Targets', 'Steps', 'Drivers')) {
+        $leaf = 'WindowsAutoCleanup.{0}.psm1' -f $name
+        $text = [System.IO.File]::ReadAllText((Join-Path -Path $script:SrcRoot -ChildPath $leaf))
+        [System.IO.File]::WriteAllText((Join-Path -Path $src -ChildPath $leaf),
+            ($text + [Environment]::NewLine + $script:ShimBody[$name]), $script:Utf8NoBom)
+    }
+
+    return [PSCustomObject]@{
+        Sandbox      = $sandbox
+        RunPath      = $runCopy
+        Src          = $src
+        PlanPath     = Join-Path -Path $sandbox -ChildPath 'plan.json'
+        ProgramData  = Join-Path -Path $sandbox -ChildPath 'PD'
+        LocalAppData = Join-Path -Path $sandbox -ChildPath 'LA'
+        Temp         = Join-Path -Path $sandbox -ChildPath 'TMP'
+        LogDirectory = Join-Path -Path $sandbox -ChildPath 'PD\WindowsAutoCleanup\Logs'
+        # Local\, not Global\: creating a Global\ kernel object needs SeCreateGlobalPrivilege, which
+        # a developer shell does not hold, so every run here would exit 3 instead of the code under
+        # test. Unique per rig so concurrent suites never collide.
+        MutexName    = 'Local\WacRig{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 12)
+    }
+}
+
+function Remove-RunRig {
+    <#
+    .SYNOPSIS
+        Removes a rig sandbox, retrying briefly while a just-exited child still holds a handle.
+    .DESCRIPTION
+        Measured: a delete issued immediately after the last child exits occasionally leaves the
+        sandbox behind - Windows has not released the exited process's handles yet - and
+        Remove-TestSandbox untracks the path whether or not the delete worked, so the end-of-suite
+        sweep never comes back to it. Bounded by a deadline rather than by a fixed wait, and it
+        never throws: this runs from a finally block, where a throw would replace the real failure
+        with a cleanup one.
+    #>
+    param([Parameter(Mandatory = $true)]$Rig)
+
+    $deadline = (Get-Date).AddSeconds(10)
+    while ($true) {
+        Remove-TestSandbox -Path $Rig.Sandbox
+        if (-not (Test-Path -LiteralPath $Rig.Sandbox)) { return }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Milliseconds 200
+    }
+
+    Write-Host ('      note: the rig sandbox outlived its removal bound and is left behind: {0}' -f $Rig.Sandbox)
+}
+
+function New-PlanTarget {
+    <#
+    .SYNOPSIS
+        One scripted target result. Every counter name is a real New-WacDeletionStats field.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Category,
+        [bool]$Attempted = $true,
+        [int]$FilesDeleted = 0,
+        [int]$SkippedReparse = 0,
+        [int]$SkippedOutOfRoot = 0,
+        [int]$SkippedProtected = 0,
+        [int]$SkippedDeadline = 0,
+        [int]$RefusedIdentity = 0,
+        [int]$RefusedOutOfRoot = 0,
+        [int]$Failed = 0
+    )
+
+    return @{
+        category         = $Category
+        path             = 'C:\WacTestTarget\{0}' -f $Category
+        attempted        = $Attempted
+        FilesDeleted     = $FilesDeleted
+        SkippedReparse   = $SkippedReparse
+        SkippedOutOfRoot = $SkippedOutOfRoot
+        SkippedProtected = $SkippedProtected
+        SkippedDeadline  = $SkippedDeadline
+        RefusedIdentity  = $RefusedIdentity
+        RefusedOutOfRoot = $RefusedOutOfRoot
+        Failed           = $Failed
+    }
+}
+
+function Invoke-RunRig {
+    <#
+    .SYNOPSIS
+        Writes the plan and runs the copied Run.ps1 as a bounded child. Returns the probe result.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Rig,
+        [Parameter(Mandatory = $true)][hashtable]$Plan,
+        [int]$TimeoutMs = 90000
+    )
+
+    [System.IO.File]::WriteAllText($Rig.PlanPath, ($Plan | ConvertTo-Json -Depth 6), $script:Utf8NoBom)
+
+    # No -ResetWindowsUpdateBase:$false here: under -File, Windows PowerShell 5.1 hands the child
+    # the literal string '$false' and parameter binding fails before the body runs (measured). The
+    # DISM step is scripted by the plan anyway, so the switch has nothing to change.
+    #
+    # -BudgetMinutes 5 rather than 1: nothing here does real work, but a budget the machine could
+    # plausibly outlive would make "a benign run exits 0" flaky in exactly the direction that hides
+    # a defect. The expired-budget case moves the deadline explicitly instead of racing it.
+    return (Invoke-Probe -TimeoutMs $TimeoutMs -CommandLine (ConvertTo-WacCommandLine -ArgumentList @(
+                '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Rig.RunPath,
+                '-Scheduled', '-BudgetMinutes', '5', '-MutexName', $Rig.MutexName)) -Environment @{
+            ProgramData   = $Rig.ProgramData
+            LOCALAPPDATA  = $Rig.LocalAppData
+            TEMP          = $Rig.Temp
+            TMP           = $Rig.Temp
+            WAC_TEST_PLAN = $Rig.PlanPath
+        })
+}
+
+function Get-RigLogText {
+    <#
+    .SYNOPSIS
+        The text of the newest run log in the rig, or '' when the run wrote none.
+    #>
+    param([Parameter(Mandatory = $true)]$Rig)
+
+    $logs = @(Get-ChildItem -LiteralPath $Rig.LogDirectory -Filter 'WindowsAutoCleanup_*.log' -File -ErrorAction SilentlyContinue |
+            Sort-Object -Property LastWriteTimeUtc -Descending)
+    if ($logs.Count -eq 0) { return '' }
+    return [System.IO.File]::ReadAllText($logs[0].FullName)
+}
+
+function Assert-RigExit {
+    <#
+    .SYNOPSIS
+        Asserts the child's exit code AND the status the footer recorded, with the log as evidence.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Rig,
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][string]$Status
+    )
+
+    $text = Get-RigLogText -Rig $Rig
+    Assert-True $Result.Exited ('the run did not finish inside its bound. stderr: ' + $Result.ErrorText)
+    Assert-Equal $ExitCode $Result.ExitCode ('stderr: {0}{1}log: {2}' -f $Result.ErrorText, [Environment]::NewLine, $text)
+    Assert-True ($text -cmatch ('(^|\s)status={0}($|\s)' -f $Status)) `
+    ('the footer did not record status={0}: {1}' -f $Status, $text)
+    Assert-True ($text -cmatch ('(^|\s)exitCode={0}($|\s)' -f $ExitCode)) `
+    ('the footer did not record exitCode={0}: {1}' -f $ExitCode, $text)
+}
+
+Test-Case 'A benign run exits 0, and the same state a second time still exits 0' {
+    # The trap this case exists for: a previous wave left a directory behind on run 1 that made
+    # every later run refuse, so run 2 exited 7 with nothing wrong. Both runs use the SAME sandbox
+    # and the same redirected %ProgramData%, so run 2 sees everything run 1 left behind.
+    #
+    # The counters are the ones a real elevated run really scores (measured: skipReparse=3,
+    # skipOutOfRoot=1). They are benign and must not move the exit code.
+    $rig = New-RunRig -Prefix 'rig-benign'
+    try {
+        $plan = @{ targets = @(
+                (New-PlanTarget -Category 'Temp' -FilesDeleted 12 -SkippedReparse 3 -SkippedOutOfRoot 1),
+                (New-PlanTarget -Category 'Caches' -SkippedProtected 2))
+        }
+
+        $first = Invoke-RunRig -Rig $rig -Plan $plan
+        Assert-RigExit -Rig $rig -Result $first -ExitCode 0 -Status 'Succeeded'
+
+        $second = Invoke-RunRig -Rig $rig -Plan $plan
+        Assert-RigExit -Rig $rig -Result $second -ExitCode 0 -Status 'Succeeded'
+
+        $logs = @(Get-ChildItem -LiteralPath $rig.LogDirectory -Filter 'WindowsAutoCleanup_*.log' -File)
+        Assert-Equal 2 $logs.Count 'the second run did not write its own log beside the first'
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text -cmatch '(^|\s)skipReparse=3($|\s)') ('the benign counters never reached the totals: ' + $text)
+        Assert-False ($text.Contains('[CRITICAL]')) ('a benign run logged a CRITICAL line: ' + $text)
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A refused target exits 7 and is the one line the log cannot lose' {
+    # Attempted is false: the target was refused BEFORE any deletion, which is the shape that used
+    # to produce no [Result] line at all - the one event driving exit 7, invisible in the audit log.
+    $rig = New-RunRig -Prefix 'rig-refusal'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{ targets = @(
+                (New-PlanTarget -Category 'Refused' -Attempted $false -RefusedIdentity 1)) }
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 7 -Status 'SecurityRefusal'
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text.Contains('[Result] Target complete.')) `
+        ('a target refused before it was attempted produced no result line: ' + $text)
+        Assert-True ($text -cmatch '(^|\s)refusedIdentity=1($|\s)') $text
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A refusal outranks a failure: both together still exit 7' {
+    $rig = New-RunRig -Prefix 'rig-precedence'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{
+            dismOutcome = 'Failed'
+            targets     = @((New-PlanTarget -Category 'Refused' -Attempted $false -RefusedOutOfRoot 1))
+        }
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 7 -Status 'SecurityRefusal'
+
+        # Both events are in the totals, so the 7 is a precedence decision and not a lost failure.
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text -cmatch '(^|\s)failed=1($|\s)') ('the failure was dropped rather than outranked: ' + $text)
+        Assert-True ($text -cmatch '(^|\s)refusedOutOfRoot=1($|\s)') $text
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A step failure exits 2, and so does a target failure' {
+    $rig = New-RunRig -Prefix 'rig-failed'
+    try {
+        $step = Invoke-RunRig -Rig $rig -Plan @{ dismOutcome = 'Failed'; targets = @() }
+        Assert-RigExit -Rig $rig -Result $step -ExitCode 2 -Status 'Failed'
+
+        $target = Invoke-RunRig -Rig $rig -Plan @{ targets = @((New-PlanTarget -Category 'Temp' -Failed 3)) }
+        Assert-RigExit -Rig $rig -Result $target -ExitCode 2 -Status 'Failed'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'An expired budget exits 6 rather than reporting success' {
+    # The defect in its literal shape: incomplete work used to exit 0.
+    $rig = New-RunRig -Prefix 'rig-budget'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{ deadlineExpired = $true; targets = @(
+                (New-PlanTarget -Category 'Temp' -FilesDeleted 1))
+        }
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 6 -Status 'Incomplete'
+        Assert-True ((Get-RigLogText -Rig $rig).Contains('The run budget expired')) 'the incomplete run never said why'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A target that ran out of deadline exits 6' {
+    $rig = New-RunRig -Prefix 'rig-deadline'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{ targets = @(
+                (New-PlanTarget -Category 'Temp' -FilesDeleted 4 -SkippedDeadline 9))
+        }
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 6 -Status 'Incomplete'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'An Incomplete step outcome exits 6, not 2' {
+    # Only reachable by READING .Outcome. The derived booleans make an Incomplete step Failed too,
+    # so a mapping that trusted them would exit 2 here and this case would be red.
+    $rig = New-RunRig -Prefix 'rig-stepincomplete'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{ pruneOutcome = 'Incomplete'; targets = @() }
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 6 -Status 'Incomplete'
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text -cmatch '(^|\s)stepIncomplete=1($|\s)') `
+        ('the totals reported the step as a plain failure: ' + $text)
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A SecurityRefusal step outcome exits 7' {
+    $rig = New-RunRig -Prefix 'rig-steprefusal'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{ pruneOutcome = 'SecurityRefusal'; targets = @() }
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 7 -Status 'SecurityRefusal'
+
+        Assert-True ((Get-RigLogText -Rig $rig) -cmatch '(^|\s)stepRefused=1($|\s)') 'the refusing step is not in the totals'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'An audit log that is not durable exits 6' {
+    # Set-WacLogDegraded is the real function and Get-WacLogHealth the real reader; only the event
+    # that trips it is injected, because a real write failure needs a broken volume.
+    $rig = New-RunRig -Prefix 'rig-durable'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{ logDegraded = $true; targets = @() }
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 6 -Status 'Incomplete'
+
+        Assert-True ((Get-RigLogText -Rig $rig).Contains('durable audit log')) 'the incomplete run never said why'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'An untrusted state directory exits 7, and a verdict never reached does not' {
+    $rig = New-RunRig -Prefix 'rig-trust'
+    try {
+        $untrusted = Invoke-RunRig -Rig $rig -Plan @{ stateTrusted = $false; targets = @() }
+        Assert-RigExit -Rig $rig -Result $untrusted -ExitCode 7 -Status 'SecurityRefusal'
+        Assert-True ((Get-RigLogText -Rig $rig).Contains('not machine-trusted')) 'the refusal was not explained'
+
+        # $null is NOT EVALUATED - the shape an unelevated run produces, whose log lives in the
+        # user's own profile. It carries no claim to refuse, so it must refuse nothing.
+        $notEvaluated = Invoke-RunRig -Rig $rig -Plan @{ stateEvaluated = $false; targets = @() }
+        Assert-RigExit -Rig $rig -Result $notEvaluated -ExitCode 0 -Status 'Succeeded'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A step result that states no outcome is never read as a success' {
+    # Every shipped step returns .Outcome now. One that does not is a step this mapping cannot
+    # classify, and the only safe reading of an unclassifiable step is that it did not succeed -
+    # the alternative is a silent 0 for work whose result nobody could interpret.
+    $rig = New-RunRig -Prefix 'rig-nooutcome'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{ stripStepOutcome = $true; targets = @() }
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 2 -Status 'Failed'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A module that cannot be imported is bootstrap-logged, folded into the run log and exits 1' {
+    $rig = New-RunRig -Prefix 'rig-bootstrap'
+    try {
+        # A module that throws at import. Nothing inside a module can log that, which is the whole
+        # reason the bootstrap log exists.
+        [System.IO.File]::AppendAllText((Join-Path -Path $rig.Src -ChildPath 'WindowsAutoCleanup.Drivers.psm1'),
+            ([Environment]::NewLine + "throw 'test shim: this module refuses to import'" + [Environment]::NewLine),
+            $script:Utf8NoBom)
+
+        $result = Invoke-RunRig -Rig $rig -Plan @{ targets = @() }
+
+        Assert-True $result.Exited ('the run did not finish inside its bound. stderr: ' + $result.ErrorText)
+        Assert-Equal 1 $result.ExitCode ('stderr: ' + $result.ErrorText)
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text.Contains('[Bootstrap]')) ('the import failure never reached the durable run log: ' + $text)
+        Assert-True ($text.Contains('WindowsAutoCleanup.Drivers.psm1')) $text
+        Assert-True ($text.Contains('A required module could not be loaded')) $text
+        Assert-False ($text.Contains('[Summary]')) 'the run cleaned with a module missing'
+
+        # Adopted, so the bootstrap file is gone and the run leaves ONE audit artifact.
+        $leftover = @(Get-ChildItem -LiteralPath $rig.Temp -Filter 'WindowsAutoCleanup-bootstrap-*.log' -File -ErrorAction SilentlyContinue)
+        Assert-Equal 0 $leftover.Count 'the bootstrap log survived a run whose log adopted it'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'The elevated harness finds a driver backup by its manifest, not by the recycled oem name' {
+    # Ledger item: backup directories became CONTENT-ADDRESSED (<stem>_<version>_<hash16>) because
+    # oem<n>.inf is a name Windows re-issues to an unrelated package after a removal. The harness
+    # still looked for Join-Path <backupRoot> <oem name>, a path that can now never exist, so it
+    # would have raised its own BLOCKER for every package it really did remove.
+    #
+    # Invoke-ElevatedVerification.ps1 is not a suite - it refuses to run unelevated and the machine
+    # scenarios change the machine - so the reader is LIFTED out of it and exercised against a
+    # synthetic backup root. Same idiom as the relaunch vector above: the shipped function runs,
+    # not a copy of it.
+    $harnessPath = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-ElevatedVerification.ps1'
+    $tokens = $null
+    $errors = $null
+    $harnessAst = [System.Management.Automation.Language.Parser]::ParseFile($harnessPath, [ref]$tokens, [ref]$errors)
+    Assert-Equal 0 (@($errors).Count) (($errors | ForEach-Object { [string]$_ }) -join ' ; ')
+
+    # ConvertTo-VerificationUtcText comes along because PowerShell 7's ConvertFrom-Json hands back a
+    # [datetime] where 5.1 hands back a string, and the reader normalises that.
+    foreach ($name in @('ConvertTo-VerificationUtcText', 'Get-DriverBackupRecord')) {
+        $definition = @($harnessAst.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object { $_.Name -eq $name })
+        Assert-Equal 1 $definition.Count ('the harness must define exactly one {0}' -f $name)
+        . ([scriptblock]::Create($definition[0].Extent.Text))
+    }
+
+    $sandbox = New-TestSandbox -Prefix 'orch-driverbackup'
+    try {
+        $root = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+
+        # A real backup: content-addressed directory name, a manifest naming oem42.inf, a stamped
+        # DeletedUtc and one exported file besides the manifest.
+        $deleted = Join-Path -Path $root -ChildPath 'wacnet_1.2.3.4_0123456789abcdef'
+        [void][System.IO.Directory]::CreateDirectory($deleted)
+        [System.IO.File]::WriteAllText((Join-Path -Path $deleted -ChildPath 'wacnet.inf'), 'inf', $script:Utf8NoBom)
+        [System.IO.File]::WriteAllText((Join-Path -Path $deleted -ChildPath 'wac-driver-backup.json'),
+            (@{ Schema = 2; DriverName = 'oem42.inf'; OriginalName = 'wacnet.inf'
+                CreatedUtc = '2026-08-24T00:00:00Z'; DeletedUtc = '2026-08-24T00:00:05Z' } | ConvertTo-Json),
+            $script:Utf8NoBom)
+
+        # An export of a package that is still installed: same shape, no DeletedUtc.
+        $kept = Join-Path -Path $root -ChildPath 'wacaudio_9.9.9.9_fedcba9876543210'
+        [void][System.IO.Directory]::CreateDirectory($kept)
+        [System.IO.File]::WriteAllText((Join-Path -Path $kept -ChildPath 'wacaudio.inf'), 'inf', $script:Utf8NoBom)
+        [System.IO.File]::WriteAllText((Join-Path -Path $kept -ChildPath 'wac-driver-backup.json'),
+            (@{ Schema = 2; DriverName = 'oem7.inf'; OriginalName = 'wacaudio.inf'
+                CreatedUtc = '2026-08-24T00:00:00Z'; DeletedUtc = '' } | ConvertTo-Json), $script:Utf8NoBom)
+
+        # A directory that cannot be identified at all. It must be REPORTED, never skipped quietly.
+        [void][System.IO.Directory]::CreateDirectory((Join-Path -Path $root -ChildPath 'oem42.inf'))
+
+        $records = @(Get-DriverBackupRecord -BackupRoot $root)
+        Assert-Equal 3 $records.Count 'every child of the backup root must be accounted for'
+
+        $found = @($records | Where-Object { $_.DriverName -ceq 'oem42.inf' })
+        Assert-Equal 1 $found.Count 'the deleted package was not found through its manifest'
+        Assert-Equal $deleted $found[0].Directory 'the record does not point at the content-addressed directory'
+        Assert-Equal 1 $found[0].FileCount 'the manifest itself must not count as an exported file'
+        Assert-Equal '2026-08-24T00:00:05Z' $found[0].DeletedUtc
+        Assert-Equal '' $found[0].Unreadable
+
+        $still = @($records | Where-Object { $_.DriverName -ceq 'oem7.inf' })
+        Assert-Equal 1 $still.Count
+        Assert-Equal '' $still[0].DeletedUtc 'an export of a package that is still installed must not claim a deletion'
+
+        # The trap the old shape fell into: a directory NAMED after the oem package proves nothing.
+        $unreadable = @($records | Where-Object { $_.Unreadable })
+        Assert-Equal 1 $unreadable.Count 'a directory with no manifest was silently ignored'
+        Assert-True ($unreadable[0].Unreadable.Contains('wac-driver-backup.json')) $unreadable[0].Unreadable
+        Assert-Equal '' $unreadable[0].DriverName 'a directory name was mistaken for a package identity'
+
+        Assert-Equal 0 (@(Get-DriverBackupRecord -BackupRoot (Join-Path -Path $sandbox -ChildPath 'never-created')).Count) `
+        'a missing backup root must be empty rather than an error'
     }
     finally {
         Remove-TestSandbox -Path $sandbox

@@ -226,4 +226,27 @@ Test-Case 'Run.ps1 binds parameters by name only' {
         ('positional binding is still enabled: {0}' -f $attributes[0].Extent.Text)
 }
 
+Test-Case 'Log retention asks Core for the log directory rather than splitting a possibly-null path' {
+    # Split-Path -Parent $null is a TERMINATING binding error on both shipped hosts, so the old
+    # spelling killed the run inside its own retention step on exactly the path where logging had
+    # already failed - the one run that most needed to report why.
+    $calls = @(Get-CommandCall -Ast $script:RunAst -Name 'Remove-WacOldLog')
+    Assert-Equal 1 $calls.Count
+
+    $bound = [string](Get-BoundArgumentText -Command $calls[0] -Parameter 'LogDirectory')
+    Assert-True ($bound.IndexOf('Get-WacLogDirectory', [System.StringComparison]::Ordinal) -ge 0) `
+    ('log retention no longer asks Core for the directory: ' + $bound)
+    Assert-True ($bound.IndexOf('Split-Path', [System.StringComparison]::Ordinal) -lt 0) $bound
+}
+
+Test-Case 'The run log adopts the pre-import bootstrap log' {
+    # Nothing inside a module can log its own import failure. If this binding goes, an import or
+    # parse failure is recorded only in a temp file nobody is told about.
+    $calls = @(Get-CommandCall -Ast $script:RunAst -Name 'Initialize-WacRun')
+    Assert-Equal 1 $calls.Count 'Run.ps1 no longer initialises the run exactly once'
+
+    $bound = [string](Get-BoundArgumentText -Command $calls[0] -Parameter 'BootstrapLogPath')
+    Assert-True ($bound.IndexOf('BootstrapLogPath', [System.StringComparison]::Ordinal) -ge 0) `
+    ('the bootstrap log is never handed to Core, so an import failure stays orphaned: ' + $bound)
+}
 Complete-TestRun

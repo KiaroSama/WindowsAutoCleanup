@@ -48,6 +48,23 @@ function New-TestJunction {
     return $Link
 }
 
+function Get-TestResultLogLine {
+    <#
+    .SYNOPSIS
+        The one 'Target complete.' line in a run log that carries the given category, or $null.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$Category
+    )
+
+    $needle = 'category=' + $Category
+    foreach ($line in [System.IO.File]::ReadAllLines($LogPath)) {
+        if ($line.Contains('[Result] Target complete.') -and $line.Contains($needle)) { return $line }
+    }
+    return $null
+}
+
 # ---------------------------------------------------------------------------------------------
 # Containment
 # ---------------------------------------------------------------------------------------------
@@ -210,7 +227,7 @@ Test-Case 'Remove-WacTree reaches a path longer than MAX_PATH' {
     }
 }
 
-Test-Case 'Remove-WacTree accounts for a locked file instead of deleting it' {
+Test-Case 'A locked file is accounted as locked and is never queued for deletion at the next boot' {
     $sandbox = New-TestSandbox -Prefix 'fs-lock'
     $handle = $null
     try {
@@ -226,14 +243,185 @@ Test-Case 'Remove-WacTree accounts for a locked file instead of deleting it' {
         Assert-Equal 1 $result.FilesDeleted 'the unlocked file should still have been deleted'
         Assert-False (Test-Path -LiteralPath $free)
         Assert-True (Test-Path -LiteralPath $locked) 'a locked file must not vanish'
-        # Delete-on-reboot registration only succeeds for an administrator or SYSTEM, so either
-        # counter is a correct outcome; being counted nowhere is not.
-        Assert-True (($result.SkippedLocked + $result.PendingDeletes) -ge 1) `
+
+        # This used to allow EITHER counter, because delete-on-reboot registration only succeeds for
+        # an administrator or SYSTEM and the suite runs at both privilege levels. Now there is one
+        # correct answer at every privilege level: MoveFileEx is not called at all, so the outcome
+        # cannot depend on whether the shell happens to be elevated. See the module header for what
+        # that costs and why the alternative could not be made safe.
+        Assert-Equal 1 ([int]$result.SkippedLocked) `
             ('locked=' + $result.SkippedLocked + ' pending=' + $result.PendingDeletes + ' denied=' + $result.SkippedDenied)
+        Assert-Equal 0 ([int]$result.PendingDeletes) 'a path was queued for deletion at the next boot'
+        Assert-Equal 0 ([int]$result.Refused) 'a locked file is not a security refusal'
     }
     finally {
         if ($handle) { try { $handle.Dispose() } catch { $null = $_ } }
         Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A target shaped like a real one produces no refusals at all' {
+    <#
+        The counter split only means something if an ORDINARY run scores zero on the new counters:
+        they drive a security-refusal exit code, and a code that fires every day means nothing. The
+        shape here is taken from a real elevated run's log - nested directories, a junction, a
+        protected subtree, a locked file, blocked attributes and a >MAX_PATH path - and the whole of
+        it must come back Refused=0.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'fs-realshape'
+    $handle = $null
+    try {
+        $root = New-TestDirectory (Join-Path -Path $sandbox -ChildPath 'root')
+        $outside = New-TestDirectory (Join-Path -Path $sandbox -ChildPath 'outside')
+
+        [void](New-TestFile (Join-Path -Path $root -ChildPath 'a\b\c\deep.tmp'))
+        [void](New-TestFile (Join-Path -Path $root -ChildPath 'a\b\other.tmp'))
+        [void](New-TestFile (Join-Path -Path $root -ChildPath 'loose.tmp'))
+        [void](New-TestJunction -Link (Join-Path -Path $root -ChildPath 'a\link') -Target $outside)
+
+        $readOnly = New-TestFile (Join-Path -Path $root -ChildPath 'a\readonly.tmp')
+        [System.IO.File]::SetAttributes($readOnly, [System.IO.FileAttributes]::ReadOnly)
+
+        $deep = Join-Path -Path $root -ChildPath 'a\b'
+        while ($deep.Length -lt 250) { $deep = Join-Path -Path $deep -ChildPath ('d' * 40) }
+        [void][System.IO.Directory]::CreateDirectory('\\?\' + $deep)
+        [System.IO.File]::WriteAllText(('\\?\' + (Join-Path -Path $deep -ChildPath 'long.tmp')), 'x')
+
+        $lockedPath = New-TestFile (Join-Path -Path $root -ChildPath 'a\locked.bin')
+        $handle = New-Object System.IO.FileStream(
+            $lockedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+
+        $protectedRoot = New-TestDirectory (Join-Path -Path $root -ChildPath 'keepme')
+        [void](New-TestFile (Join-Path -Path $protectedRoot -ChildPath 'app.ps1'))
+        Clear-WacProtectedRoot
+        Add-WacProtectedRoot -Path $protectedRoot
+
+        $result = Remove-WacTree -Category 'realshape' -Path $root
+
+        Assert-True $result.Attempted
+        # Per counter as well as on the roll-up: a roll-up hard-wired to 0 would make the benign
+        # direction pass vacuously, which is the same defect from the other side.
+        Assert-Equal 0 ([int]$result.RefusedIdentity) 'a realistic run reported an identity refusal'
+        Assert-Equal 0 ([int]$result.RefusedOutOfRoot) 'a realistic run reported an out-of-root refusal'
+        Assert-Equal 0 ([int]$result.Refused) `
+            ('a realistic run reported a security refusal: identity=' + $result.RefusedIdentity +
+             ' outOfRoot=' + $result.RefusedOutOfRoot)
+        Assert-Equal 0 ([int]$result.Failed)
+        # ...and it really did the work, so Refused=0 is not the trivial answer.
+        Assert-True ($result.FilesDeleted -ge 4) ('only ' + $result.FilesDeleted + ' files were deleted')
+        Assert-Equal 1 ([int]$result.ReparsePointsDeleted)
+        Assert-Equal 1 ([int]$result.SkippedLocked)
+        Assert-True ($result.SkippedProtected -ge 1)
+        Assert-True (Test-Path -LiteralPath $protectedRoot) 'the protected subtree was removed'
+        Assert-True (Test-Path -LiteralPath $outside) 'the junction target was followed'
+    }
+    finally {
+        if ($handle) { try { $handle.Dispose() } catch { $null = $_ } }
+        Clear-WacProtectedRoot
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A path that cannot be canonicalised is a skip, never a refusal' {
+    <#
+        Measured on a real elevated run: its only skipOutOfRoot was a file named 'nul' in the user's
+        TEMP. GetFullPath resolves that to \\.\nul on BOTH hosts, so Get-WacNormalizedPath returns
+        $null. Nothing resolved and nothing was deleted, so classifying it as a security refusal
+        would have exit-coded an ordinary daily run as an attack. No file is created here: the
+        classification is asserted directly, because a real 'nul' in TEMP is not removable by the
+        same path APIs that would have to clean the sandbox up.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'fs-device'
+    try {
+        $root = New-TestDirectory (Join-Path -Path $sandbox -ChildPath 'root')
+        $device = Join-Path -Path $root -ChildPath 'nul'
+
+        Assert-Equal $null (Get-WacNormalizedPath -Path $device) `
+            'the premise changed: a DOS device name now canonicalises'
+
+        $stats = New-WacDeletionStats
+        Remove-WacLeaf -Path $device -RootPath $root -Stats $stats
+
+        Assert-Equal 1 ([int]$stats.SkippedOutOfRoot)
+        Assert-Equal 0 (Get-WacRefusedTotal -Stats $stats) 'an unresolvable path was called a refusal'
+        Assert-Equal 0 ([int]$stats.FilesDeleted)
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The result line
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'Write-WacTreeResult names both refusal counters and lifts the line to WARNING' {
+    <#
+        Write-WacTreeResult is what an operator and an incident reviewer actually read, and nothing
+        in the tree referenced it at all - so the refusal keys could be dropped and the WARNING lift
+        removed with every case still green.
+
+        Both counters here come from REAL refusals routed through Remove-WacLeaf - one path that is
+        lexically inside the root but resolves outside it, one that is not inside it at all - rather
+        than from hand-set fields, so this case fails if the counting, the roll-up, the log key or
+        the level lift breaks.
+    #>
+    $fixture = New-TestSandbox -Prefix 'fs-resultlog'
+    $logRoot = New-TestSandbox -Prefix 'fs-resultlog-log'
+    try {
+        Clear-WacProtectedRoot
+
+        $root = New-TestDirectory (Join-Path -Path $fixture -ChildPath 'root')
+        $outside = New-TestDirectory (Join-Path -Path $fixture -ChildPath 'outside')
+        $sentinel = New-TestFile -Path (Join-Path -Path $outside -ChildPath 'SENTINEL.dll') -Content 'MUST SURVIVE'
+        $link = New-TestJunction -Link (Join-Path -Path $root -ChildPath 'swapped') -Target $outside
+
+        $stats = New-WacDeletionStats
+        Remove-WacLeaf -Path (Join-Path -Path $link -ChildPath 'SENTINEL.dll') -RootPath $root -Stats $stats
+        Remove-WacLeaf -Path $sentinel -RootPath $root -Stats $stats
+
+        Assert-Equal 1 ([int]$stats.RefusedIdentity) 'the redirected path was not an identity refusal'
+        Assert-Equal 1 ([int]$stats.RefusedOutOfRoot) 'the out-of-root path was not an out-of-root refusal'
+        Assert-Equal 2 (Get-WacRefusedTotal -Stats $stats) 'the refusal roll-up does not add up its members'
+        Assert-True ([System.IO.File]::Exists($sentinel)) 'a refused path was deleted anyway'
+
+        $refusing = New-WacTreeResult -Category 'refusing' -Path $root -Stats $stats -Attempted $true
+        Assert-Equal 2 ([int]$refusing.Refused) 'the result object dropped the refusal roll-up'
+        $clean = New-WacTreeResult -Category 'clean' -Path $root -Stats (New-WacDeletionStats) -Attempted $true
+
+        Assert-True (Initialize-WacRun -BaseName 'resultlog' -CandidateRoot @($logRoot) -BudgetMinutes 60) `
+            'the run log was not created, so no line could be captured'
+
+        Write-WacTreeResult -Result $refusing
+        Write-WacTreeResult -Result $clean
+
+        $logPath = Get-WacLogPath
+        Close-WacLog
+
+        $refusedLine = Get-TestResultLogLine -LogPath $logPath -Category 'refusing'
+        Assert-True ($null -ne $refusedLine) 'Write-WacTreeResult emitted no line for a refusing target'
+        Assert-True ($refusedLine.Contains('refusedIdentity=1')) `
+            ('the identity refusal is not named in the line: ' + $refusedLine)
+        Assert-True ($refusedLine.Contains('refusedOutOfRoot=1')) `
+            ('the out-of-root refusal is not named in the line: ' + $refusedLine)
+        Assert-True ($refusedLine.Contains('] [WARNING] [Result] ')) `
+            ('a refusal was logged below WARNING: ' + $refusedLine)
+
+        # The other direction, or a line hard-wired to WARNING would satisfy the assertion above and
+        # every ordinary target would shout.
+        $cleanLine = Get-TestResultLogLine -LogPath $logPath -Category 'clean'
+        Assert-True ($null -ne $cleanLine) 'Write-WacTreeResult emitted no line for a clean target'
+        Assert-True ($cleanLine.Contains('] [INFO] [Result] ')) `
+            ('a clean target was not logged at INFO: ' + $cleanLine)
+        Assert-False ($cleanLine.Contains('refused')) `
+            ('a clean target reported a refusal: ' + $cleanLine)
+    }
+    finally {
+        Close-WacLog
+        Clear-WacProtectedRoot
+        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddHours(1))
+        Remove-TestSandbox -Path $logRoot
+        Remove-TestSandbox -Path $fixture
     }
 }
 
@@ -275,7 +463,7 @@ Test-Case 'The retry pass removes a directory that was non-empty a moment earlie
         # can surface through the UnauthorizedAccessException handler, which is a defect in the
         # module's typed catch clauses rather than in this behaviour (see the handover notes).
         $first = New-WacDeletionStats
-        Remove-WacLeaf -Path $sub -RootPath $root -Stats $first -IsDirectory -NoPendingDelete
+        Remove-WacLeaf -Path $sub -RootPath $root -Stats $first -IsDirectory
         Assert-Equal 0 $first.DirectoriesDeleted
         Assert-Equal 1 (Get-WacSkippedTotal -Stats $first)
         Assert-True (Test-Path -LiteralPath $sub) 'a non-empty directory must not be removed'

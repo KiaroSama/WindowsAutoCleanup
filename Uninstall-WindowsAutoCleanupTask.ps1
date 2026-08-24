@@ -32,9 +32,13 @@
     Exit codes:
       0  success
       1  error, or a removal that could not be verified
-      3  another installer or uninstaller instance is already running
+      3  another WindowsAutoCleanup operation - a cleanup run, an install or an uninstall - already
+         holds the machine-wide lock
       4  elevation was cancelled or failed
       5  unsupported environment (the deployment root cannot be resolved)
+      6  everything of ours was removed, but this run's audit log is not durable
+      7  refused: something at the task path or the deployment path could not be proven to be ours,
+         and it was left exactly as it was found
 #>
 
 # Write-Host is deliberate: the uninstaller is a user-facing console tool and the structured
@@ -161,53 +165,91 @@ function Invoke-UninstallerElevation {
 function Remove-InstalledTask {
     <#
     .SYNOPSIS
-        Removes our task wherever it is registered. Returns $true when nothing of ours is left.
+        Removes our task wherever it is registered, including the pre-1.2 one at the root task path.
+    .OUTPUTS
+        Clean   - nothing of ours is left registered.
+        Refused - a task with our name was left in place because it could not be proven ours.
+        Remaining - the tasks still registered after this pass, for the deployment decision.
     #>
     param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
+
+    $result = [PSCustomObject]@{ Clean = $true; Refused = $false; Remaining = @() }
 
     $tasks = @(Get-WacInstalledTask -IncludeLegacy)
     if ($tasks.Count -eq 0) {
         Write-UninstallerMessage -Level INFO -Message 'No WindowsAutoCleanup task is registered. Nothing to remove.'
-        return $true
+        return $result
     }
 
-    $clean = $true
+    $remaining = New-Object 'System.Collections.Generic.List[object]'
     foreach ($task in $tasks) {
         $removal = Remove-WacInstalledTask -Task $task -DeploymentRoot $DeploymentRoot -AllowLegacyMigration
         $label = '{0}{1}' -f $removal.TaskPath, $removal.TaskName
 
         if ($removal.Verified) {
-            Write-UninstallerMessage -Level INFO -Message 'Scheduled task removed and verified absent.' -Data @{ task = $label }
+            Write-UninstallerMessage -Level INFO -Message 'Scheduled task removed and verified absent.' -Data @{ task = $label; reason = [string]$removal.Reason }
             continue
         }
+
+        [void]$remaining.Add($task)
 
         if ($removal.Removed) {
             Write-UninstallerMessage -Level ERROR -Message 'The task was unregistered but is still present.' -Data @{ task = $label; reason = $removal.Reason }
-            $clean = $false
+            $result.Clean = $false
             continue
         }
 
-        # Not ours: leaving someone else's task alone is the correct outcome, not a failure.
+        # Not ours: leaving someone else's task alone is the correct outcome. It is still reported
+        # as a REFUSAL rather than as success, because the operator asked for a removal that this
+        # run deliberately did not perform.
         Write-UninstallerMessage -Level WARNING -Message 'A task with this name was left in place because it does not belong to WindowsAutoCleanup.' -Data @{ task = $label; reason = $removal.Reason }
+        $result.Refused = $true
     }
 
-    return $clean
+    $result.Remaining = @($remaining.ToArray())
+    return $result
 }
 
 function Remove-InstalledDeployment {
     <#
     .SYNOPSIS
         Deletes the deployment root and any leftover swap slot. Returns $true on success.
+    .DESCRIPTION
+        Refuses outright when the directory at the deployment path cannot be proven to belong to
+        this project (ledger B2-3): a same-name directory at the expected path is not evidence, and
+        an installer that deletes on that basis destroys whatever else happens to live there.
+    .OUTPUTS
+        Clean, Refused, Reason.
     #>
     param([Parameter(Mandatory = $true)]$Slots)
+
+    $result = [PSCustomObject]@{ Clean = $true; Refused = $false; Reason = $null }
 
     $source = Get-WacNormalizedPath -Path $script:ScriptRoot
     if ($source -and (Test-WacIsWithinRoot -ChildPath $source -RootPath $Slots.Root)) {
         Write-UninstallerMessage -Level WARNING -Message 'This script is running from inside the deployment root, so the deployment was left in place. Run the uninstaller from your own checkout.' -Data @{ root = $Slots.Root }
-        return $false
+        $result.Clean = $false
+        $result.Reason = 'The uninstaller is running from inside the deployment root.'
+        return $result
     }
 
-    $clean = $true
+    $ownership = Get-WacDeploymentOwnership -DeploymentRoot $Slots.Root
+    if (-not $ownership.IsOurs) {
+        Write-UninstallerMessage -Level ERROR -Message 'Refusing to delete a directory at the deployment path that cannot be proven to belong to WindowsAutoCleanup. It was left exactly as it was found.' -Data @{
+            root = $ownership.Root; kind = $ownership.Kind; reason = $ownership.Reason
+            findings = ((@($ownership.Findings) | Sort-Object) -join '; ')
+        }
+        $result.Clean = $false
+        $result.Refused = $true
+        $result.Reason = $ownership.Reason
+        return $result
+    }
+
+    Write-UninstallerMessage -Level INFO -Message 'Deployment path ownership proven.' -Data @{
+        root = $ownership.Root; kind = $ownership.Kind; version = [string]$ownership.Version
+        tampered = [bool]$ownership.Tampered
+    }
+
     foreach ($path in @($Slots.Root, $Slots.Staging, $Slots.Previous)) {
         if (-not (Test-Path -LiteralPath $path)) { continue }
 
@@ -217,11 +259,12 @@ function Remove-InstalledDeployment {
         }
         else {
             Write-UninstallerMessage -Level ERROR -Message 'The deployment directory could not be fully removed.' -Data @{ path = $path; reason = [string]$removal.Reason }
-            $clean = $false
+            $result.Clean = $false
+            $result.Reason = [string]$removal.Reason
         }
     }
 
-    return $clean
+    return $result
 }
 
 function Remove-RetainedLog {
@@ -230,7 +273,8 @@ function Remove-RetainedLog {
         Deletes the stored log files, except the one this run is writing.
     #>
     $logPath = Get-WacLogPath
-    $directory = if ($logPath) { Split-Path -Parent $logPath } else { Join-Path -Path (Get-WacDataRoot) -ChildPath 'Logs' }
+    $directory = Get-WacLogDirectory
+    if (-not $directory) { $directory = Join-Path -Path (Get-WacDataRoot) -ChildPath 'Logs' }
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return }
 
     $removed = 0
@@ -247,9 +291,13 @@ function Invoke-Main {
         return (Invoke-UninstallerElevation)
     }
 
-    $script:InstanceLock = Enter-WacSingleInstance -Name 'Global\WindowsAutoCleanupInstaller'
+    # The SAME lock the runtime and the installer take (ledger B2-3). The uninstaller used to take a
+    # different name from Run.ps1, so it could delete the deployment tree out from under a cleanup
+    # run that was executing it. Held through the ownership proof and the removal, and released in
+    # the finally at the bottom of the file.
+    $script:InstanceLock = Enter-WacSingleInstance -Name (Get-WacOperationLockName)
     if (-not $script:InstanceLock) {
-        Write-UninstallerMessage -Level ERROR -Message 'Another WindowsAutoCleanup installer or uninstaller is already running.'
+        Write-UninstallerMessage -Level ERROR -Message 'Another WindowsAutoCleanup operation - a cleanup run, an install or an uninstall - already holds the machine-wide lock.' -Data @{ lock = (Get-WacOperationLockName) }
         return 3
     }
 
@@ -263,13 +311,36 @@ function Invoke-Main {
 
     # The installer and Run.ps1 both prune to 30; without this, repeated uninstall attempts grow
     # %ProgramData%\WindowsAutoCleanup\Logs forever and the documented retention is simply untrue.
-    [void](Remove-WacOldLog -LogDirectory (Split-Path -Parent (Get-WacLogPath)) `
-        -Pattern 'Uninstall-WindowsAutoCleanupTask_*.log' -KeepCount 30)
+    #
+    # Get-WacLogDirectory, not Split-Path -Parent (Get-WacLogPath): the log path is $null exactly
+    # when logging failed, and Split-Path -Parent $null is a TERMINATING parameter-binding error on
+    # both shipped hosts (measured), so the old spelling killed the run it was reporting on.
+    $logDirectory = Get-WacLogDirectory
+    if ($logDirectory) {
+        [void](Remove-WacOldLog -LogDirectory $logDirectory -Pattern 'Uninstall-WindowsAutoCleanupTask_*.log' -KeepCount 30)
+    }
 
     Import-Module -Name 'ScheduledTasks' -ErrorAction Stop
 
-    $taskClean = Remove-InstalledTask -DeploymentRoot $slots.Root
-    $deploymentClean = Remove-InstalledDeployment -Slots $slots
+    $tasks = Remove-InstalledTask -DeploymentRoot $slots.Root
+
+    # The files go LAST, and only when nothing can still reach them (ledger B2-3). A failed or
+    # refused task removal leaves a registration pointing at Run.ps1; deleting the tree then turns a
+    # recoverable state into a scheduled task that fails every night with a missing file.
+    $deployment = [PSCustomObject]@{ Clean = $true; Refused = $false; Reason = $null }
+    if (-not $tasks.Clean) {
+        Write-UninstallerMessage -Level ERROR -Message 'The deployment files were KEPT because a WindowsAutoCleanup task could not be removed and would still reference them.' -Data @{ root = $slots.Root }
+        $deployment.Clean = $false
+        $deployment.Reason = 'A task that references the deployment is still registered.'
+    }
+    elseif (Test-WacTaskReferencesRoot -Task @($tasks.Remaining) -DeploymentRoot $slots.Root) {
+        Write-UninstallerMessage -Level ERROR -Message 'The deployment files were KEPT because a task this run left in place still runs something inside the deployment root.' -Data @{ root = $slots.Root }
+        $deployment.Clean = $false
+        $deployment.Reason = 'A task left in place still references the deployment root.'
+    }
+    else {
+        $deployment = Remove-InstalledDeployment -Slots $slots
+    }
 
     if ($RemoveLogs -and $KeepLogs) {
         Write-UninstallerMessage -Level WARNING -Message '-KeepLogs overrides -RemoveLogs; the log files were kept.'
@@ -281,9 +352,24 @@ function Invoke-Main {
         Write-UninstallerMessage -Level INFO -Message 'Log files were kept. Pass -RemoveLogs to delete them.' -Data @{ directory = (Join-Path -Path (Get-WacDataRoot) -ChildPath 'Logs') }
     }
 
-    if (-not $taskClean -or -not $deploymentClean) {
+    # A refusal outranks a plain failure: it says the machine was deliberately left as it was, which
+    # is a different instruction to the operator than "something broke".
+    if ($tasks.Refused -or $deployment.Refused) {
+        Write-UninstallerMessage -Level ERROR -Message 'Final status: refused. Something at the task path or the deployment path could not be proven to belong to WindowsAutoCleanup and was left exactly as it was found.'
+        return 7
+    }
+
+    if (-not $tasks.Clean -or -not $deployment.Clean) {
         Write-UninstallerMessage -Level ERROR -Message 'Final status: incomplete. See the errors above.'
         return 1
+    }
+
+    $logHealth = Get-WacLogHealth
+    if (-not $logHealth.IsDurable) {
+        Write-UninstallerMessage -Level ERROR -Message 'Final status: incomplete. Everything of ours was removed, but this run has no durable audit log.' -Data @{
+            degraded = [bool]$logHealth.Degraded; failedWrites = [int]$logHealth.FailedWrites; reason = [string]$logHealth.Reason
+        }
+        return 6
     }
 
     Write-UninstallerMessage -Level INFO -Message 'Final status: success.'

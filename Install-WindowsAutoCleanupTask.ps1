@@ -39,9 +39,13 @@
     Exit codes:
       0  success
       1  error, or an unverifiable safety condition
-      3  another installer or uninstaller instance is already running
+      3  another WindowsAutoCleanup operation - a cleanup run, an install or an uninstall - already
+         holds the machine-wide lock
       4  elevation was cancelled or failed
       5  unsupported environment (the online system drive is not C:)
+      6  the task and deployment landed, but this run's audit log is not durable
+      7  refused: something at the task path or the deployment path could not be proven to be ours,
+         and it was left exactly as it was found
 #>
 
 # Write-Host is deliberate: the installer is a user-facing console tool and the structured
@@ -196,32 +200,90 @@ function Get-InstallerTaskTrigger {
     return (New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.Add($parsed.TimeOfDay)))
 }
 
-function Remove-ConflictingTask {
+function Resolve-ConflictingTask {
     <#
     .SYNOPSIS
-        Clears our own registration before re-registering, and refuses to touch anyone else's.
+        Clears our own registration - current or pre-1.2 - before re-registering, and refuses to
+        touch anyone else's.
     .DESCRIPTION
         Register-ScheduledTask -Force is documented only as "without prompting for confirmation";
         nothing says it overwrites. So the installer explicitly Gets, proves ownership, then
-        Unregisters (ledger P0-4). A foreign task sitting on our canonical path is fatal, because
-        registering over it would destroy something we do not own.
+        Unregisters (ledger P0-4).
+
+        Ledger B2-3 changes two things here. A foreign task at EITHER path is now a REFUSAL rather
+        than a warning-and-carry-on: the pre-1.2 task ran a PATH-resolved host as SYSTEM, so leaving
+        an unrecognised one registered while adding a second one beside it is how a machine ends up
+        running two cleanup tasks, one of them the vulnerable one. And a legacy task that we DID
+        prove and could not remove is fatal too, for the same reason.
+
+        Called BEFORE anything is switched into the live deployment root, and with the machine-wide
+        lock already held, so no cleanup run can start out of the tree between here and the swap.
+    .OUTPUTS
+        Ok, Refused, Reason.
     #>
     param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
 
+    $result = [PSCustomObject]@{ Ok = $true; Refused = $false; Reason = $null }
+
     foreach ($existing in (Get-WacInstalledTask -IncludeLegacy)) {
-        $isCanonical = ([string]$existing.TaskPath -eq (Get-WacTaskFolder))
+        $label = '{0}{1}' -f [string]$existing.TaskPath, [string]$existing.TaskName
 
         $removal = Remove-WacInstalledTask -Task $existing -DeploymentRoot $DeploymentRoot -AllowLegacyMigration
         if ($removal.Verified) {
-            Write-InstallerMessage -Level INFO -Message 'Removed the previous WindowsAutoCleanup task.' -Data @{ task = ('{0}{1}' -f $removal.TaskPath, $removal.TaskName) }
+            Write-InstallerMessage -Level INFO -Message 'Removed the previously registered WindowsAutoCleanup task.' -Data @{
+                task = $label; reason = [string]$removal.Reason
+            }
             continue
         }
 
-        if ($isCanonical) {
-            throw ("A task already occupies {0}{1} and it is not ours, so it will not be replaced: {2}" -f $existing.TaskPath, $existing.TaskName, $removal.Reason)
+        if ($removal.Removed) {
+            $result.Ok = $false
+            $result.Reason = ('The task at {0} was unregistered but is still present: {1}' -f $label, [string]$removal.Reason)
+            return $result
         }
 
-        Write-InstallerMessage -Level WARNING -Message 'A task named WindowsAutoCleanup at the root task path was left untouched because ownership could not be proven.' -Data @{ reason = $removal.Reason }
+        $result.Ok = $false
+        $result.Refused = $true
+        $result.Reason = ('A task already occupies {0} and it could not be proven to be ours, so it was left untouched and nothing was registered beside it: {1}' -f $label, [string]$removal.Reason)
+        return $result
+    }
+
+    return $result
+}
+
+function Undo-Installation {
+    <#
+    .SYNOPSIS
+        Puts the machine back the way it was after a failure between the swap and the final assert.
+    .DESCRIPTION
+        Unregisters whatever this run registered - through the same ownership proof, so a task that
+        somehow is not ours is left alone rather than deleted on the way out - and restores the
+        deployment tree that Switch-WacDeploymentStage -KeepPrevious set aside.
+    #>
+    param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
+
+    foreach ($task in (Get-WacInstalledTask)) {
+        $removal = Remove-WacInstalledTask -Task $task -DeploymentRoot $DeploymentRoot
+        if ($removal.Verified) {
+            Write-InstallerMessage -Level WARNING -Message 'Rollback: the task registered by this run was unregistered.' -Data @{
+                task = ('{0}{1}' -f $removal.TaskPath, $removal.TaskName)
+            }
+        }
+        else {
+            Write-InstallerMessage -Level CRITICAL -Message 'Rollback could not unregister the task; remove it by hand before re-running.' -Data @{
+                task = ('{0}{1}' -f $removal.TaskPath, $removal.TaskName); reason = [string]$removal.Reason
+            }
+        }
+    }
+
+    $restored = Restore-WacDeploymentPrevious
+    if ($restored.Restored) {
+        Write-InstallerMessage -Level WARNING -Message 'Rollback: the deployment was restored to its previous state.' -Data @{
+            hadPrevious = [bool]$restored.HadPrevious; reason = [string]$restored.Reason
+        }
+    }
+    else {
+        Write-InstallerMessage -Level CRITICAL -Message 'Rollback could not restore the previous deployment.' -Data @{ reason = [string]$restored.Reason }
     }
 }
 
@@ -233,7 +295,9 @@ function Assert-RegisteredTask {
     param(
         [Parameter(Mandatory = $true)][string]$ExpectedHost,
         [Parameter(Mandatory = $true)][string]$ExpectedArguments,
-        [Parameter(Mandatory = $true)][string]$ExpectedDescription
+        [Parameter(Mandatory = $true)][string]$ExpectedDescription,
+        [Parameter(Mandatory = $true)][string]$ExpectedWorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$ExpectedRunTime
     )
 
     $task = $null
@@ -245,7 +309,11 @@ function Assert-RegisteredTask {
     }
     if (-not $task) { throw 'The task was registered without error but cannot be read back.' }
 
-    $action = @($task.Actions)[0]
+    $actions = @($task.Actions)
+    if ($actions.Count -ne 1) {
+        throw ("The registered task has {0} actions instead of exactly one." -f $actions.Count)
+    }
+    $action = $actions[0]
 
     $checks = @(
         @{ Name = 'Hidden'; Actual = [string][bool]$task.Settings.Hidden; Expected = 'True' }
@@ -265,6 +333,15 @@ function Assert-RegisteredTask {
         }
     }
 
+    # Compared through the canonicaliser rather than as raw text: the scheduler is free to hand a
+    # directory back with a trailing separator, and a plain string compare would fail an install
+    # that is in fact exactly right.
+    $actualWorking = Get-WacNormalizedPath -Path ([string]$action.WorkingDirectory)
+    $expectedWorking = Get-WacNormalizedPath -Path $ExpectedWorkingDirectory
+    if (-not $actualWorking -or -not $expectedWorking -or ($actualWorking -ine $expectedWorking)) {
+        throw ("The registered task's WorkingDirectory is '{0}' instead of '{1}'." -f [string]$action.WorkingDirectory, $ExpectedWorkingDirectory)
+    }
+
     # UserId reads back as the account name on some builds and as the SID on others.
     $userId = [string]$task.Principal.UserId
     if ($userId -notmatch '(?i)^(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18)$') {
@@ -279,7 +356,32 @@ function Assert-RegisteredTask {
         throw ("The registered task's ExecutionTimeLimit is '{0}' instead of 4 hours." -f $limit)
     }
 
-    $ownership = Test-WacTaskIsOurs -Task $task
+    # The trigger is asserted too (ledger B2-3): a task registered with the wrong or an extra
+    # trigger runs the cleanup at a time the operator never asked for, and until now nothing read
+    # it back. StartBoundary is an ISO 8601 LOCAL datetime string, not a DateTime.
+    $triggers = @($task.Triggers)
+    if ($triggers.Count -ne 1) {
+        throw ("The registered task has {0} triggers instead of exactly one daily trigger." -f $triggers.Count)
+    }
+    $triggerKind = ''
+    try { $triggerKind = [string]$triggers[0].CimClass.CimClassName } catch { $triggerKind = '' }
+    if ($triggerKind -and $triggerKind -notmatch '(?i)Daily') {
+        throw ("The registered task's trigger is '{0}' instead of a daily trigger." -f $triggerKind)
+    }
+    # Unspecified, and it matters. Measured on both shipped hosts: given '...T20:00:00' the reading
+    # is 20:00, and given an offset form such as '...T20:00:00+02:00' it converts to the equivalent
+    # LOCAL time - which is the time the task will actually fire, and therefore the one to compare
+    # against what the operator asked for. Do not "fix" this to RoundtripKind.
+    $startBoundary = [string]$triggers[0].StartBoundary
+    $startAt = [datetime]::MinValue
+    try { $startAt = [System.Xml.XmlConvert]::ToDateTime($startBoundary, [System.Xml.XmlDateTimeSerializationMode]::Unspecified) }
+    catch { throw ("The registered task's StartBoundary '{0}' is not a datetime." -f $startBoundary) }
+    $actualRunTime = $startAt.ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+    if (-not [string]::Equals($actualRunTime, $ExpectedRunTime, [System.StringComparison]::Ordinal)) {
+        throw ("The registered task runs daily at '{0}' instead of '{1}'." -f $actualRunTime, $ExpectedRunTime)
+    }
+
+    $ownership = Test-WacTaskIsOurs -Task $task -DeploymentRoot $ExpectedWorkingDirectory
     if (-not $ownership.IsOurs) {
         throw ("The registered task does not pass its own ownership proof: {0}" -f $ownership.Reason)
     }
@@ -292,9 +394,13 @@ function Invoke-Main {
         return (Invoke-InstallerElevation)
     }
 
-    $script:InstanceLock = Enter-WacSingleInstance -Name 'Global\WindowsAutoCleanupInstaller'
+    # ONE lock for the runtime, the install, the upgrade and the uninstall (ledger B2-3). The
+    # installer used to take a DIFFERENT name from Run.ps1, so a scheduled cleanup could be running
+    # out of the very tree this script was about to replace. Taken before anything is inspected, and
+    # released in the finally at the bottom of the file, so it covers verification and rollback too.
+    $script:InstanceLock = Enter-WacSingleInstance -Name (Get-WacOperationLockName)
     if (-not $script:InstanceLock) {
-        Write-InstallerMessage -Level ERROR -Message 'Another WindowsAutoCleanup installer or uninstaller is already running.'
+        Write-InstallerMessage -Level ERROR -Message 'Another WindowsAutoCleanup operation - a cleanup run, an install or an uninstall - already holds the machine-wide lock.' -Data @{ lock = (Get-WacOperationLockName) }
         return 3
     }
 
@@ -310,18 +416,26 @@ function Invoke-Main {
     # Fail before deploying if the run time is unusable.
     $trigger = Get-InstallerTaskTrigger -RunTime $DailyRunTime
 
-    $deployment = Install-WacDeployment -SourceRoot $script:ScriptRoot
-    Write-InstallerMessage -Level INFO -Message 'Runtime deployed.' -Data @{ root = $deployment.DeploymentRoot; files = $deployment.FileCount }
-
-    $trust = Test-WacDeploymentTrusted -DeploymentRoot $deployment.DeploymentRoot
-    if (-not $trust.IsTrusted) {
-        foreach ($entry in $trust.Untrusted) {
-            Write-InstallerMessage -Level ERROR -Message 'A deployed path is not machine-trusted.' -Data @{ path = $entry.Path; owner = [string]$entry.Owner; reason = $entry.Reason }
-        }
-        Write-InstallerMessage -Level ERROR -Message ('Refusing to register a SYSTEM task against an untrusted deployment: {0}' -f $trust.Reason)
-        return 1
+    $slots = Get-WacDeploymentSlotPath
+    if (-not $slots) {
+        Write-InstallerMessage -Level ERROR -Message 'The deployment root cannot be resolved on this machine.'
+        return 5
     }
-    Write-InstallerMessage -Level INFO -Message 'Deployment trust verified.' -Data @{ checked = $trust.CheckedCount }
+
+    # Prove ownership of the deployment path BEFORE anything is written or removed (ledger B2-3). A
+    # directory sitting at the expected path is not evidence that we put it there.
+    $ownership = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
+    if (-not $ownership.IsOurs) {
+        Write-InstallerMessage -Level ERROR -Message 'Refusing to replace a directory at the deployment path that cannot be proven to belong to WindowsAutoCleanup. It was left exactly as it was found.' -Data @{
+            root = $ownership.Root; kind = $ownership.Kind; reason = $ownership.Reason
+            findings = ((@($ownership.Findings) | Sort-Object) -join '; ')
+        }
+        return 7
+    }
+    Write-InstallerMessage -Level INFO -Message 'Deployment path ownership proven.' -Data @{
+        root = $ownership.Root; kind = $ownership.Kind; version = [string]$ownership.Version
+        tampered = [bool]$ownership.Tampered; reason = $ownership.Reason
+    }
 
     $taskHost = Get-WacCanonicalPowerShellHost
     if (-not $taskHost) {
@@ -329,41 +443,89 @@ function Invoke-Main {
         return 1
     }
 
+    # Phase 1: build the whole new tree in the .staging slot. Nothing the currently registered task
+    # can reach is touched, so this cannot pull a file out from under a run that is already going.
+    $stage = New-WacDeploymentStage -SourceRoot $script:ScriptRoot
+    Write-InstallerMessage -Level INFO -Message 'Runtime staged and hashed.' -Data @{
+        staging = $stage.StagingRoot; files = $stage.FileCount; version = $stage.Version
+    }
+
+    # Phase 2: verify the STAGED tree, so an untrusted one never goes live at all. Its ancestors are
+    # the deployment root's ancestors, and the PowerShell host chain is walked here too.
+    $trust = Test-WacDeploymentTrusted -DeploymentRoot $stage.StagingRoot
+    if (-not $trust.IsTrusted) {
+        foreach ($entry in $trust.Untrusted) {
+            Write-InstallerMessage -Level ERROR -Message 'A staged path is not machine-trusted.' -Data @{ path = $entry.Path; owner = [string]$entry.Owner; reason = $entry.Reason }
+        }
+        Write-InstallerMessage -Level ERROR -Message ('Refusing to install against an untrusted location: {0}' -f $trust.Reason)
+        [void](Remove-WacDeployment -Path $stage.StagingRoot)
+        return 1
+    }
+    Write-InstallerMessage -Level INFO -Message 'Staged deployment trust verified.' -Data @{ checked = $trust.CheckedCount }
+
+    # Phase 3: resolve the existing task BEFORE the swap. Doing it the other way round leaves a
+    # window in which the OLD task can start against the NEW files.
+    $conflict = Resolve-ConflictingTask -DeploymentRoot $slots.Root
+    if (-not $conflict.Ok) {
+        Write-InstallerMessage -Level ERROR -Message $conflict.Reason
+        [void](Remove-WacDeployment -Path $stage.StagingRoot)
+        if ($conflict.Refused) { return 7 }
+        return 1
+    }
+
+    # Phase 4: the swap, then register, then read everything back. The previous tree is KEPT until
+    # the last assertion passes, so any failure from here on is fully reversible.
+    $switched = Switch-WacDeploymentStage -KeepPrevious
+    $description = Get-WacTaskDescription
     $arguments = Get-WacTaskActionArgument `
-        -RunScript $deployment.RunScript `
+        -RunScript $switched.RunScript `
         -ResetWindowsUpdateBase ([bool]$ResetWindowsUpdateBase) `
         -PruneSupersededDrivers:$PruneSupersededDrivers `
         -EnableLegacyDiskCleanup:$EnableLegacyDiskCleanup
 
-    $description = Get-WacTaskDescription
+    $registered = $null
+    try {
+        $live = Get-WacDeploymentOwnership -DeploymentRoot $switched.DeploymentRoot
+        if ($live.Kind -ne 'Managed' -or $live.Tampered) {
+            throw ("What went live does not match the manifest that was staged: {0}" -f $live.Reason)
+        }
 
-    Remove-ConflictingTask -DeploymentRoot $deployment.DeploymentRoot
+        $definition = New-ScheduledTask `
+            -Action (New-ScheduledTaskAction -Execute $taskHost -Argument $arguments -WorkingDirectory $switched.DeploymentRoot) `
+            -Trigger $trigger `
+            -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
+            -Settings (New-ScheduledTaskSettingsSet `
+                -Compatibility Win8 `
+                -Hidden `
+                -AllowStartIfOnBatteries `
+                -DontStopIfGoingOnBatteries `
+                -StartWhenAvailable `
+                -MultipleInstances IgnoreNew `
+                -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+                -RestartCount 3 `
+                -RestartInterval (New-TimeSpan -Minutes 10)) `
+            -Description $description
 
-    $definition = New-ScheduledTask `
-        -Action (New-ScheduledTaskAction -Execute $taskHost -Argument $arguments -WorkingDirectory $deployment.DeploymentRoot) `
-        -Trigger $trigger `
-        -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
-        -Settings (New-ScheduledTaskSettingsSet `
-            -Compatibility Win8 `
-            -Hidden `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable `
-            -MultipleInstances IgnoreNew `
-            -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
-            -RestartCount 3 `
-            -RestartInterval (New-TimeSpan -Minutes 10)) `
-        -Description $description
+        Write-InstallerMessage -Level INFO -Message 'Registering the scheduled task.' -Data @{ task = ('{0}{1}' -f (Get-WacTaskFolder), (Get-WacTaskName)) }
+        Register-ScheduledTask -TaskName (Get-WacTaskName) -TaskPath (Get-WacTaskFolder) -InputObject $definition -ErrorAction Stop | Out-Null
 
-    Write-InstallerMessage -Level INFO -Message 'Registering the scheduled task.' -Data @{ task = ('{0}{1}' -f (Get-WacTaskFolder), (Get-WacTaskName)) }
-    Register-ScheduledTask -TaskName (Get-WacTaskName) -TaskPath (Get-WacTaskFolder) -InputObject $definition -ErrorAction Stop | Out-Null
+        $registered = Assert-RegisteredTask -ExpectedHost $taskHost -ExpectedArguments $arguments `
+            -ExpectedDescription $description -ExpectedWorkingDirectory $switched.DeploymentRoot -ExpectedRunTime $DailyRunTime
+    }
+    catch {
+        Write-InstallerMessage -Level ERROR -Message ('The task could not be registered and verified: {0}' -f $_.Exception.Message)
+        Undo-Installation -DeploymentRoot $switched.DeploymentRoot
+        Write-InstallerMessage -Level ERROR -Message 'Final status: failed and rolled back. No WindowsAutoCleanup task is registered; re-run the installer once the cause above is fixed.'
+        return 1
+    }
 
-    $registered = Assert-RegisteredTask -ExpectedHost $taskHost -ExpectedArguments $arguments -ExpectedDescription $description
+    [void](Remove-WacDeploymentPrevious)
 
     Write-InstallerMessage -Level INFO -Message 'Scheduled task registered and verified.' -Data @{
         task = ('{0}{1}' -f $registered.TaskPath, $registered.TaskName)
         execute = $taskHost
         arguments = $arguments
+        workingDirectory = $switched.DeploymentRoot
         dailyRunTime = $DailyRunTime
         executionTimeLimit = [string]$registered.Settings.ExecutionTimeLimit
     }
@@ -374,6 +536,16 @@ function Invoke-Main {
     }
     catch {
         Write-InstallerMessage -Level WARNING -Message ('The next run time could not be read: {0}' -f $_.Exception.Message)
+    }
+
+    # The install itself succeeded, but a run whose audit trail was lost did not fully do what it
+    # was asked to. Reported as INCOMPLETE (6), never as success.
+    $logHealth = Get-WacLogHealth
+    if (-not $logHealth.IsDurable) {
+        Write-InstallerMessage -Level ERROR -Message 'Final status: incomplete. The task and the deployment are in place, but this run has no durable audit log.' -Data @{
+            degraded = [bool]$logHealth.Degraded; failedWrites = [int]$logHealth.FailedWrites; reason = [string]$logHealth.Reason
+        }
+        return 6
     }
 
     Write-InstallerMessage -Level INFO -Message 'Final status: success.'
@@ -409,8 +581,13 @@ catch {
 }
 finally {
     Exit-WacSingleInstance -Mutex $script:InstanceLock
-    if ($script:LogReady) {
-        [void](Remove-WacOldLog -LogDirectory (Split-Path -Parent (Get-WacLogPath)) -Pattern 'Install-WindowsAutoCleanupTask_*.log' -KeepCount 30)
+    # Get-WacLogDirectory, not Split-Path -Parent (Get-WacLogPath): the log path is $null exactly
+    # when logging failed, and Split-Path -Parent $null is a TERMINATING parameter-binding error on
+    # both shipped hosts (measured). The old spelling therefore crashed the cleanup of the very run
+    # that was in the middle of reporting a log failure.
+    $logDirectory = Get-WacLogDirectory
+    if ($logDirectory) {
+        [void](Remove-WacOldLog -LogDirectory $logDirectory -Pattern 'Install-WindowsAutoCleanupTask_*.log' -KeepCount 30)
     }
     Close-WacLog
 }

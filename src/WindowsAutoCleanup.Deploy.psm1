@@ -34,6 +34,17 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanu
 $script:TaskName = 'WindowsAutoCleanup'
 $script:TaskFolder = '\WindowsAutoCleanup\'
 
+# ONE machine-wide lock covers runtime, install, upgrade and uninstall (ledger B2-3). Until now the
+# entry points took 'Global\WindowsAutoCleanupInstaller' while Run.ps1 took 'Global\WindowsAutoCleanup',
+# so a cleanup run and a deployment replacement held DIFFERENT locks and could not see each other:
+# the uninstaller could delete the tree a live run was executing out of.
+#
+# The value is deliberately the one Run.ps1 already defaults its -MutexName to, so the runtime needs
+# no change and every existing command line keeps working. Run.ps1 cannot call this function - it does
+# not import this module - so Deploy.Tests.ps1 parses Run.ps1's parameter default and fails if the two
+# ever drift.
+$script:OperationLockName = 'Global\WindowsAutoCleanup'
+
 # Register-ScheduledTask exposes only -Description, so a fixed sentinel inside the description is
 # the sole ownership marker a PowerShell-only installer can write. Never change this value: an
 # installed task with the old sentinel would stop being recognised as ours.
@@ -47,10 +58,37 @@ $script:LegacyTaskDescription = 'Runs WindowsAutoCleanup daily to silently remov
 # The tree is Run.ps1 + src + LICENSE; 8 levels is far more than it can legitimately need.
 $script:MaxTreeDepth = 8
 
+# The deployment's own ownership marker (ledger B2-3). A directory sitting at the expected path is
+# NOT evidence that we put it there, and deleting one on that basis is how an installer destroys an
+# unrelated product. Same never-change rule as the task sentinel: an installed deployment carrying
+# the old id would stop being recognised as ours and could never be replaced or removed again.
+$script:DeploymentProjectId = 'WindowsAutoCleanupDeployment=4a83c6d1-70b5-4c2e-9f18-6d0a2b7e5c34'
+$script:DeploymentManifestName = 'wac-deployment.json'
+$script:DeploymentManifestSchema = 1
+
+# Kept here rather than read out of Run.ps1 at runtime: parsing another script for a version string
+# is a coupling that breaks silently when its formatting changes. Deploy.Tests.ps1 asserts this
+# equals Run.ps1's $script:Version, so drift fails a test instead of shipping a lying manifest.
+$script:DeploymentVersion = '1.2.0'
+
+# Exactly what Copy-WacDeploymentTree puts at the top level of a deployment, plus the manifest. A
+# root holding anything else was not written by this project.
+$script:DeploymentTopLevelName = @('Run.ps1', 'src', 'LICENSE', $script:DeploymentManifestName)
+
 function Get-WacTaskName { return $script:TaskName }
 function Get-WacTaskFolder { return $script:TaskFolder }
 function Get-WacTaskSentinel { return $script:TaskSentinel }
 function Get-WacTaskDescription { return ('{0} {1}' -f $script:TaskDescriptionText, $script:TaskSentinel) }
+function Get-WacOperationLockName { return $script:OperationLockName }
+function Get-WacDeploymentVersion { return $script:DeploymentVersion }
+function Get-WacDeploymentProjectId { return $script:DeploymentProjectId }
+
+function Get-WacDeploymentManifestPath {
+    param([string]$DeploymentRoot)
+
+    if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
+    return (Join-Path -Path $DeploymentRoot -ChildPath $script:DeploymentManifestName)
+}
 
 # ---------------------------------------------------------------------------------------------
 # Bounded, never-following tree walk
@@ -288,18 +326,252 @@ function Remove-WacDeployment {
     return $result
 }
 
-function Install-WacDeployment {
+function Get-WacDeploymentFileHash {
     <#
     .SYNOPSIS
-        Copies Run.ps1, src\ and LICENSE into the machine-wide deployment root through an atomic
-        staging swap.
+        The uppercase SHA-256 of one file, or $null when it cannot be read.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try { return ([string](Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash).ToUpperInvariant() }
+    catch { return $null }
+}
+
+function New-WacDeploymentManifest {
+    <#
+    .SYNOPSIS
+        Writes the protected deployment manifest into a staged tree and returns what it recorded.
     .DESCRIPTION
-        A SYSTEM task must not execute a directory a standard user can rewrite, so the runtime is
-        copied out of the checkout (ledger P0-3). The swap is move-old-aside / move-staging-in /
-        delete-old, with a rollback, so an interrupted install never leaves a half-copied tree that
-        the task would still run.
+        Ledger B2-3: nothing may mutate a deployment it cannot prove it owns, and a same-name
+        directory at the expected path proves nothing. The manifest is the ownership marker - a
+        fixed project id, the version that wrote it, and the SHA-256 of every file - so a later
+        install or uninstall can tell OUR tree from someone else's.
+
+        The manifest never lists itself: a file cannot carry its own hash.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$StagingRoot)
+
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    $prefix = $StagingRoot.TrimEnd('\') + '\'
+
+    foreach ($item in @(Get-WacDeploymentItem -Root $StagingRoot)) {
+        if ($item.IsDirectory) { continue }
+        if ($item.IsReparsePoint) { throw ("The staged tree contains a reparse point: {0}" -f $item.Path) }
+
+        $relative = $item.Path
+        if ($relative.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $relative = $relative.Substring($prefix.Length)
+        }
+        if ($relative -ieq $script:DeploymentManifestName) { continue }
+
+        $hash = Get-WacDeploymentFileHash -Path $item.Path
+        if (-not $hash) { throw ("A staged file could not be hashed: {0}" -f $item.Path) }
+
+        [void]$entries.Add([PSCustomObject]@{
+            Path = $relative
+            Sha256 = $hash
+            Length = [long](New-Object System.IO.FileInfo($item.Path)).Length
+        })
+    }
+
+    if ($entries.Count -eq 0) { throw ("The staged tree is empty: {0}" -f $StagingRoot) }
+
+    $manifest = [PSCustomObject]@{
+        Schema = $script:DeploymentManifestSchema
+        ProjectId = $script:DeploymentProjectId
+        Version = $script:DeploymentVersion
+        CreatedUtc = ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture))
+        File = @(@($entries.ToArray()) | Sort-Object -Property Path)
+    }
+
+    # UTF-8 without a BOM, written through .NET rather than Out-File: the default encoding of
+    # Set-Content differs between the two shipped hosts and the manifest is compared byte-for-byte
+    # by nothing, but read by ConvertFrom-Json on both.
+    $json = ConvertTo-Json -InputObject $manifest -Depth 4
+    [System.IO.File]::WriteAllText((Join-Path -Path $StagingRoot -ChildPath $script:DeploymentManifestName),
+        $json, (New-Object System.Text.UTF8Encoding($false)))
+
+    return $manifest
+}
+
+function Read-WacDeploymentManifest {
+    <#
+    .SYNOPSIS
+        The manifest recorded in a deployment root, or $null when there is none it can read.
+    #>
+    param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
+
+    $path = Get-WacDeploymentManifestPath -DeploymentRoot $DeploymentRoot
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    if (Test-WacIsReparsePoint -Path $path) { return $null }
+
+    try { return (ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($path))) }
+    catch { return $null }
+}
+
+function Get-WacDeploymentOwnership {
+    <#
+    .SYNOPSIS
+        Proves - or refuses to prove - that the directory at the deployment path belongs to us.
+    .DESCRIPTION
+        Ledger B2-3. Nothing here deletes or replaces anything; it answers the single question every
+        mutation has to ask first. Four kinds:
+
+          Absent    - nothing is there. Safe to create.
+          Managed   - our manifest is there and its project id matches. Safe to replace or remove.
+          Unmanaged - no manifest, but the top level holds ONLY the names this project deploys and
+                      an empty directory or one carrying Run.ps1. That is what every deployment made
+                      before the manifest existed looks like, and refusing it would strand every
+                      already-installed machine: the upgrade could never replace the old tree and the
+                      uninstaller could never remove it. A BENIGN, EXPECTED steady state must not
+                      produce a security refusal, so this is adopted - and logged as adopted.
+          Foreign   - anything else, including a reparse point standing in for the root. Refused, and
+                      the caller must leave it exactly as it found it.
+
+        Tampered is REPORTED, not refused. A hash that no longer matches means the tree changed since
+        it was installed, which is worth logging - but making it flip ownership would mean a single
+        edited file locks the deployment in place forever, unremovable and unreplaceable. Identity is
+        the project id and the layout; the hashes are evidence about content.
     .OUTPUTS
-        DeploymentRoot, RunScript, FileCount.
+        Root, Exists, Kind, IsOurs, Version, Tampered, Findings, Reason.
+    #>
+    [CmdletBinding()]
+    param([string]$DeploymentRoot)
+
+    if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
+
+    $result = [PSCustomObject]@{
+        Root = $DeploymentRoot
+        Exists = $false
+        Kind = 'Foreign'
+        IsOurs = $false
+        Version = $null
+        Tampered = $false
+        Findings = @()
+        Reason = $null
+    }
+
+    $root = Get-WacNormalizedPath -Path $DeploymentRoot
+    if (-not $root) {
+        $result.Reason = 'The deployment path is not a supported local path.'
+        return $result
+    }
+    $result.Root = $root
+
+    if (-not (Test-Path -LiteralPath $root)) {
+        $result.Exists = $false
+        $result.Kind = 'Absent'
+        $result.IsOurs = $true
+        $result.Reason = 'Nothing is deployed at this path.'
+        return $result
+    }
+
+    $result.Exists = $true
+
+    if (Test-WacIsReparsePoint -Path $root) {
+        $result.Reason = 'The deployment path is a reparse point, so deleting it would act on whatever it points at.'
+        return $result
+    }
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        $result.Reason = 'The deployment path exists but is not a directory.'
+        return $result
+    }
+    if (-not (Test-WacPathResolvesToItself -Path $root)) {
+        $result.Reason = 'The deployment path does not resolve to itself; a component may have been swapped.'
+        return $result
+    }
+
+    # The top level is checked before the manifest is trusted: a foreign directory could carry a
+    # copied manifest, and the layout is what makes that copy implausible.
+    $unexpected = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($entry in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+        $known = $false
+        foreach ($name in $script:DeploymentTopLevelName) {
+            if ([string]::Equals([string]$entry.Name, $name, [System.StringComparison]::OrdinalIgnoreCase)) { $known = $true; break }
+        }
+        if (-not $known) { [void]$unexpected.Add([string]$entry.Name) }
+    }
+
+    if ($unexpected.Count -gt 0) {
+        $result.Findings = @($unexpected.ToArray())
+        $result.Reason = ('The directory holds names this project never deploys, so it is not ours: {0}' -f
+            ((@($unexpected.ToArray()) | Sort-Object) -join ', '))
+        return $result
+    }
+
+    $manifest = Read-WacDeploymentManifest -DeploymentRoot $root
+    if (-not $manifest) {
+        $hasRun = Test-Path -LiteralPath (Join-Path -Path $root -ChildPath 'Run.ps1') -PathType Leaf
+        $isEmpty = (@(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue).Count -eq 0)
+        if (-not $hasRun -and -not $isEmpty) {
+            $result.Reason = 'The directory carries no deployment manifest and no Run.ps1, so it cannot be proven ours.'
+            return $result
+        }
+
+        $result.Kind = 'Unmanaged'
+        $result.IsOurs = $true
+        $result.Reason = 'No manifest, but the layout is exactly what this project deployed before manifests existed.'
+        return $result
+    }
+
+    $projectId = ''
+    try { $projectId = [string]$manifest.ProjectId } catch { $projectId = '' }
+    if (-not [string]::Equals($projectId, $script:DeploymentProjectId, [System.StringComparison]::Ordinal)) {
+        $result.Reason = 'The deployment manifest carries a different project identity.'
+        return $result
+    }
+
+    try { $result.Version = [string]$manifest.Version } catch { $result.Version = $null }
+
+    $files = @()
+    try { $files = @($manifest.File) } catch { $files = @() }
+
+    $mismatch = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($entry in $files) {
+        $relative = ''
+        $expected = ''
+        try { $relative = [string]$entry.Path } catch { $relative = '' }
+        try { $expected = [string]$entry.Sha256 } catch { $expected = '' }
+        if (-not $relative) { continue }
+
+        $full = Join-Path -Path $root -ChildPath $relative
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            [void]$mismatch.Add(('{0}: missing' -f $relative))
+            continue
+        }
+
+        $actual = Get-WacDeploymentFileHash -Path $full
+        if (-not $actual -or -not [string]::Equals($actual, $expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void]$mismatch.Add(('{0}: content differs from the manifest' -f $relative))
+        }
+    }
+
+    $result.Kind = 'Managed'
+    $result.IsOurs = $true
+    $result.Tampered = ($mismatch.Count -gt 0)
+    $result.Findings = @($mismatch.ToArray())
+    $result.Reason = if ($result.Tampered) {
+        ('Our manifest, but {0} file(s) no longer match it.' -f $mismatch.Count)
+    }
+    else {
+        ('Our manifest, version {0}, and all {1} recorded files match.' -f [string]$result.Version, $files.Count)
+    }
+    return $result
+}
+
+function New-WacDeploymentStage {
+    <#
+    .SYNOPSIS
+        Builds the complete new deployment in the .staging slot and writes its manifest. Nothing the
+        running task can reach is touched.
+    .DESCRIPTION
+        Split out of Install-WacDeployment for ledger B2-3's ordering rule: the caller must be able
+        to VERIFY the tree, and resolve the existing scheduled task, before anything goes live. The
+        staging slot is a different directory from the deployment root, so building it cannot change
+        a file the currently registered task would execute.
+    .OUTPUTS
+        StagingRoot, Manifest, FileCount, Version.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$SourceRoot)
@@ -340,6 +612,45 @@ function Install-WacDeployment {
         Copy-Item -LiteralPath $sourceLicense -Destination (Join-Path -Path $slots.Staging -ChildPath 'LICENSE') -Force -ErrorAction Stop
     }
 
+    $manifest = New-WacDeploymentManifest -StagingRoot $slots.Staging
+
+    # Read the staged tree back through the same ownership proof the deployment root will face. Here
+    # a hash mismatch IS fatal - it means the copy did not land intact - unlike on an installed tree,
+    # where refusing on it would make an edited file impossible to replace.
+    $staged = Get-WacDeploymentOwnership -DeploymentRoot $slots.Staging
+    if ($staged.Kind -ne 'Managed' -or $staged.Tampered) {
+        [void](Remove-WacDeployment -Path $slots.Staging)
+        throw ("The staged deployment did not verify against its own manifest: {0}" -f $staged.Reason)
+    }
+
+    return [PSCustomObject]@{
+        StagingRoot = $slots.Staging
+        Manifest = $manifest
+        FileCount = @($manifest.File).Count
+        Version = $script:DeploymentVersion
+    }
+}
+
+function Switch-WacDeploymentStage {
+    <#
+    .SYNOPSIS
+        Atomically swaps the staged tree into the deployment root.
+    .DESCRIPTION
+        Move-old-aside / move-staging-in, with the old tree restored if the second move fails. With
+        -KeepPrevious the old tree is LEFT in the .previous slot so the caller can roll back after a
+        later step - registering the task, or asserting what it registered - fails.
+    .OUTPUTS
+        DeploymentRoot, RunScript, FileCount, PreviousKept.
+    #>
+    [CmdletBinding()]
+    param([switch]$KeepPrevious)
+
+    $slots = Get-WacDeploymentSlotPath
+    if (-not $slots) { throw 'The deployment root could not be resolved.' }
+    if (-not (Test-Path -LiteralPath $slots.Staging -PathType Container)) {
+        throw ("There is no staged deployment to switch into place: {0}" -f $slots.Staging)
+    }
+
     $movedAside = $false
     if (Test-Path -LiteralPath $slots.Root -PathType Container) {
         [System.IO.Directory]::Move($slots.Root, $slots.Previous)
@@ -357,219 +668,119 @@ function Install-WacDeployment {
         throw ("The staging directory could not be swapped into place: {0}" -f $_.Exception.Message)
     }
 
+    $keptPrevious = $false
     if ($movedAside) {
-        $discarded = Remove-WacDeployment -Path $slots.Previous
-        if (-not $discarded.Removed) {
-            # The new deployment is already live, so this is untidy rather than fatal.
-            Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The previous deployment could not be deleted.' -Data @{ path = $slots.Previous; reason = $discarded.Reason }
+        if ($KeepPrevious) {
+            $keptPrevious = $true
+        }
+        else {
+            $discarded = Remove-WacDeployment -Path $slots.Previous
+            if (-not $discarded.Removed) {
+                # The new deployment is already live, so this is untidy rather than fatal.
+                Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The previous deployment could not be deleted.' -Data @{ path = $slots.Previous; reason = $discarded.Reason }
+            }
         }
     }
 
     $fileCount = @(Get-WacDeploymentItem -Root $slots.Root | Where-Object { -not $_.IsDirectory }).Count
-    Write-WacLog -Level INFO -Component 'Deploy' -Message 'Deployment complete.' -Data @{ root = $slots.Root; files = $fileCount }
+    Write-WacLog -Level INFO -Component 'Deploy' -Message 'Deployment switched into place.' -Data @{ root = $slots.Root; files = $fileCount; previousKept = $keptPrevious }
 
     return [PSCustomObject]@{
         DeploymentRoot = $slots.Root
         RunScript = (Join-Path -Path $slots.Root -ChildPath 'Run.ps1')
         FileCount = $fileCount
+        PreviousKept = $keptPrevious
     }
 }
 
-function Get-WacPathAncestor {
+function Restore-WacDeploymentPrevious {
     <#
     .SYNOPSIS
-        Every ancestor directory of a path, nearest parent first, up to and including the volume
-        root.
+        Undoes a switch: discards the new deployment and puts the kept previous tree back.
     .DESCRIPTION
-        The volume root comes back in its rooted 'C:\' form rather than the bare 'C:' form
-        Get-WacNormalizedPath produces. A bare 'X:' is DRIVE-RELATIVE to the FileSystem provider, so
-        Get-Acl -LiteralPath 'C:' reads whichever directory the session happens to sit in - measured
-        on pwsh 7.6.5: after Set-Location C:\Windows it returns the descriptor of C:\Windows. An
-        installer launched from anywhere on C: would otherwise vouch for a root it never looked at.
+        Only ever called after Switch-WacDeploymentStage -KeepPrevious, so the tree it deletes is the
+        one this run just wrote. When there was no previous deployment the root is simply removed,
+        which is the correct rollback of a first install.
     .OUTPUTS
-        A string array, empty when the path is not a supported local path. Callers wrap the call in
-        @( ) because a single-element array returned from a function unwraps on Windows PowerShell.
-    #>
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path)
-
-    $ancestors = New-Object 'System.Collections.Generic.List[string]'
-
-    $current = Get-WacNormalizedPath -Path $Path
-    if (-not $current) { return @($ancestors.ToArray()) }
-
-    while ($true) {
-        $parent = [System.IO.Path]::GetDirectoryName($current)
-        if ([string]::IsNullOrEmpty($parent)) { break }
-
-        $normalized = Get-WacNormalizedPath -Path $parent
-        if (-not $normalized -or $normalized -ieq $current) { break }
-
-        if ($normalized -match '^[A-Za-z]:$') { [void]$ancestors.Add($normalized + '\') }
-        else { [void]$ancestors.Add($normalized) }
-
-        $current = $normalized
-    }
-
-    return @($ancestors.ToArray())
-}
-
-function Test-WacAncestorDescriptorIsTrusted {
-    <#
-    .SYNOPSIS
-        The ancestor-trust DECISION, taken over a security descriptor the caller already holds.
-    .DESCRIPTION
-        An ancestor is not asked the same question as the deployment itself.
-        Test-WacPathIsMachineTrusted asks "can a non-administrator write anything here at all",
-        which is right for a directory that HOLDS executed code and wrong one level up: the DEFAULT
-        DACL of C:\ on a healthy Windows install grants Authenticated Users CreateDirectories on the
-        folder itself. Measured on this machine: S-1-5-11 Allow 0x00000004 with no inheritance
-        flags, plus a separate INHERIT-ONLY S-1-5-11 0xE0010000 that grants nothing on the root.
-        Asking the strict question there marks every legitimate volume root untrusted and would
-        refuse every correct install.
-
-        Creating a NEW name beside an existing one cannot replace the existing one. Replacing or
-        redirecting an existing child needs one of:
-          * DeleteSubdirectoriesAndFiles - delete or rename a child whatever the child's DACL says;
-          * Delete - rename or delete THIS directory, taking the whole subtree with it;
-          * ChangePermissions or TakeOwnership - grant yourself either of the above;
-          * GENERIC_ALL, which is not decomposed into specific rights inside a raw ACE.
-        GENERIC_WRITE is deliberately absent: on a directory it maps to add-file, add-subdirectory,
-        write-EA, write-attributes and READ_CONTROL, none of which can touch an existing child.
-
-        The OWNER test stays strict, because an owner implicitly keeps WRITE_DAC and can grant
-        itself every right above at any moment. Ownerless, non-administratively owned and
-        rule-less descriptors all leave IsTrusted false so callers fail closed.
-
-        The decision lives apart from the directory that carries it ON PURPOSE. Setting a
-        directory's owner to an arbitrary account needs SeRestorePrivilege, and emptying its DACL
-        needs a write this project refuses to perform, so no on-disk fixture can reach the owner
-        or rule-less refusals - both stayed unproven while they were welded to Get-Acl. A
-        DirectorySecurity built from SDDL reaches every branch. The rules are unchanged; only
-        where the descriptor comes from is.
-    .OUTPUTS
-        IsTrusted / Owner / Reason. The caller supplies the Path.
+        Restored, HadPrevious, Reason.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$SecurityDescriptor)
+    param()
 
-    $result = [PSCustomObject]@{
-        IsTrusted = $false
-        Owner = $null
-        Reason = $null
-    }
+    $result = [PSCustomObject]@{ Restored = $false; HadPrevious = $false; Reason = $null }
 
-    $ownerSid = $null
-    try { $ownerSid = [string]$SecurityDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { $ownerSid = $null }
-    $result.Owner = $ownerSid
-
-    if (-not (Test-WacSidIsAdministrator -Sid ([string]$ownerSid))) {
-        $result.Reason = ('Owner {0} is not an administrative principal; an owner implicitly keeps WRITE_DAC.' -f $ownerSid)
+    $slots = Get-WacDeploymentSlotPath
+    if (-not $slots) {
+        $result.Reason = 'The deployment root could not be resolved.'
         return $result
     }
 
-    $replaceRights = [int]([System.Security.AccessControl.FileSystemRights]::Delete) -bor
-                     [int]([System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
-                     [int]([System.Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
-                     [int]([System.Security.AccessControl.FileSystemRights]::TakeOwnership)
-    $genericAll = 0x10000000
+    $result.HadPrevious = Test-Path -LiteralPath $slots.Previous -PathType Container
 
-    try {
-        $rules = @($SecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-    }
-    catch {
-        $result.Reason = ('Access rules are unreadable: {0}' -f $_.Exception.Message)
+    $removed = Remove-WacDeployment -Path $slots.Root
+    if (-not $removed.Removed) {
+        $result.Reason = ('The new deployment could not be removed, so the previous one was not restored: {0}' -f [string]$removed.Reason)
         return $result
     }
 
-    # Zero rules is refused rather than read as "nobody can replace anything here". Measured on
-    # both hosts: a genuine NULL DACL does NOT arrive as zero rules - .NET materialises it as one
-    # Allow(S-1-1-0, 0xFFFFFFFF) ACE, which the loop below rejects on its own. Zero rules is an
-    # EMPTY or unreadable DACL, and a descriptor offering nothing to evaluate is not evidence.
-    if ($rules.Count -eq 0) {
-        $result.Reason = 'The security descriptor exposes no access rules to evaluate.'
-        return $result
-    }
-
-    $untrusted = New-Object 'System.Collections.Generic.List[string]'
-
-    foreach ($rule in $rules) {
-        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
-
-        # An InheritOnly ACE is a template for children and grants nothing on this container. Both
-        # C:\ and %ProgramFiles% carry one, so skipping it is what keeps the check usable.
-        $propagation = [System.Security.AccessControl.PropagationFlags]::None
-        try { $propagation = $rule.PropagationFlags } catch { $propagation = [System.Security.AccessControl.PropagationFlags]::None }
-        if (([int]$propagation -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
-
-        if ((([int]$rule.FileSystemRights -band $replaceRights) -eq 0) -and
-            (([int]$rule.FileSystemRights -band $genericAll) -eq 0)) { continue }
-
-        $sid = [string]$rule.IdentityReference.Value
-        if (Test-WacSidIsAdministrator -Sid $sid) { continue }
-
-        [void]$untrusted.Add($sid)
-    }
-
-    if ($untrusted.Count -gt 0) {
-        $writers = ((@($untrusted.ToArray()) | Sort-Object -Unique) -join ', ')
-        $result.Reason = ('Non-administrative principals can replace a child of this directory: {0}' -f $writers)
-        return $result
-    }
-
-    $result.IsTrusted = $true
-    $result.Reason = 'Owner is administrative and no non-administrative principal can replace a child here.'
-    return $result
-}
-
-function Test-WacAncestorIsMachineTrusted {
-    <#
-    .SYNOPSIS
-        True when no non-administrative principal can REPLACE or REDIRECT a child of this directory.
-    .DESCRIPTION
-        Reads the descriptor off disk and hands it to Test-WacAncestorDescriptorIsTrusted, which
-        owns the decision and documents it. Everything here is I/O: normalising the path,
-        re-rooting a bare drive qualifier, and failing closed on anything unreadable.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $result = [PSCustomObject]@{
-        Path = $Path
-        IsTrusted = $false
-        Owner = $null
-        Reason = $null
-    }
-
-    $normalized = Get-WacNormalizedPath -Path $Path
-    if (-not $normalized) {
-        $result.Reason = 'Path is not a supported local path.'
-        return $result
-    }
-
-    # The guard lives inside the helper, not at each call site, so a bare drive-relative 'X:' can
-    # never reach Test-Path or Get-Acl no matter who calls this next.
-    $literal = $normalized
-    if ($literal -match '^[A-Za-z]:$') { $literal = $literal + '\' }
-
-    if (-not (Test-Path -LiteralPath $literal)) {
-        $result.Reason = 'Path does not exist.'
+    if (-not $result.HadPrevious) {
+        $result.Restored = $true
+        $result.Reason = 'There was no previous deployment; the new one was removed.'
         return $result
     }
 
     try {
-        $acl = Get-Acl -LiteralPath $literal -ErrorAction Stop
+        [System.IO.Directory]::Move($slots.Previous, $slots.Root)
+        $result.Restored = $true
+        $result.Reason = 'The previous deployment was restored.'
     }
     catch {
-        $result.Reason = ('Security descriptor is unreadable: {0}' -f $_.Exception.Message)
-        return $result
+        $result.Reason = ('The previous deployment could not be restored: {0}' -f $_.Exception.Message)
     }
 
-    $decision = Test-WacAncestorDescriptorIsTrusted -SecurityDescriptor $acl
-    $result.Owner = $decision.Owner
-    $result.IsTrusted = $decision.IsTrusted
-    $result.Reason = $decision.Reason
     return $result
 }
+
+function Remove-WacDeploymentPrevious {
+    <#
+    .SYNOPSIS
+        Discards the kept previous deployment once the new one is registered and verified.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $slots = Get-WacDeploymentSlotPath
+    if (-not $slots) { return $false }
+    if (-not (Test-Path -LiteralPath $slots.Previous)) { return $true }
+
+    $discarded = Remove-WacDeployment -Path $slots.Previous
+    if (-not $discarded.Removed) {
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The previous deployment could not be deleted.' -Data @{ path = $slots.Previous; reason = [string]$discarded.Reason }
+    }
+    return [bool]$discarded.Removed
+}
+
+function Install-WacDeployment {
+    <#
+    .SYNOPSIS
+        Stage-and-switch in one call, discarding the previous tree. The installer uses the two phases
+        separately so it can verify and roll back between them.
+    .OUTPUTS
+        DeploymentRoot, RunScript, FileCount.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$SourceRoot)
+
+    [void](New-WacDeploymentStage -SourceRoot $SourceRoot)
+    $switched = Switch-WacDeploymentStage
+
+    return [PSCustomObject]@{
+        DeploymentRoot = $switched.DeploymentRoot
+        RunScript = $switched.RunScript
+        FileCount = $switched.FileCount
+    }
+}
+
 
 function Test-WacDeploymentTrusted {
     <#
@@ -623,9 +834,14 @@ function Test-WacDeploymentTrusted {
         [void]$toCheck.Add($item.Path)
     }
 
+    $checkedSet = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $reported = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+
     foreach ($path in $toCheck) {
+        [void]$checkedSet.Add($path)
         $trust = Test-WacPathIsMachineTrusted -Path $path
         if (-not $trust.IsTrusted) {
+            [void]$reported.Add($path)
             [void]$untrusted.Add([PSCustomObject]@{ Path = $path; Reason = $trust.Reason; Owner = $trust.Owner })
         }
     }
@@ -633,19 +849,24 @@ function Test-WacDeploymentTrusted {
     # Ancestors (ledger R-22). Verifying only the leaf proves less than it looks: write access to a
     # PARENT is enough to rename the whole deployment aside and drop a different one in its place.
     #
-    # Only two chains are walked. Every directory INSIDE the deployment is already in $toCheck, so
-    # walking each item's parents would re-check the same handful of directories once per file and
-    # prove nothing new. The two chains overlap (both sit under %ProgramFiles% on a default
-    # install), so a per-invocation set keeps every directory to a single Get-Acl.
+    # Core owns this walk now (ledger B2-3). Test-WacStatePathIsTrusted answers exactly the ancestor
+    # question - "can a non-administrator REPLACE or REDIRECT this", not the strict "can anyone write
+    # here at all" that the deployed files themselves are held to - and it additionally proves the
+    # chain is on a ready local FIXED disk and free of reparse points. This module used to carry its
+    # own copy of that rule (Get-WacPathAncestor plus Test-WacAncestorDescriptorIsTrusted); two
+    # copies of a security decision is one copy that gets fixed and one that does not.
+    #
+    # Two chains, not one per file: every directory INSIDE the deployment is already in $toCheck, so
+    # walking each item's parents would re-read the same handful of descriptors once per file. The
+    # chains overlap under %ProgramFiles% on a default install, so findings and counts are collected
+    # through sets and each path is reported at most once - the strict verdict wins, because it is
+    # the stronger statement about the same path.
     #
     # The HOST binary's chain is proved HERE rather than beside Get-WacCanonicalPowerShellHost in
     # Core, deliberately: this function is the single gate the installer crosses immediately before
     # it registers the SYSTEM task, so one check here covers the only flow that ever hands a binary
     # to SYSTEM. The other callers of that function (Run.ps1's elevated relaunch, the uninstaller)
-    # re-launch as the invoking ADMINISTRATOR, who can already rewrite any of those directories, so
-    # its own leaf trust check is the right depth for them. If the ancestor guarantee is ever wanted
-    # for those callers too, the two helpers above move to Core and Get-WacCanonicalPowerShellHost
-    # calls them - never the call sites, which is how a guarantee gets forgotten in one of them.
+    # re-launch as the invoking ADMINISTRATOR, who can already rewrite any of those directories.
     #
     # A missing host is one more FINDING, not an early return. Returning here threw away every
     # untrusted path already collected and reported a CheckedCount that excluded them, so the
@@ -666,22 +887,27 @@ function Test-WacDeploymentTrusted {
         })
     }
 
-    $ancestors = New-Object 'System.Collections.Generic.List[string]'
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($chain in $chains) {
-        foreach ($ancestor in @(Get-WacPathAncestor -Path $chain)) {
-            if ($seen.Add($ancestor)) { [void]$ancestors.Add($ancestor) }
+        $chainTrust = Test-WacStatePathIsTrusted -Path $chain
+        foreach ($probe in @($chainTrust.Checked)) { [void]$checkedSet.Add([string]$probe) }
+
+        foreach ($failure in @($chainTrust.Failures)) {
+            $path = [string]$failure.Path
+            if (-not $reported.Add($path)) { continue }
+            [void]$untrusted.Add([PSCustomObject]@{ Path = $path; Reason = [string]$failure.Reason; Owner = $null })
+        }
+
+        # A chain that answered nothing - an unresolvable path, an unready or non-fixed volume - is
+        # not a pass. Test-WacStatePathIsTrusted reports those in Reason with no per-path failure,
+        # so without this the walk would silently contribute zero findings.
+        if (-not $chainTrust.IsTrusted -and @($chainTrust.Failures).Count -eq 0) {
+            if ($reported.Add($chain)) {
+                [void]$untrusted.Add([PSCustomObject]@{ Path = $chain; Reason = [string]$chainTrust.Reason; Owner = $null })
+            }
         }
     }
 
-    foreach ($ancestor in $ancestors) {
-        $trust = Test-WacAncestorIsMachineTrusted -Path $ancestor
-        if (-not $trust.IsTrusted) {
-            [void]$untrusted.Add([PSCustomObject]@{ Path = $ancestor; Reason = $trust.Reason; Owner = $trust.Owner })
-        }
-    }
-
-    $checked = $toCheck.Count + $ancestors.Count
+    $checked = $checkedSet.Count
     $result.CheckedCount = $checked
     if ($untrusted.Count -gt 0) {
         $result.Untrusted = @($untrusted.ToArray())
@@ -787,6 +1013,77 @@ function Get-WacInstalledTask {
     return @($found.ToArray())
 }
 
+function Get-WacTaskActionArgumentCandidate {
+    <#
+    .SYNOPSIS
+        Every argument string this version can legitimately register for one deployed Run.ps1.
+    .DESCRIPTION
+        Ledger B2-3: "the arguments look about right" is not ownership proof. A permissive match
+        accepts a trailing `; iwr evil | iex` inside the -Command payload, and the payload runs as
+        SYSTEM. The only shape that cannot be talked around is the one this module GENERATES, so
+        ownership compares the registered string ordinally against the complete set of strings
+        Get-WacTaskActionArgument can produce for that script path - three independent switches,
+        eight strings, no regex and therefore no regex hole.
+
+        A task written by a FUTURE version whose action shape has changed will not match, and will
+        be refused rather than silently replaced. That is the intended direction of the failure: the
+        version that changes the shape adds its predecessor's generator here, in one place, instead
+        of every reader loosening its matching.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$RunScript)
+
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($resetBase in @($true, $false)) {
+        foreach ($prune in @($true, $false)) {
+            foreach ($legacy in @($true, $false)) {
+                [void]$candidates.Add((Get-WacTaskActionArgument -RunScript $RunScript `
+                    -ResetWindowsUpdateBase $resetBase `
+                    -PruneSupersededDrivers:$prune `
+                    -EnableLegacyDiskCleanup:$legacy))
+            }
+        }
+    }
+
+    return @($candidates.ToArray())
+}
+
+function Get-WacLegacyTaskScriptPath {
+    <#
+    .SYNOPSIS
+        The Run.ps1 path a pre-1.2 task action runs, or $null when the string is not EXACTLY the
+        shape the pre-1.2 installer wrote.
+    .DESCRIPTION
+        v1.0.0/v1.1.0 built the action as one interpolated literal:
+
+            -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<script>" -Scheduled
+            [ -ResetWindowsUpdateBase]
+
+        The pattern is anchored at both ends, so nothing may precede or follow it. That is what the
+        brief means by "no trailing command injection": a task whose arguments merely CONTAIN the old
+        shape - with an extra `-Command "..."` bolted on, say - is not the old task and is refused,
+        because unregistering it would be acting on something we did not identify.
+
+        Note what is deliberately NOT required here: a canonical Execute. The pre-1.2 installer
+        resolved its host with `Get-Command pwsh.exe`, so a real legacy task can and does point at a
+        PATH-resolved portable PowerShell on a secondary drive. That is precisely the vulnerable
+        registration this migration exists to REMOVE; demanding a canonical host would refuse it,
+        leave it running, and register a second task beside it.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Arguments)
+
+    if ([string]::IsNullOrWhiteSpace($Arguments)) { return $null }
+
+    $pattern = '^-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "(?<path>[^"]+)" -Scheduled( -ResetWindowsUpdateBase)?$'
+    $match = [regex]::Match($Arguments.Trim(), $pattern)
+    if (-not $match.Success) { return $null }
+
+    $path = Get-WacNormalizedPath -Path $match.Groups['path'].Value
+    if (-not $path) { return $null }
+    if (-not ([System.IO.Path]::GetFileName($path) -ieq 'Run.ps1')) { return $null }
+    return $path
+}
+
 function Test-WacTaskIsOurs {
     <#
     .SYNOPSIS
@@ -795,13 +1092,20 @@ function Test-WacTaskIsOurs {
         v1.1.0 registered with -Force and unregistered by name alone, so any unrelated task called
         WindowsAutoCleanup was silently replaced or deleted (ledger P0-4).
 
-        A task is ours when its description carries the fixed sentinel AND its single action runs a
-        rooted executable whose -File argument lives inside the canonical deployment root. The
-        rooted-executable test is what rejects a PATH-resolved host.
+        CURRENT shape - every one of these, or the task is not ours (ledger B2-3):
+          * exactly one action;
+          * Execute is one of the canonical machine-wide PowerShell hosts, not merely rooted;
+          * Arguments equal, ORDINALLY, one of the eight strings this version generates for
+            <DeploymentRoot>\Run.ps1 - so a trailing statement in the -Command payload cannot pass;
+          * WorkingDirectory, when the task carries one, is the deployment root;
+          * the description carries the fixed sentinel.
 
-        Migration: the pre-1.2 task at the ROOT path is adopted only with -AllowLegacyMigration and
-        only when its description is the old text and its arguments run a Run.ps1 with -Scheduled.
-        Anything else is refused with a reason rather than guessed at.
+        LEGACY shape - only with -AllowLegacyMigration, only at the ROOT task path, and only to
+        REMOVE or REPLACE it, never to keep it: the exact pre-1.2 description plus an exactly parsed
+        pre-1.2 action running a Run.ps1 with -Scheduled. Its Execute is intentionally unconstrained;
+        see Get-WacLegacyTaskScriptPath.
+
+        Anything else is refused with a reason, and the caller must leave that task alone.
     #>
     [CmdletBinding()]
     param(
@@ -815,6 +1119,7 @@ function Test-WacTaskIsOurs {
         TaskPath = $null
         IsOurs = $false
         IsLegacy = $false
+        ScriptPath = $null
         Reason = $null
     }
 
@@ -836,41 +1141,56 @@ function Test-WacTaskIsOurs {
 
     $execute = ''
     $arguments = ''
+    $workingDirectory = ''
     try { $execute = [string]$actions[0].Execute } catch { $execute = '' }
     try { $arguments = [string]$actions[0].Arguments } catch { $arguments = '' }
+    # Absent on a stub and on some CIM shapes; an absent value cannot contradict the expectation, so
+    # it is treated as "not stated" rather than as a mismatch.
+    try { $workingDirectory = [string]$actions[0].WorkingDirectory } catch { $workingDirectory = '' }
 
-    # IsPathRooted alone accepts the drive-relative 'C:file' form, and normalisation alone accepts a
-    # bare 'pwsh.exe' because GetFullPath resolves it against the current directory. A PATH-resolved
-    # host is exactly what must not be registered for SYSTEM, so both checks are required.
-    $executeRooted = $false
-    try { $executeRooted = [System.IO.Path]::IsPathRooted($execute) } catch { $executeRooted = $false }
-    if (-not $executeRooted -or -not (Get-WacNormalizedPath -Path $execute)) {
-        $result.Reason = 'The action executable is not a rooted local path.'
-        return $result
-    }
+    $carriesSentinel = ($description -and $description.Contains($script:TaskSentinel))
 
-    # Rooted is not enough. Ownership has to cover WHAT runs, not only which script it points at:
-    # a task carrying our sentinel but executing C:\Users\bob\evil.exe as SYSTEM would otherwise be
-    # judged ours, adopted, and left in place - the exact escalation the sentinel exists to prevent.
-    if (-not (Test-WacTaskExecuteIsCanonicalHost -Execute $execute)) {
-        $result.Reason = ('The action executable {0} is not a canonical machine-wide PowerShell host.' -f $execute)
-        return $result
-    }
-
-    $scriptPath = Get-WacTaskScriptPath -Arguments $arguments
-
-    if ($description -and $description.Contains($script:TaskSentinel)) {
-        if (-not $scriptPath) {
-            $result.Reason = 'The description carries our sentinel but the action has no -File argument.'
+    if ($carriesSentinel) {
+        # IsPathRooted alone accepts the drive-relative 'C:file' form, and normalisation alone
+        # accepts a bare 'pwsh.exe' because GetFullPath resolves it against the current directory.
+        $executeRooted = $false
+        try { $executeRooted = [System.IO.Path]::IsPathRooted($execute) } catch { $executeRooted = $false }
+        if (-not $executeRooted -or -not (Get-WacNormalizedPath -Path $execute)) {
+            $result.Reason = 'The action executable is not a rooted local path.'
             return $result
         }
-        if (-not (Test-WacIsWithinRoot -ChildPath $scriptPath -RootPath $DeploymentRoot)) {
-            $result.Reason = ('The action script {0} is outside the deployment root {1}.' -f $scriptPath, $DeploymentRoot)
+
+        # Rooted is not enough. Ownership has to cover WHAT runs, not only which script it points
+        # at: a task carrying our sentinel but executing C:\Users\bob\evil.exe as SYSTEM would
+        # otherwise be judged ours, adopted and left in place - the exact escalation the sentinel
+        # exists to prevent.
+        if (-not (Test-WacTaskExecuteIsCanonicalHost -Execute $execute)) {
+            $result.Reason = ('The action executable {0} is not a canonical machine-wide PowerShell host.' -f $execute)
             return $result
+        }
+
+        $runScript = Join-Path -Path $DeploymentRoot -ChildPath 'Run.ps1'
+        $matched = $false
+        foreach ($candidate in (Get-WacTaskActionArgumentCandidate -RunScript $runScript)) {
+            if ([string]::Equals($arguments, $candidate, [System.StringComparison]::Ordinal)) { $matched = $true; break }
+        }
+        if (-not $matched) {
+            $result.Reason = ('The action arguments are not one this version registers for {0}.' -f $runScript)
+            return $result
+        }
+
+        if ($workingDirectory) {
+            $normalizedWorking = Get-WacNormalizedPath -Path $workingDirectory
+            $normalizedRoot = Get-WacNormalizedPath -Path $DeploymentRoot
+            if (-not $normalizedWorking -or -not $normalizedRoot -or ($normalizedWorking -ine $normalizedRoot)) {
+                $result.Reason = ('The action working directory {0} is not the deployment root {1}.' -f $workingDirectory, $DeploymentRoot)
+                return $result
+            }
         }
 
         $result.IsOurs = $true
-        $result.Reason = 'The description sentinel and the deployed action script both match.'
+        $result.ScriptPath = (Get-WacNormalizedPath -Path $runScript)
+        $result.Reason = 'The sentinel, the canonical host and the exact registered action all match.'
         return $result
     }
 
@@ -887,19 +1207,64 @@ function Test-WacTaskIsOurs {
         $result.Reason = 'The description does not match the pre-1.2 WindowsAutoCleanup description.'
         return $result
     }
-    if (-not $scriptPath -or -not ([System.IO.Path]::GetFileName($scriptPath) -ieq 'Run.ps1')) {
-        $result.Reason = 'The action does not run a Run.ps1 file.'
-        return $result
-    }
-    if ($arguments -notmatch '(?i)(^|\s)-Scheduled(\s|$|:)') {
-        $result.Reason = 'The action arguments do not contain -Scheduled.'
+
+    $legacyScript = Get-WacLegacyTaskScriptPath -Arguments $arguments
+    if (-not $legacyScript) {
+        $result.Reason = 'The action arguments are not exactly the pre-1.2 -File Run.ps1 -Scheduled form.'
         return $result
     }
 
     $result.IsOurs = $true
     $result.IsLegacy = $true
-    $result.Reason = 'Adopted the pre-1.2 task: old description text and a -Scheduled Run.ps1 action.'
+    $result.ScriptPath = $legacyScript
+    $result.Reason = ('Adopted the pre-1.2 task: old description text and an exactly parsed -Scheduled action running {0}.' -f $legacyScript)
     return $result
+}
+
+function Test-WacTaskReferencesRoot {
+    <#
+    .SYNOPSIS
+        True when any of the given tasks would execute something inside the deployment root.
+    .DESCRIPTION
+        Ledger B2-3: the deployment files must survive if anything can still reach them. That
+        includes a task the uninstaller REFUSED to touch - deleting the tree under a foreign task
+        that happens to point into it turns "we left it alone" into "we broke it".
+
+        Every place a path can hide in an action is looked at, not only the parsed script argument:
+        the executable itself and the working directory are equally capable of naming the tree.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowNull()][object[]]$Task,
+        [Parameter(Mandatory = $true)][string]$DeploymentRoot
+    )
+
+    foreach ($entry in @($Task)) {
+        if (-not $entry) { continue }
+
+        $actions = @()
+        try { $actions = @($entry.Actions) } catch { $actions = @() }
+
+        foreach ($action in $actions) {
+            if (-not $action) { continue }
+
+            $arguments = ''
+            $execute = ''
+            $working = ''
+            try { $arguments = [string]$action.Arguments } catch { $arguments = '' }
+            try { $execute = [string]$action.Execute } catch { $execute = '' }
+            try { $working = [string]$action.WorkingDirectory } catch { $working = '' }
+
+            foreach ($candidate in @((Get-WacTaskScriptPath -Arguments $arguments), $execute, $working)) {
+                if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
+                $normalized = Get-WacNormalizedPath -Path ([string]$candidate)
+                if (-not $normalized) { continue }
+                if (Test-WacIsWithinRoot -ChildPath $normalized -RootPath $DeploymentRoot) { return $true }
+            }
+        }
+    }
+
+    return $false
 }
 
 function Remove-WacInstalledTask {
@@ -1027,11 +1392,15 @@ function Get-WacTaskActionArgument {
 
 Export-ModuleMember -Function @(
     'Get-WacTaskName', 'Get-WacTaskFolder', 'Get-WacTaskSentinel', 'Get-WacTaskDescription',
+    'Get-WacOperationLockName', 'Get-WacDeploymentVersion', 'Get-WacDeploymentProjectId',
+    'Get-WacDeploymentManifestPath', 'New-WacDeploymentManifest', 'Read-WacDeploymentManifest',
+    'Get-WacDeploymentFileHash', 'Get-WacDeploymentOwnership',
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
-    'Get-WacPathAncestor', 'Test-WacAncestorIsMachineTrusted', 'Test-WacAncestorDescriptorIsTrusted',
+    'New-WacDeploymentStage', 'Switch-WacDeploymentStage',
+    'Restore-WacDeploymentPrevious', 'Remove-WacDeploymentPrevious',
     'Test-WacDeploymentTrusted',
-    'Get-WacTaskScriptPath', 'Test-WacTaskExecuteIsCanonicalHost',
-    'Get-WacInstalledTask', 'Test-WacTaskIsOurs', 'Remove-WacInstalledTask',
-    'Get-WacInstallerRelaunchArgument', 'Get-WacTaskActionArgument'
+    'Get-WacTaskScriptPath', 'Get-WacLegacyTaskScriptPath', 'Test-WacTaskExecuteIsCanonicalHost',
+    'Get-WacInstalledTask', 'Test-WacTaskIsOurs', 'Test-WacTaskReferencesRoot', 'Remove-WacInstalledTask',
+    'Get-WacInstallerRelaunchArgument', 'Get-WacTaskActionArgument', 'Get-WacTaskActionArgumentCandidate'
 )

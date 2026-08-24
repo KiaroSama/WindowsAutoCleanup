@@ -18,9 +18,25 @@ $script:LogLevel            = 'INFO'
 $script:ExecutionId         = $null
 $script:DeadlineUtc         = $null
 $script:ProcessInvoker      = $null
+$script:ProcessHandleOpener = $null
 $script:ProtectedRoots      = New-Object 'System.Collections.Generic.List[string]'
 $script:PendingDeleteWarned = $false
 $script:LevelRank           = @{ DEBUG = 0; INFO = 1; WARNING = 2; ERROR = 3; CRITICAL = 4 }
+
+# Audit health. A run whose durable log could not be created, or which lost a line mid-run, is not
+# entitled to report success: the shared result contract calls that Incomplete (exit 6). These stay
+# sticky for the life of the process on purpose - a later successful write does not un-lose a line.
+$script:LogDegraded         = $false
+$script:LogOpened           = $false
+$script:LogFailedWrites     = 0
+$script:LogFallbackKind     = 'None'
+$script:LogFailReason       = $null
+$script:LogFallbackWriter   = $null
+$script:StateTrust          = $null
+
+# Captured at import: inside a module $PSCommandPath is this .psm1 (measured on both hosts), and
+# Invoke-WacBounded needs a real path to import into the runspace it creates.
+$script:CoreModulePath      = $PSCommandPath
 
 # ---------------------------------------------------------------------------------------------
 # Native helpers
@@ -50,6 +66,18 @@ public static class WacNative
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool MoveFileExW(string lpExistingFileName, string lpNewFileName, int dwFlags);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern int WaitForSingleObject(IntPtr hHandle, int dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
     private const uint FILE_READ_ATTRIBUTES         = 0x0080;
     private const uint FILE_SHARE_READ_WRITE_DELETE = 0x0007;
     private const uint OPEN_EXISTING                = 3;
@@ -58,6 +86,8 @@ public static class WacNative
     private const uint FILE_NAME_NORMALIZED         = 0x00000000;
     private const uint VOLUME_NAME_DOS              = 0x00000000;
     private const int  MOVEFILE_DELAY_UNTIL_REBOOT  = 0x00000004;
+    private const int  SYNCHRONIZE                  = 0x00100000;
+    private const int  PROCESS_TERMINATE             = 0x00000001;
 
     // Resolves the final on-disk path of the object named by 'path'.
     //
@@ -107,6 +137,46 @@ public static class WacNative
     public static bool DeleteOnReboot(string path)
     {
         return MoveFileExW(path, null, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+
+    // Opens a handle BOUND to whatever owns 'processId' at this instant. Every later question -
+    // has it exited yet, terminate it - is then asked of the HANDLE, so the answer keeps referring
+    // to the process that was opened however Windows later reuses the number.
+    //
+    // The mask is exactly the two rights used: SYNCHRONIZE to wait on it and PROCESS_TERMINATE to
+    // kill it. PROCESS_QUERY_LIMITED_INFORMATION is deliberately NOT requested - nothing here reads
+    // an exit code, the wait is the exit test, and every unnecessary right is one more reason for
+    // the OS to refuse an open it would otherwise have granted.
+    //
+    // Returns 0 with the handle set, otherwise the Win32 error with handle = IntPtr.Zero. Measured
+    // identically on both shipped hosts: 87 ERROR_INVALID_PARAMETER when nothing owns the id
+    // (0, -1, 999999, 4194303 and 2147483647 all gave 87) and 5 ERROR_ACCESS_DENIED for a protected
+    // process (PID 4, csrss). A process that has exited while someone still holds a handle to it
+    // opens SUCCESSFULLY and its handle is already signalled - which is how "it was gone before we
+    // asked" is told apart from "nothing owns this id".
+    public static int OpenProcessForTermination(int processId, out IntPtr handle)
+    {
+        handle = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, false, processId);
+        if (handle == IntPtr.Zero) { return Marshal.GetLastWin32Error(); }
+        return 0;
+    }
+
+    // 0 is WAIT_OBJECT_0: the process this handle is bound to has exited. 258 is WAIT_TIMEOUT.
+    public static int WaitForProcessExit(IntPtr handle, int milliseconds)
+    {
+        return WaitForSingleObject(handle, milliseconds);
+    }
+
+    // Documented as asynchronous: it ASKS for termination and returns before the process is gone,
+    // which is why the caller must still wait on the handle afterwards.
+    public static bool TerminateBoundProcess(IntPtr handle)
+    {
+        return TerminateProcess(handle, 1);
+    }
+
+    public static void CloseProcessHandle(IntPtr handle)
+    {
+        if (handle != IntPtr.Zero) { CloseHandle(handle); }
     }
 }
 '@
@@ -591,21 +661,205 @@ function New-WacLogFile {
     return $null
 }
 
+function Set-WacLogFallbackWriter {
+    <#
+    .SYNOPSIS
+        Replaces the degraded-mode log sink. This is the seam that makes the fallback PROVABLE.
+    .DESCRIPTION
+        The scriptblock receives one already-formatted line. Pass $null to restore the real chain
+        (Event Log, then console). A test injects a collector here so it can assert the line really
+        reached a sink, instead of asserting that Write-WacLog did not throw - which is exactly the
+        non-assertion the old swallowing catch turned every log failure into.
+    #>
+    param([scriptblock]$Writer)
+    $script:LogFallbackWriter = $Writer
+}
+
+function Set-WacLogWriter {
+    <#
+    .SYNOPSIS
+        Replaces the object Write-WacLog writes through. The seam that makes a mid-run write FAILURE
+        reproducible, in the same spirit as Set-WacProcessInvoker.
+    .DESCRIPTION
+        A write to an open handle on a healthy local disk essentially cannot be made to fail on
+        demand: disk-full and device errors are not reproducible in a test, and the alternatives
+        (a VHD, a quota) cost far more than the path being proved. Anything exposing WriteLine is
+        accepted; pass $null to detach. Close-WacLog already tolerates an object without Flush or
+        Dispose, because it wraps both.
+    #>
+    param([object]$Writer)
+    $script:LogWriter = $Writer
+}
+
+function Write-WacFallbackLine {
+    <#
+    .SYNOPSIS
+        Writes one line to the best sink that ACCEPTS it, and reports which one did.
+    .DESCRIPTION
+        "Verified" here means the write itself did not throw - not that a probe succeeded earlier.
+        A pre-flight probe would prove the sink worked once and leave the real line unaccounted for.
+
+        Event Log before console, because the production caller is a SYSTEM scheduled task with no
+        console at all: Write-Host there goes nowhere and would be a fallback in name only.
+        The source is the pre-registered 'Application' source rather than a WindowsAutoCleanup one.
+        Registering a source needs an administrator, and EventLog.SourceExists cannot be used to
+        find out - measured on BOTH hosts, unelevated, it throws because it tries to search the
+        Security log ("The source ... was not found ... Inaccessible logs: Security"). Writing to
+        the pre-registered source works at either privilege level and needs no probe.
+
+        Console only when there is one: a task registered "run whether user is logged on or not"
+        reports UserInteractive false, and that is the case the Event Log branch exists for.
+    .OUTPUTS
+        [string] the sink that took the line: Injected, EventLog, Console or None.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Line)
+
+    if ($script:LogFallbackWriter) {
+        try {
+            & $script:LogFallbackWriter $Line
+            return 'Injected'
+        }
+        catch {
+            $null = $_
+        }
+    }
+
+    try {
+        [System.Diagnostics.EventLog]::WriteEntry(
+            'Application', $Line, [System.Diagnostics.EventLogEntryType]::Warning, 9001)
+        return 'EventLog'
+    }
+    catch {
+        $null = $_
+    }
+
+    if ([Environment]::UserInteractive) {
+        try {
+            Write-Host $Line
+            return 'Console'
+        }
+        catch {
+            $null = $_
+        }
+    }
+
+    return 'None'
+}
+
+function Set-WacLogDegraded {
+    <#
+    .SYNOPSIS
+        Records that durable audit output was required and could not be produced.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    $script:LogDegraded = $true
+    if (-not $script:LogFailReason) { $script:LogFailReason = $Reason }
+}
+
+function Get-WacLogHealth {
+    <#
+    .SYNOPSIS
+        Whether this run's audit trail is durable. Feeds the run's Incomplete verdict (exit 6).
+    .DESCRIPTION
+        IsDurable is false when the log file could not be created, when a write failed mid-run, or
+        when a bootstrap log that WAS supplied could not be folded in. Every one of those loses
+        audit output that the run was asked to produce, and none of them may read as success.
+
+        It reads a flag rather than the live writer, so Close-WacLog does not retroactively turn a
+        healthy run into an incomplete one. A caller computing its exit code after closing the log
+        is the normal order, not a mistake.
+    #>
+    return [PSCustomObject]@{
+        Path         = $script:LogPath
+        IsDurable    = ($script:LogOpened -and (-not $script:LogDegraded))
+        Degraded     = $script:LogDegraded
+        FallbackKind = $script:LogFallbackKind
+        FailedWrites = $script:LogFailedWrites
+        Reason       = $script:LogFailReason
+    }
+}
+
+function Get-WacStateTrust {
+    <#
+    .SYNOPSIS
+        The trust verdict for the directory this run's audit log was opened in, or $null.
+    .DESCRIPTION
+        $null means NOT EVALUATED, which is the correct answer for an unelevated run: that log lives
+        in the invoking user's own profile, the user owns it by construction, and no SYSTEM audit
+        claim rests on it. Only an elevated run makes a machine-trust claim worth refusing on.
+    #>
+    return $script:StateTrust
+}
+
+function Copy-WacBootstrapLog {
+    <#
+    .SYNOPSIS
+        Folds a pre-import bootstrap log into the run log, so an import failure is not orphaned.
+    .DESCRIPTION
+        Nothing inside this module can log before the module is imported, so the entry point owns
+        the few lines that capture a parse or import failure. This is the other half: once the real
+        log exists, the bootstrap content is copied into it and the run has ONE audit artifact.
+
+        A supplied bootstrap path that cannot be read is a LOST audit log, so it degrades the run
+        rather than being ignored.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $info = New-Object System.IO.FileInfo($Path)
+        if (-not $info.Exists) {
+            Write-WacLog -Level DEBUG -Component 'Log' -Message 'No bootstrap log was produced.' -Data @{ path = $Path }
+            return $true
+        }
+
+        if ($info.Length -gt 262144) {
+            Set-WacLogDegraded -Reason ('The bootstrap log at {0} is too large to fold in ({1} bytes).' -f $Path, $info.Length)
+            Write-WacLog -Level WARNING -Component 'Log' -Message 'Bootstrap log too large to adopt; it is left in place.' -Data @{ path = $Path; bytes = $info.Length }
+            return $false
+        }
+
+        # Folded in at WARNING, not INFO: a bootstrap log exists because something happened before
+        # this module could log it, and a run started with -LogLevel WARNING would otherwise drop the
+        # very import failure the bootstrap log was written to preserve.
+        $lines = @([System.IO.File]::ReadAllLines($Path))
+        Write-WacLog -Level WARNING -Component 'Log' -Message 'Adopting the pre-import bootstrap log.' -Data @{ path = $Path; lines = $lines.Count }
+        foreach ($line in $lines) {
+            Write-WacLog -Level WARNING -Component 'Bootstrap' -Message ([string]$line)
+        }
+        return $true
+    }
+    catch {
+        Set-WacLogDegraded -Reason ('The bootstrap log at {0} could not be read: {1}' -f $Path, $_.Exception.Message)
+        Write-WacLog -Level ERROR -Component 'Log' -Message 'The bootstrap log could not be adopted.' -Data @{ path = $Path; error = $_.Exception.Message }
+        return $false
+    }
+}
+
 function Initialize-WacRun {
     <#
     .SYNOPSIS
-        Opens the run log and arms the overall deadline.
+        Opens the run log, arms the overall deadline, adopts any bootstrap log and verifies that the
+        directory the log landed in is machine-trusted.
     .DESCRIPTION
         Returns $true only when a log file was really created. The old code assigned $LogPath even
         after every fallback failed, so later writes silently went nowhere while the run reported
         success.
+
+        A failure here no longer goes quiet either: the reason is written to the verified fallback
+        sink and Get-WacLogHealth reports IsDurable false, which the caller must map to Incomplete.
+
+        The trust check lives here rather than at the call sites because this is the one function
+        every entry point already calls; a guard a caller has to remember is a guard one caller will
+        forget. It VERIFIES and records - refusing the run is the orchestrator's decision.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$BaseName,
         [string[]]$CandidateRoot,
         [ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$LogLevel = 'INFO',
-        [int]$BudgetMinutes = 210
+        [int]$BudgetMinutes = 210,
+        [string]$BootstrapLogPath
     )
 
     if (-not $CandidateRoot -or $CandidateRoot.Count -eq 0) {
@@ -628,26 +882,66 @@ function Initialize-WacRun {
     $script:LogLevel = $LogLevel
     $script:ExecutionId = [guid]::NewGuid().ToString('N')
     $script:DeadlineUtc = (Get-Date).ToUniversalTime().AddMinutes($BudgetMinutes)
+    $script:LogDegraded = $false
+    $script:LogOpened = $false
+    $script:LogFailedWrites = 0
+    $script:LogFallbackKind = 'None'
+    $script:LogFailReason = $null
+    $script:StateTrust = $null
 
     $created = New-WacLogFile -BaseName $BaseName -CandidateRoot $CandidateRoot
     if (-not $created) {
         $script:LogPath = $null
         $script:LogWriter = $null
+
+        $reason = ('No log file could be created under any of: {0}' -f ($CandidateRoot -join '; '))
+        Set-WacLogDegraded -Reason $reason
+        $script:LogFallbackKind = Write-WacFallbackLine -Line (
+            '[{0} UTC] [CRITICAL] [Log] {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'), $reason)
         return $false
     }
 
     $script:LogPath = $created.Path
     $script:LogWriter = $created.Writer
+    $script:LogOpened = $true
 
     foreach ($root in $CandidateRoot) { Add-WacProtectedRoot -Path $root }
     Add-WacProtectedRoot -Path (Get-WacDataRoot)
     Add-WacProtectedRoot -Path (Get-WacDeploymentRoot)
+
+    if ($BootstrapLogPath) { [void](Copy-WacBootstrapLog -Path $BootstrapLogPath) }
+
+    # Only an elevated run writes into the machine-wide state root and hands SYSTEM an audit trail,
+    # so only an elevated run has a trust claim to verify. See Get-WacStateTrust for why $null is
+    # the right answer otherwise.
+    if (Test-WacIsAdministrator) {
+        $script:StateTrust = Test-WacStatePathIsTrusted -Path (Split-Path -Parent $script:LogPath)
+        if (-not $script:StateTrust.IsTrusted) {
+            Write-WacLog -Level ERROR -Component 'Log' -Message 'The audit log directory is not machine-trusted.' -Data @{
+                path = $script:StateTrust.Path; reason = $script:StateTrust.Reason
+            }
+        }
+    }
 
     return $true
 }
 
 function Get-WacLogPath { return $script:LogPath }
 function Get-WacExecutionId { return $script:ExecutionId }
+
+function Get-WacLogDirectory {
+    <#
+    .SYNOPSIS
+        The directory holding this run's log, or $null when there is no log.
+    .DESCRIPTION
+        Exists because Split-Path -Parent $null is a TERMINATING parameter-binding error on both
+        shipped hosts (measured), and the retention call in the uninstaller reached it on exactly
+        the path where logging had already failed - so the run died in its own cleanup rather than
+        reporting the log failure it was in the middle of handling.
+    #>
+    if (-not $script:LogPath) { return $null }
+    try { return (Split-Path -Parent $script:LogPath) } catch { return $null }
+}
 
 function Write-WacLog {
     <#
@@ -665,8 +959,12 @@ function Write-WacLog {
         [hashtable]$Data
     )
 
-    if (-not $script:LogWriter) { return }
     if ($script:LevelRank[$Level] -lt $script:LevelRank[$script:LogLevel]) { return }
+
+    # Before Initialize-WacRun there is deliberately nothing to say: helpers such as
+    # Register-WacDeleteOnReboot are callable without a run. Once a run has DECLARED its logging
+    # broken, the same lines go to the fallback instead of evaporating.
+    if (-not $script:LogWriter -and -not $script:LogDegraded) { return }
 
     $line = '[{0} UTC] [{1}] [{2}] {3}' -f `
         (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Component, $Message
@@ -681,12 +979,21 @@ function Write-WacLog {
         $line = '{0} | {1}' -f $line, ($parts -join ' ')
     }
 
+    if (-not $script:LogWriter) {
+        $script:LogFallbackKind = Write-WacFallbackLine -Line $line
+        return
+    }
+
     try {
         $script:LogWriter.WriteLine($line)
     }
     catch {
-        # Cleanup must stay silent even when logging fails.
-        $null = $_
+        # A lost line is lost audit output, not a nuisance. The old catch swallowed it whole, so a
+        # disk that filled up mid-run - or a log whose directory was pulled out from under it - left
+        # the run reporting success on an audit trail that had stopped being written.
+        $script:LogFailedWrites++
+        Set-WacLogDegraded -Reason ('A log write failed: {0}' -f $_.Exception.Message)
+        $script:LogFallbackKind = Write-WacFallbackLine -Line $line
     }
 }
 
@@ -704,11 +1011,15 @@ function Remove-WacOldLog {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$LogDirectory,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$LogDirectory,
         [Parameter(Mandatory = $true)][string]$Pattern,
         [int]$KeepCount = 30
     )
 
+    # There is nothing to retain when logging never started. Guarding HERE rather than in each
+    # caller is the point: the uninstaller reached this with a null directory on exactly the run
+    # where the log had failed to open.
+    if ([string]::IsNullOrWhiteSpace($LogDirectory)) { return 0 }
     if ($KeepCount -lt 1) { return 0 }
     if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) { return 0 }
 
@@ -942,50 +1253,152 @@ function Get-WacRelaunchArgument {
     return @($arguments.ToArray())
 }
 
+function Set-WacProcessHandleOpener {
+    <#
+    .SYNOPSIS
+        Replaces the OpenProcess call Stop-WacProcessTree binds its handle with. $null restores it.
+    .DESCRIPTION
+        The scriptblock receives (ProcessId) and must return an object exposing Handle and
+        Win32Error, in the same spirit as Set-WacProcessInvoker and Set-WacLogWriter.
+
+        It exists for exactly one arm: "the id exists but the OS will not hand over a handle". Only
+        a protected process produces that for real - PID 4 and csrss measured 5 ERROR_ACCESS_DENIED
+        on both hosts - and a case that asks the shipped code to terminate one of those is not
+        something to run on a workstation, at any privilege level.
+
+        Inject a FAILURE (Handle = IntPtr.Zero) and nothing else: a fabricated non-zero handle is
+        waited on, terminated and closed for real.
+    #>
+    param([scriptblock]$Opener)
+    $script:ProcessHandleOpener = $Opener
+}
+
 function Stop-WacProcessTree {
     <#
     .SYNOPSIS
-        Kills a process AND its children. Process.Kill() alone leaves the children running.
+        Kills a process AND its children, and returns $true only when the target is PROVEN gone.
+    .DESCRIPTION
+        The old body returned taskkill's WaitForExit(): its EXIT CODE was never read and the target
+        was never re-checked, so "taskkill ran" was reported as "the process is dead". Measured on
+        both shipped hosts, taskkill /T /F /PID returns
+
+            0    SUCCESS: the process ... has been terminated
+            128  ERROR: The process "<pid>" not found
+            255  ERROR: ... could not be terminated (critical system process)
+
+        and all three exited, so all three used to return $true. A failed kill was indistinguishable
+        from a real one, and Invoke-WacProcess went on to report a bounded, cleaned-up timeout while
+        the tool it was supposed to have killed kept running.
+
+        The verdict comes from a kernel handle OPENED AT ENTRY and held until this call returns, and
+        that is meant literally. System.Diagnostics.Process keeps no handle of its own unless it
+        STARTED the process: HasExited, WaitForExit and Kill each re-open the raw id and close it
+        again, so a Process object handed back by Get-Process proves nothing the replaced code did
+        not - it was the same reuse window under a better name. Waiting on, and terminating through,
+        ONE bound handle is what keeps every answer attached to the process that was opened,
+        whatever Windows later does with the number.
+
+        That is also why Get-Process is gone from this path. It answers about an id, it cannot see a
+        process that exited while a handle to it is still open, and its failure does not say WHY.
+        OpenProcess does: 87 ERROR_INVALID_PARAMETER means nothing owns the id, which IS the outcome
+        the caller wanted; anything else - 5 ERROR_ACCESS_DENIED for a protected process - means the
+        state could not be read at all. Unreadable state is never reported as proof here, the same
+        way Test-WacIsReparsePoint refuses to call an unreadable descriptor safe.
+
+        taskkill's exit code is read and logged because it is the only evidence of WHY a kill did
+        not take (255 refused vs 128 raced to exit), but it is never the verdict on its own.
+    .OUTPUTS
+        [bool] $true only when the target is known to have exited.
     #>
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,
         [int]$TimeoutMs = 10000
     )
 
-    $killed = $false
-    try {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = (Join-Path -Path $env:SystemRoot -ChildPath 'System32\taskkill.exe')
-        $psi.Arguments = ConvertTo-WacCommandLine -ArgumentList @('/T', '/F', '/PID', [string]$ProcessId)
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
+    if ($TimeoutMs -le 0) { $TimeoutMs = 1 }
 
-        $killer = [System.Diagnostics.Process]::Start($psi)
-        if ($killer) {
-            [void]$killer.StandardOutput.ReadToEndAsync()
-            [void]$killer.StandardError.ReadToEndAsync()
-            $killed = $killer.WaitForExit($TimeoutMs)
-            try { $killer.Dispose() } catch { $null = $_ }
+    $bound = [IntPtr]::Zero
+    # -1 is not a Win32 code. It stands for "no handle could be bound at all", which is a different
+    # claim from "nothing owns this id" and must never be reported as one.
+    $openError = -1
+    if ($script:ProcessHandleOpener) {
+        $injected = & $script:ProcessHandleOpener $ProcessId
+        $bound = [IntPtr]$injected.Handle
+        $openError = [int]$injected.Win32Error
+    }
+    elseif (Initialize-WacNative) {
+        $openError = [WacNative]::OpenProcessForTermination($ProcessId, [ref]$bound)
+    }
+
+    if ($bound -eq [IntPtr]::Zero) {
+        # ERROR_INVALID_PARAMETER: nothing owns this id, so the target is gone and the caller got
+        # what it asked for. Every OTHER failure is unverifiable, and unverifiable is not success.
+        if ($openError -eq 87) { return $true }
+
+        Write-WacLog -Level WARNING -Component 'Process' -Message 'The target could not be opened, so termination is unverifiable.' -Data @{
+            pid = $ProcessId
+            win32Error = $openError
         }
-    }
-    catch {
-        $killed = $false
+        return $false
     }
 
-    if (-not $killed) {
+    try {
+        # Already gone before anything was asked of it. The handle is what makes this the TARGET's
+        # own exit rather than a later occupant of the number, so no kill is needed or attempted.
+        if ([WacNative]::WaitForProcessExit($bound, 0) -eq 0) { return $true }
+
+        $exitCode = $null
         try {
-            $orphan = Get-Process -Id $ProcessId -ErrorAction Stop
-            $orphan.Kill()
-            $killed = $true
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = (Join-Path -Path $env:SystemRoot -ChildPath 'System32\taskkill.exe')
+            $psi.Arguments = ConvertTo-WacCommandLine -ArgumentList @('/T', '/F', '/PID', [string]$ProcessId)
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+
+            $killer = [System.Diagnostics.Process]::Start($psi)
+            if ($killer) {
+                [void]$killer.StandardOutput.ReadToEndAsync()
+                [void]$killer.StandardError.ReadToEndAsync()
+                if ($killer.WaitForExit($TimeoutMs)) {
+                    try { $exitCode = [int]$killer.ExitCode } catch { $exitCode = $null }
+                }
+                else {
+                    # taskkill itself overran its bound. Killing it directly is not recursion: it is
+                    # our own child and has no tree of its own worth walking.
+                    try { $killer.Kill() } catch { $null = $_ }
+                }
+                try { $killer.Dispose() } catch { $null = $_ }
+            }
         }
         catch {
-            $null = $_
+            $exitCode = $null
         }
-    }
 
-    return $killed
+        # The proof. taskkill returns once it has ASKED for termination, so the target may still be
+        # tearing down; waiting on the bound handle is the deterministic signal that it finished.
+        $verified = ([WacNative]::WaitForProcessExit($bound, $TimeoutMs) -eq 0)
+
+        if (-not $verified) {
+            # The escalation goes through the SAME handle rather than the id, so it cannot land on
+            # whatever inherited the number while taskkill was running.
+            [void][WacNative]::TerminateBoundProcess($bound)
+            $verified = ([WacNative]::WaitForProcessExit($bound, $TimeoutMs) -eq 0)
+        }
+
+        if (-not $verified) {
+            Write-WacLog -Level WARNING -Component 'Process' -Message 'Termination could not be established; the target may still be running.' -Data @{
+                pid = $ProcessId
+                taskkillExit = $(if ($null -eq $exitCode) { 'none' } else { [string]$exitCode })
+            }
+        }
+
+        return $verified
+    }
+    finally {
+        [WacNative]::CloseProcessHandle($bound)
+    }
 }
 
 function Set-WacProcessInvoker {
@@ -1098,6 +1511,171 @@ function Invoke-WacProcess {
     }
     finally {
         if ($process) { try { $process.Dispose() } catch { $null = $_ } }
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Bounded in-process work
+# ---------------------------------------------------------------------------------------------
+
+function Invoke-WacBounded {
+    <#
+    .SYNOPSIS
+        Runs IN-PROCESS work under a real wall-clock bound and returns a shared-contract outcome.
+    .DESCRIPTION
+        The run budget used to cover only external tools and the traversal loop. Everything else -
+        the Delivery Optimization cmdlet, a CIM/WMI profile query, registry work, a Recycle Bin
+        scan, target construction, a deployment walk - runs inside this process, and a call that
+        blocks in the OS blocks every deadline check sitting behind it. A 210-minute budget can be
+        blown by one of them without a single clock read.
+
+        Cooperative checking cannot fix that, because the thread never comes back to check. So the
+        work runs in its own runspace and the caller waits on a handle: expiry is a real bound, not
+        a request. Measured cost of the runspace on BOTH shipped hosts: ~80 ms bare, ~100 ms with
+        this module imported into it. That is fine per PHASE and far too expensive per file - this
+        is for phase-level blocking calls, never for the traversal loop's inner steps.
+
+        Expiry is NOT success. The outcome is 'Incomplete', which the shared result contract maps to
+        exit code 6. An exhausted run budget also refuses to START the work, which is what "stop
+        scheduling new work" means; a bounded rollback that must still run after expiry passes
+        -IgnoreRunBudget and supplies its own explicit bound.
+
+        The pipeline holds exactly ONE AddScript, and that is not cosmetic. Arming strict mode as a
+        separate first statement was tried and had to be rejected on measured evidence:
+
+          * AddScript / AddStatement / AddScript turns a THROW inside the block into an ordinary
+            error-stream record instead of an exception out of EndInvoke, so a broken step reported
+            Succeeded;
+          * with a batched pipeline, abandoning a blocked runspace crashes the HOST at process exit
+            when the worker wakes into a closing runspace - measured on both hosts, pwsh exited
+            -532462766 (unhandled InvalidRunspaceStateException from BatchInvocationWorkItem) and
+            Windows PowerShell 5.1 exited 2. A single AddScript exits 0 in the same scenario.
+
+        Prefixing the block's own text is not an alternative either: a param() block has to be the
+        first statement in a script. So a bounded block runs WITHOUT strict mode, which is one more
+        reason to keep it down to the single blocking call and leave the logic outside.
+
+        A terminating error is Failed. A non-terminating one leaves Outcome Succeeded with
+        HadErrors set and Error populated - reported, never swallowed, and the caller decides.
+
+        ponytail: a runspace whose thread is stuck inside a blocking NATIVE call is abandoned rather
+        than aborted - PowerShell.Stop() cannot interrupt one and Thread.Abort does not exist on
+        .NET Core. Measured cost of one abandoned call: 2-3 threads until the process exits. That is
+        the right trade for a tool that runs once a day and then leaves; if a caller ever abandons
+        many, move that work to a child process and kill it with Stop-WacProcessTree instead.
+    .OUTPUTS
+        Outcome (Succeeded | Incomplete | Failed), Started, TimedOut, Output, HadErrors, Error,
+        DurationMs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory = $true)][int]$TimeoutMs,
+        [AllowEmptyCollection()][object[]]$ArgumentList = @(),
+        [AllowEmptyCollection()][string[]]$ImportModule = @(),
+        [string]$Component = 'Bounded',
+        [switch]$IgnoreRunBudget
+    )
+
+    $budgetMs = $TimeoutMs
+    if (-not $IgnoreRunBudget) { $budgetMs = Get-WacStepTimeoutMs -RequestedMs $TimeoutMs }
+
+    if ($budgetMs -le 0) {
+        Write-WacLog -Level WARNING -Component $Component -Message 'Run budget exhausted before the work could be scheduled.' -Data @{ requestedMs = $TimeoutMs }
+        return [PSCustomObject]@{
+            Outcome = 'Incomplete'; Started = $false; TimedOut = $true
+            Output = @(); HadErrors = $false
+            Error = 'The run budget expired before this work was scheduled.'
+            DurationMs = 0
+        }
+    }
+
+    $modules = New-Object 'System.Collections.Generic.List[string]'
+    if ($script:CoreModulePath) { [void]$modules.Add($script:CoreModulePath) }
+    foreach ($module in $ImportModule) {
+        if (-not [string]::IsNullOrWhiteSpace($module)) { [void]$modules.Add($module) }
+    }
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $runspace = $null
+    $shell = $null
+    $abandoned = $false
+
+    try {
+        $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+        if ($modules.Count -gt 0) { $state.ImportPSModule([string[]]$modules.ToArray()) }
+
+        $runspace = [runspacefactory]::CreateRunspace($state)
+        $runspace.Open()
+
+        $shell = [powershell]::Create()
+        $shell.Runspace = $runspace
+        [void]$shell.AddScript($ScriptBlock.ToString())
+        foreach ($argument in $ArgumentList) { [void]$shell.AddArgument($argument) }
+
+        $handle = $shell.BeginInvoke()
+
+        if (-not $handle.AsyncWaitHandle.WaitOne($budgetMs)) {
+            $abandoned = $true
+            try { [void]$shell.BeginStop($null, $null) } catch { $null = $_ }
+            $watch.Stop()
+
+            Write-WacLog -Level WARNING -Component $Component -Message 'In-process work exceeded its bound and was abandoned.' -Data @{ budgetMs = $budgetMs }
+            return [PSCustomObject]@{
+                Outcome = 'Incomplete'; Started = $true; TimedOut = $true
+                Output = @(); HadErrors = $false
+                Error = ('The work did not finish within {0} ms.' -f $budgetMs)
+                DurationMs = [int]$watch.Elapsed.TotalMilliseconds
+            }
+        }
+
+        $output = @()
+        $failure = $null
+        try {
+            $output = @($shell.EndInvoke($handle))
+        }
+        catch {
+            # A terminating error inside the block surfaces HERE, wrapped, not in the error stream.
+            $failure = [string]$_.Exception.Message
+        }
+
+        $errors = @()
+        try { $errors = @($shell.Streams.Error) } catch { $errors = @() }
+
+        $watch.Stop()
+        $outcome = 'Succeeded'
+        if ($failure) { $outcome = 'Failed' }
+
+        $errorText = $failure
+        if (-not $errorText -and $errors.Count -gt 0) {
+            $errorText = (@($errors | ForEach-Object { [string]$_ }) -join '; ')
+        }
+
+        return [PSCustomObject]@{
+            Outcome = $outcome; Started = $true; TimedOut = $false
+            Output = $output; HadErrors = ($errors.Count -gt 0)
+            Error = $errorText
+            DurationMs = [int]$watch.Elapsed.TotalMilliseconds
+        }
+    }
+    catch {
+        $watch.Stop()
+        Write-WacLog -Level WARNING -Component $Component -Message 'Bounded work could not be started.' -Data @{ error = $_.Exception.Message }
+        return [PSCustomObject]@{
+            Outcome = 'Failed'; Started = $false; TimedOut = $false
+            Output = @(); HadErrors = $true
+            Error = [string]$_.Exception.Message
+            DurationMs = [int]$watch.Elapsed.TotalMilliseconds
+        }
+    }
+    finally {
+        # Disposing either object waits for the pipeline, so an abandoned runspace must be left
+        # alone: cleaning it up here would reintroduce exactly the unbounded wait this function
+        # exists to prevent.
+        if (-not $abandoned) {
+            if ($shell) { try { $shell.Dispose() } catch { $null = $_ } }
+            if ($runspace) { try { $runspace.Dispose() } catch { $null = $_ } }
+        }
     }
 }
 
@@ -1510,6 +2088,273 @@ function Test-WacPathIsMachineTrusted {
     return $result
 }
 
+function Test-WacAncestorAclIsAdministrative {
+    <#
+    .SYNOPSIS
+        The ancestor trust rule, taken over a descriptor the caller already holds.
+    .DESCRIPTION
+        An ancestor is NOT asked the leaf's question. Test-WacPathIsMachineTrusted asks "can a
+        non-administrator write anything here at all", which is right for the directory that holds
+        the audit log and wrong one level up: the default DACL of C:\ grants Authenticated Users
+        CreateDirectories, so the strict question marks every volume root untrusted and no state
+        root on a healthy Windows install would ever pass.
+
+        Creating a NEW name beside an existing one cannot replace the existing one. Redirecting or
+        removing an existing child needs one of Delete, DeleteSubdirectoriesAndFiles,
+        ChangePermissions, TakeOwnership, or GENERIC_ALL (which is not decomposed into specific
+        rights inside a raw ACE). GENERIC_WRITE is deliberately absent: on a directory it maps to
+        add-file, add-subdirectory, write-EA, write-attributes and READ_CONTROL, none of which
+        reaches an existing child.
+
+        The OWNER test stays strict, because an owner implicitly keeps WRITE_DAC and can grant
+        itself any of the above at any moment.
+    .OUTPUTS
+        IsTrusted / Owner / Reason.
+    #>
+    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$Acl)
+
+    $verdict = [PSCustomObject]@{ IsTrusted = $false; Owner = $null; Reason = $null }
+
+    $ownerSid = $null
+    try { $ownerSid = [string]$Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { $ownerSid = $null }
+    $verdict.Owner = $ownerSid
+
+    if (-not (Test-WacSidIsAdministrator -Sid ([string]$ownerSid))) {
+        $verdict.Reason = ('Owner {0} is not an administrative principal; an owner implicitly keeps WRITE_DAC.' -f $ownerSid)
+        return $verdict
+    }
+
+    $replaceRights = [int]([System.Security.AccessControl.FileSystemRights]::Delete) -bor
+                     [int]([System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+                     [int]([System.Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
+                     [int]([System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+    $genericAll = 0x10000000
+
+    $rules = $null
+    try { $rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) }
+    catch {
+        $verdict.Reason = ('Access rules are unreadable: {0}' -f $_.Exception.Message)
+        return $verdict
+    }
+
+    if ($rules.Count -eq 0) {
+        $verdict.Reason = 'The security descriptor exposes no access rules to evaluate.'
+        return $verdict
+    }
+
+    $writers = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+
+        $propagation = [System.Security.AccessControl.PropagationFlags]::None
+        try { $propagation = $rule.PropagationFlags } catch { $propagation = [System.Security.AccessControl.PropagationFlags]::None }
+        if (([int]$propagation -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+
+        if ((([int]$rule.FileSystemRights -band $replaceRights) -eq 0) -and
+            (([int]$rule.FileSystemRights -band $genericAll) -eq 0)) { continue }
+
+        $sid = [string]$rule.IdentityReference.Value
+        if (Test-WacSidIsAdministrator -Sid $sid) { continue }
+
+        [void]$writers.Add($sid)
+    }
+
+    if ($writers.Count -gt 0) {
+        $verdict.Reason = ('Non-administrative principals can replace children here: {0}' -f
+            ((@($writers.ToArray() | Sort-Object -Unique)) -join ', '))
+        return $verdict
+    }
+
+    $verdict.IsTrusted = $true
+    $verdict.Reason = 'Owner and DACL are administrative only.'
+    return $verdict
+}
+
+function Test-WacStatePathIsTrusted {
+    <#
+    .SYNOPSIS
+        Proves a log / state / driver-backup path is on a local fixed disk, free of reparse points,
+        and writable only by administrative principals - itself AND every ancestor up to the root.
+    .DESCRIPTION
+        %ProgramData%\WindowsAutoCleanup holds the audit log a SYSTEM task writes and the driver
+        backups a restore would read. Checking the leaf alone proves less than it looks: write
+        access to a PARENT is enough to rename the whole directory aside and drop a different one
+        in its place, and a reparse point anywhere in the chain redirects the whole thing.
+
+        The question asked of every level - leaf included - is "can a non-administrator REPLACE,
+        delete or redirect this", not the stricter "can a non-administrator write anything here at
+        all" that Test-WacPathIsMachineTrusted asks of executable code. Measured on a stock Windows
+        11 install: C:\ProgramData grants BUILTIN\Users (S-1-5-32-545) create-file and
+        create-folder, and that ACE is inherited by %ProgramData%\WindowsAutoCleanup. Since this
+        project is forbidden to rewrite an ACL, the strict question would answer "untrusted" on
+        every default machine forever, which is not a finding - it is a check nobody can act on.
+
+        That residual risk is REPORTED rather than hidden: Writers lists the non-administrative
+        principals that can create new content in the leaf, so a caller that needs the stricter
+        guarantee - driver backups being read back during a restore, for instance - can require it
+        to be empty without this function having to refuse every run to say so.
+
+        Nothing here is swallowed. An unreadable descriptor, a reparse point, an unresolvable
+        ancestor and a chain longer than -MaxDepth are all recorded as FAILURES and all leave
+        IsTrusted false, because every one of them means the trust question was not answered - and
+        an unanswered security question is not a yes.
+
+        A path that does not exist yet is legitimate on a first run, so the nearest existing
+        ancestor is verified instead and Reason says so. That is the directory the leaf will be
+        created in, which is the thing that has to be trustworthy.
+    .OUTPUTS
+        Path (what was actually verified), IsTrusted, Reason, Checked, Failures, Writers.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path,
+        [ValidateRange(1, 128)][int]$MaxDepth = 64
+    )
+
+    $result = [PSCustomObject]@{
+        Path = $Path
+        IsTrusted = $false
+        Reason = $null
+        Checked = @()
+        Failures = @()
+        Writers = @()
+    }
+
+    $normalized = Get-WacNormalizedPath -Path $Path
+    if (-not $normalized) {
+        $result.Reason = 'The path is not a usable local drive path.'
+        return $result
+    }
+
+    $drive = $null
+    try { $drive = New-Object System.IO.DriveInfo($normalized.Substring(0, 2)) } catch { $drive = $null }
+    if (-not $drive) {
+        $result.Reason = ('The volume for {0} could not be inspected.' -f $normalized)
+        return $result
+    }
+    if (-not $drive.IsReady -or [string]$drive.DriveType -ne 'Fixed') {
+        $result.Reason = ('{0} is not on a ready local fixed disk (DriveType={1}).' -f $normalized, $drive.DriveType)
+        return $result
+    }
+
+    # Walk down to the first component that exists. Bounded by MaxDepth like the walk back up, so a
+    # pathological path cannot spin here either.
+    $existing = $normalized
+    $descend = 0
+    while (-not (Test-Path -LiteralPath $existing)) {
+        $descend++
+        if ($descend -gt $MaxDepth) {
+            $result.Reason = ('No existing ancestor of {0} was found within {1} levels.' -f $normalized, $MaxDepth)
+            return $result
+        }
+
+        $parent = [System.IO.Path]::GetDirectoryName($existing)
+        if ([string]::IsNullOrEmpty($parent)) {
+            $result.Reason = ('No existing ancestor of {0} exists.' -f $normalized)
+            return $result
+        }
+        $existing = Get-WacNormalizedPath -Path $parent
+        if (-not $existing) {
+            $result.Reason = ('An ancestor of {0} could not be canonicalised.' -f $normalized)
+            return $result
+        }
+    }
+
+    $result.Path = $existing
+    $checked = New-Object 'System.Collections.Generic.List[string]'
+    $failures = New-Object 'System.Collections.Generic.List[object]'
+
+    $current = $existing
+    $isLeaf = $true
+    $depth = 0
+    $reachedRoot = $false
+
+    while ($true) {
+        $depth++
+        if ($depth -gt $MaxDepth) {
+            [void]$failures.Add([PSCustomObject]@{
+                Path = $current
+                Reason = ('The ancestor chain exceeded the {0}-level depth limit before reaching the volume root.' -f $MaxDepth)
+            })
+            break
+        }
+
+        $probe = $current
+        if ($probe -match '^[A-Za-z]:$') { $probe = $probe + '\' }
+        [void]$checked.Add($probe)
+
+        if (Test-WacIsReparsePoint -Path $probe) {
+            [void]$failures.Add([PSCustomObject]@{
+                Path = $probe
+                Reason = 'The path is a reparse point, or its attributes are unreadable; either way it can redirect elsewhere.'
+            })
+        }
+        else {
+            # Get-Acl on a bare 'X:' is DRIVE-RELATIVE and returns the session's current directory
+            # on that drive, which is why $probe was re-rooted to 'X:\' above.
+            $acl = $null
+            try { $acl = Get-Acl -LiteralPath $probe -ErrorAction Stop }
+            catch {
+                [void]$failures.Add([PSCustomObject]@{
+                    Path = $probe
+                    Reason = ('Security descriptor is unreadable: {0}' -f $_.Exception.Message)
+                })
+            }
+
+            if ($acl) {
+                $verdict = Test-WacAncestorAclIsAdministrative -Acl $acl
+                if (-not $verdict.IsTrusted) {
+                    [void]$failures.Add([PSCustomObject]@{ Path = $probe; Reason = $verdict.Reason })
+                }
+            }
+
+            # The stricter question is asked of the leaf only, and only to REPORT the answer.
+            if ($isLeaf) {
+                $strict = Test-WacPathIsMachineTrusted -Path $probe
+                if (-not $strict.IsTrusted) { $result.Writers = @($strict.UntrustedWriters) }
+            }
+        }
+
+        if ($current -match '^[A-Za-z]:$') { $reachedRoot = $true; break }
+
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent)) { $reachedRoot = $true; break }
+
+        $next = Get-WacNormalizedPath -Path $parent
+        if (-not $next -or $next -ieq $current) {
+            [void]$failures.Add([PSCustomObject]@{
+                Path = $current
+                Reason = 'The ancestor chain could not be followed to the volume root.'
+            })
+            break
+        }
+
+        $current = $next
+        $isLeaf = $false
+    }
+
+    $result.Checked = @($checked.ToArray())
+    $result.Failures = @($failures.ToArray())
+
+    if ($failures.Count -gt 0) {
+        $result.Reason = (@($failures.ToArray() | ForEach-Object { '{0}: {1}' -f $_.Path, $_.Reason }) -join ' | ')
+        return $result
+    }
+
+    if (-not $reachedRoot) {
+        $result.Reason = 'The ancestor chain did not reach the volume root.'
+        return $result
+    }
+
+    $result.IsTrusted = $true
+    $result.Reason = ('{0} and all {1} ancestors are local, non-reparse, and cannot be replaced by a non-administrator.' -f $existing, ($checked.Count - 1))
+    if ($result.Writers.Count -gt 0) {
+        $result.Reason = ('{0} Non-administrative principals can still create content in it: {1}' -f
+            $result.Reason, ($result.Writers -join ', '))
+    }
+    return $result
+}
+
 function Test-WacSidIsAdministrator {
     <#
     .SYNOPSIS
@@ -1573,14 +2418,16 @@ Export-ModuleMember -Function @(
     'Get-WacIoFailureKind',
     'Get-WacDataRoot', 'Get-WacDeploymentRoot',
     'Initialize-WacRun', 'Write-WacLog', 'Close-WacLog', 'Get-WacLogPath', 'Get-WacExecutionId',
+    'Get-WacLogDirectory', 'Get-WacLogHealth', 'Get-WacStateTrust',
+    'Set-WacLogFallbackWriter', 'Set-WacLogWriter',
     'New-WacLogFile', 'Remove-WacOldLog',
     'Set-WacDeadline', 'Get-WacRemainingMs', 'Test-WacDeadlineExpired', 'Get-WacStepTimeoutMs',
     'ConvertTo-WacCommandLineArgument', 'ConvertTo-WacCommandLine',
     'ConvertTo-WacPowerShellLiteral', 'Get-WacRelaunchCommand', 'Get-WacRelaunchArgument',
-    'Stop-WacProcessTree',
-    'Invoke-WacProcess', 'Set-WacProcessInvoker', 'Get-WacProcessInvoker',
+    'Stop-WacProcessTree', 'Set-WacProcessHandleOpener',
+    'Invoke-WacProcess', 'Set-WacProcessInvoker', 'Get-WacProcessInvoker', 'Invoke-WacBounded',
     'Enter-WacSingleInstance', 'Exit-WacSingleInstance',
     'Test-WacIsAdministrator', 'Test-WacIsWindowsServer', 'Test-WacSystemDriveSupported',
     'Get-WacCanonicalPowerShellHost', 'Get-WacUserProfilePath', 'Test-WacIsRealUserProfilePath', 'Get-WacFreeBytes', 'Format-WacBytes',
-    'Test-WacPathIsMachineTrusted', 'Test-WacSidIsAdministrator'
+    'Test-WacPathIsMachineTrusted', 'Test-WacSidIsAdministrator', 'Test-WacStatePathIsTrusted'
 )
