@@ -1,0 +1,12 @@
+version: 2
+
+updates:
+  # GitHub Actions is the only ecosystem this repository has: the project is plain PowerShell with
+  # no package manifest and no lockfile, so there is nothing else to watch.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
