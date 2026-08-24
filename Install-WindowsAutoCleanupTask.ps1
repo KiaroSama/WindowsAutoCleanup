@@ -1,108 +1,114 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
-    Installs or updates the WindowsAutoCleanup scheduled task.
+    Deploys WindowsAutoCleanup to %ProgramFiles% and registers the hidden daily SYSTEM task.
 
 .DESCRIPTION
-    Registers a daily scheduled task named WindowsAutoCleanup. The task runs the
-    Run.ps1 script from the same folder where this installer is executed.
-    The script is not copied or moved.
+    The runtime is copied out of this checkout into %ProgramFiles%\WindowsAutoCleanup before the
+    task is registered, because a SYSTEM task must never execute a directory a standard user can
+    rewrite. The deployed tree and the PowerShell host are then VERIFIED to be machine-trusted;
+    registration is refused if they are not. Nothing here changes an ACL or an owner - the v1.1.0
+    hardening capability was removed because it made the user's own checkout hard to delete.
 
-    The installer writes a transcript of its actions to a log file under the project's
-    Logs folder, then pauses before exiting so the result remains visible even when the
-    elevated window would otherwise close immediately.
+    Actions are written to %ProgramData%\WindowsAutoCleanup\Logs and printed to the console.
 
 .PARAMETER DailyRunTime
-    Daily task run time in 24-hour HH:mm format.
+    Daily task run time, 24-hour HH:mm.
 
 .PARAMETER NoPause
-    Do not wait for a key press before exiting. Intended for automation and tests.
+    Do not wait for a key press before exiting. For automation and tests.
 
 .PARAMETER ResetWindowsUpdateBase
-    Adds the ResetWindowsUpdateBase value to the scheduled Run.ps1 action. Enabled
-    by default. This enables DISM /ResetBase and makes installed Windows updates
-    non-uninstallable. Pass -ResetWindowsUpdateBase:$false to disable it.
+    Registers the task with DISM /ResetBase enabled. Default $true. After a /ResetBase run the
+    Windows updates installed before it can no longer be uninstalled. Pass
+    -ResetWindowsUpdateBase:$false to register the task without it; that value now survives the
+    elevation relaunch and is always written into the task action explicitly.
 
-.PARAMETER SkipAclHardening
-    Adds -SkipAclHardening to the scheduled Run.ps1 action so normal users keep
-    write access to the project folder for development or Git workflows.
+.PARAMETER PruneSupersededDrivers
+    Adds -PruneSupersededDrivers to the task action. Off by default.
+
+.PARAMETER EnableLegacyDiskCleanup
+    Adds -EnableLegacyDiskCleanup to the task action. Off by default: cleanmgr /sagerun enumerates
+    every drive on the machine, which breaks the C:-only guarantee.
+
+.EXAMPLE
+    .\Install-WindowsAutoCleanupTask.ps1 -DailyRunTime 03:00 -ResetWindowsUpdateBase:$false
+
+.NOTES
+    Exit codes:
+      0  success
+      1  error, or an unverifiable safety condition
+      3  another installer or uninstaller instance is already running
+      4  elevation was cancelled or failed
+      5  unsupported environment (the online system drive is not C:)
 #>
 
+# Write-Host is deliberate: the installer is a user-facing console tool and the structured
+# record goes to the file log separately.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Console output is the point of an interactive installer; the file log is written through Write-WacLog.')]
 [CmdletBinding()]
 param(
-    # Configure the daily run time. Use 24-hour HH:mm format.
     [ValidatePattern('^(?:[01]\d|2[0-3]):[0-5]\d$')]
     [string]$DailyRunTime = '20:00',
 
-    # Useful for automation, tests, and GitHub Actions because it prevents the
-    # elevated console from waiting for a key press before exiting.
     [switch]$NoPause,
 
-    # Aggressive Windows Update component cleanup for scheduled runs is enabled by
-    # default. Installed Windows updates cannot be uninstalled after DISM /ResetBase.
     [switch]$ResetWindowsUpdateBase = $true,
 
-    # Keep normal-user write access to the project folder for development/Git checkouts.
-    [switch]$SkipAclHardening
+    [switch]$PruneSupersededDrivers,
+
+    [switch]$EnableLegacyDiskCleanup
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$TaskName = 'WindowsAutoCleanup'
-$TaskPath = '\'
-$TaskDescription = 'Runs WindowsAutoCleanup daily to silently remove explicitly allowed temporary files and cache locations from drive C:.'
+# Ledger P0-2. Inside a function $PSBoundParameters is that FUNCTION's, which is how an explicit
+# -ResetWindowsUpdateBase:$false used to be lost across the UAC relaunch and DISM ran /ResetBase
+# anyway. Snapshot the script's own bound parameters here, before any function call.
+$script:BoundParameter = @{}
+foreach ($key in $PSBoundParameters.Keys) { $script:BoundParameter[$key] = $PSBoundParameters[$key] }
 
 $script:ScriptRoot = Split-Path -Parent $PSCommandPath
-$script:LogRoot = Join-Path -Path $script:ScriptRoot -ChildPath 'Logs'
-$script:LogPath = $null
+$script:LogReady = $false
+$script:InstanceLock = $null
+$script:Relaunched = $false
 
-function Initialize-InstallerLog {
-    try {
-        if (-not (Test-Path -LiteralPath $script:LogRoot -PathType Container)) {
-            New-Item -Path $script:LogRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        $name = 'Install-WindowsAutoCleanupTask_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss')
-        $script:LogPath = Join-Path -Path $script:LogRoot -ChildPath $name
-        New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction Stop | Out-Null
-    }
-    catch {
-        $fallbackRoot = if ($env:ProgramData) { Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\Logs' } else { Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup' }
-        try {
-            if (-not (Test-Path -LiteralPath $fallbackRoot -PathType Container)) {
-                New-Item -Path $fallbackRoot -ItemType Directory -Force -ErrorAction Stop | Out-Null
-            }
-        }
-        catch { $null = $_ }
-        $script:LogPath = Join-Path -Path $fallbackRoot -ChildPath ('Install-WindowsAutoCleanupTask_{0}.log' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-        New-Item -Path $script:LogPath -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null
-    }
-}
+# The elevated child does the whole install; 20 minutes is well beyond a copy plus a registration.
+$script:ElevationTimeoutMs = 1200000
 
-function Write-InstallerLine {
+Import-Module -Name (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.Core.psm1') -DisableNameChecking -Force -ErrorAction Stop
+Import-Module -Name (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.Deploy.psm1') -DisableNameChecking -Force -ErrorAction Stop
+
+function Write-InstallerMessage {
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('INFO','SUCCESS','WARN','ERROR')][string]$Level,
-        [Parameter(Mandatory = $true)][string]$Message
+        [Parameter(Mandatory = $true)][ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$Level,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [hashtable]$Data
     )
 
-    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
-    switch ($Level) {
-        'SUCCESS' { Write-Host $line -ForegroundColor Green }
-        'WARN'    { Write-Host $line -ForegroundColor Yellow }
-        'ERROR'   { Write-Host $line -ForegroundColor Red }
-        default   { Write-Host $line -ForegroundColor White }
+    if ($script:LogReady) {
+        if ($Data) { Write-WacLog -Level $Level -Component 'Installer' -Message $Message -Data $Data }
+        else { Write-WacLog -Level $Level -Component 'Installer' -Message $Message }
     }
-    if ($script:LogPath) {
-        try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 -ErrorAction Stop } catch { $null = $_ }
+
+    $colour = switch ($Level) {
+        'WARNING' { 'Yellow' }
+        'ERROR' { 'Red' }
+        'CRITICAL' { 'Red' }
+        default { 'Gray' }
     }
+    Write-Host ('[{0}] {1}' -f $Level, $Message) -ForegroundColor $colour
 }
 
 function Wait-InstallerExit {
     if ($NoPause) { return }
+    # The elevated child already paused; a second prompt in the parent window helps nobody.
+    if ($script:Relaunched) { return }
+    # A redirected stdin means no user is there to press anything; waiting would hang CI.
+    try { if ([System.Console]::IsInputRedirected) { return } } catch { return }
 
-    # Keep the elevated console open so the user can read the result. Wait for any key
-    # press through the host RawUI when available; fall back to Read-Host when it is not
-    # (for example, inside PowerShell ISE or under non-interactive hosts).
     try {
         Write-Host ''
         Write-Host 'Press any key to close this window...' -ForegroundColor Cyan
@@ -113,231 +119,301 @@ function Wait-InstallerExit {
     }
 }
 
-function Test-IsAdministrator {
+function Invoke-InstallerElevation {
+    <#
+    .SYNOPSIS
+        Relaunches this script elevated and returns the child's real exit code.
+    .DESCRIPTION
+        Called from INSIDE the main try (ledger P1-12), so a cancelled UAC prompt is logged, honours
+        -NoPause and produces exit code 4 instead of an unhandled terminating error.
+        wt.exe is never used as the elevation wrapper: it is PATH-resolved, it may not be present,
+        and it exits as soon as it hands the command to its own window, so the exit code is lost.
+    #>
+    $hostPath = Get-WacCanonicalPowerShellHost
+    if (-not $hostPath) {
+        Write-InstallerMessage -Level ERROR -Message 'No machine-trusted PowerShell host was found for the elevated relaunch.'
+        return 4
+    }
+
+    $vector = Get-WacInstallerRelaunchArgument `
+        -ScriptPath $PSCommandPath `
+        -DailyRunTime $DailyRunTime `
+        -ResetWindowsUpdateBase ([bool]$ResetWindowsUpdateBase) `
+        -PruneSupersededDrivers:$PruneSupersededDrivers `
+        -EnableLegacyDiskCleanup:$EnableLegacyDiskCleanup `
+        -NoPause:$NoPause
+
+    # Start-Process joins an array argument with plain spaces and no quoting, so the vector has to
+    # be turned into one correctly quoted command line first.
+    $commandLine = ConvertTo-WacCommandLine -ArgumentList $vector
+
+    Write-InstallerMessage -Level INFO -Message 'Requesting elevation.' -Data @{
+        host = $hostPath
+        arguments = $commandLine
+        explicitParameters = (@($script:BoundParameter.Keys | Sort-Object) -join ',')
+    }
+
+    $script:Relaunched = $true
+    $child = $null
     try {
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        $child = Start-Process -FilePath $hostPath -ArgumentList $commandLine -Verb RunAs -PassThru -ErrorAction Stop
     }
     catch {
-        return $false
+        Write-InstallerMessage -Level ERROR -Message ('Elevation was cancelled or failed: {0}' -f $_.Exception.Message)
+        return 4
+    }
+
+    if (-not $child) {
+        Write-InstallerMessage -Level ERROR -Message 'Elevation returned no child process.'
+        return 4
+    }
+
+    # Touching Handle caches it, which is what keeps ExitCode readable after the child exits.
+    try { $null = $child.Handle } catch { $null = $_ }
+
+    if (-not $child.WaitForExit($script:ElevationTimeoutMs)) {
+        Write-InstallerMessage -Level ERROR -Message 'The elevated installer did not finish inside its deadline; it was left running rather than killed mid-install.' -Data @{ pid = $child.Id; timeoutMs = $script:ElevationTimeoutMs }
+        return 1
+    }
+
+    $code = 1
+    try { $code = [int]$child.ExitCode } catch { $code = 1 }
+    Write-InstallerMessage -Level INFO -Message 'The elevated installer finished.' -Data @{ exitCode = $code }
+    return $code
+}
+
+function Get-InstallerTaskTrigger {
+    param([Parameter(Mandatory = $true)][string]$RunTime)
+
+    $parsed = $null
+    try {
+        $parsed = [datetime]::ParseExact($RunTime, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    catch {
+        throw ("Invalid DailyRunTime '{0}'. Use 24-hour HH:mm, for example '03:00'." -f $RunTime)
+    }
+
+    return (New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.Add($parsed.TimeOfDay)))
+}
+
+function Remove-ConflictingTask {
+    <#
+    .SYNOPSIS
+        Clears our own registration before re-registering, and refuses to touch anyone else's.
+    .DESCRIPTION
+        Register-ScheduledTask -Force is documented only as "without prompting for confirmation";
+        nothing says it overwrites. So the installer explicitly Gets, proves ownership, then
+        Unregisters (ledger P0-4). A foreign task sitting on our canonical path is fatal, because
+        registering over it would destroy something we do not own.
+    #>
+    param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
+
+    foreach ($existing in (Get-WacInstalledTask -IncludeLegacy)) {
+        $isCanonical = ([string]$existing.TaskPath -eq (Get-WacTaskFolder))
+
+        $removal = Remove-WacInstalledTask -Task $existing -DeploymentRoot $DeploymentRoot -AllowLegacyMigration
+        if ($removal.Verified) {
+            Write-InstallerMessage -Level INFO -Message 'Removed the previous WindowsAutoCleanup task.' -Data @{ task = ('{0}{1}' -f $removal.TaskPath, $removal.TaskName) }
+            continue
+        }
+
+        if ($isCanonical) {
+            throw ("A task already occupies {0}{1} and it is not ours, so it will not be replaced: {2}" -f $existing.TaskPath, $existing.TaskName, $removal.Reason)
+        }
+
+        Write-InstallerMessage -Level WARNING -Message 'A task named WindowsAutoCleanup at the root task path was left untouched because ownership could not be proven.' -Data @{ reason = $removal.Reason }
     }
 }
 
-function Get-PreferredPowerShellPath {
-    # Prefer PowerShell 7 (pwsh.exe) when available; fall back to Windows PowerShell 5.1.
-    $pwshCmd = @(Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if ($pwshCmd.Count -gt 0) {
-        $pwshPath = [string]$pwshCmd[0].Source
-        if ($pwshPath -and (Test-Path -LiteralPath $pwshPath -PathType Leaf)) {
-            return $pwshPath
+function Assert-RegisteredTask {
+    <#
+    .SYNOPSIS
+        Reads the task back and proves every setting the installer asked for actually landed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$ExpectedHost,
+        [Parameter(Mandatory = $true)][string]$ExpectedArguments,
+        [Parameter(Mandatory = $true)][string]$ExpectedDescription
+    )
+
+    $task = $null
+    try {
+        $task = Get-ScheduledTask -TaskName (Get-WacTaskName) -TaskPath (Get-WacTaskFolder) -ErrorAction Stop
+    }
+    catch {
+        throw ("The task was registered without error but cannot be read back: {0}" -f $_.Exception.Message)
+    }
+    if (-not $task) { throw 'The task was registered without error but cannot be read back.' }
+
+    $action = @($task.Actions)[0]
+
+    $checks = @(
+        @{ Name = 'Hidden'; Actual = [string][bool]$task.Settings.Hidden; Expected = 'True' }
+        @{ Name = 'RunLevel'; Actual = [string]$task.Principal.RunLevel; Expected = 'Highest' }
+        @{ Name = 'LogonType'; Actual = [string]$task.Principal.LogonType; Expected = 'ServiceAccount' }
+        @{ Name = 'Compatibility'; Actual = [string]$task.Settings.Compatibility; Expected = 'Win8' }
+        @{ Name = 'MultipleInstances'; Actual = [string]$task.Settings.MultipleInstances; Expected = 'IgnoreNew' }
+        @{ Name = 'StartWhenAvailable'; Actual = [string][bool]$task.Settings.StartWhenAvailable; Expected = 'True' }
+        @{ Name = 'Execute'; Actual = [string]$action.Execute; Expected = $ExpectedHost }
+        @{ Name = 'Arguments'; Actual = [string]$action.Arguments; Expected = $ExpectedArguments }
+        @{ Name = 'Description'; Actual = [string]$task.Description; Expected = $ExpectedDescription }
+    )
+
+    foreach ($check in $checks) {
+        if (-not [string]::Equals([string]$check.Actual, [string]$check.Expected, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw ("The registered task's {0} is '{1}' instead of '{2}'." -f $check.Name, $check.Actual, $check.Expected)
         }
     }
 
-    if ($env:ProgramFiles) {
-        $defaultPwsh = Join-Path -Path $env:ProgramFiles -ChildPath 'PowerShell\7\pwsh.exe'
-        if (Test-Path -LiteralPath $defaultPwsh -PathType Leaf) {
-            return $defaultPwsh
-        }
+    # UserId reads back as the account name on some builds and as the SID on others.
+    $userId = [string]$task.Principal.UserId
+    if ($userId -notmatch '(?i)^(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18)$') {
+        throw ("The registered task runs as '{0}' instead of SYSTEM." -f $userId)
     }
 
-    return (Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    # ExecutionTimeLimit comes back as an ISO 8601 duration string, not a TimeSpan.
+    $limit = [string]$task.Settings.ExecutionTimeLimit
+    $limitSpan = [timespan]::Zero
+    try { $limitSpan = [System.Xml.XmlConvert]::ToTimeSpan($limit) } catch { $limitSpan = [timespan]::Zero }
+    if ($limitSpan -ne (New-TimeSpan -Hours 4)) {
+        throw ("The registered task's ExecutionTimeLimit is '{0}' instead of 4 hours." -f $limit)
+    }
+
+    $ownership = Test-WacTaskIsOurs -Task $task
+    if (-not $ownership.IsOurs) {
+        throw ("The registered task does not pass its own ownership proof: {0}" -f $ownership.Reason)
+    }
+
+    return $task
 }
 
-function Invoke-ElevatedRelaunchIfNeeded {
-    if (Test-IsAdministrator) { return }
+function Invoke-Main {
+    if (-not (Test-WacIsAdministrator)) {
+        return (Invoke-InstallerElevation)
+    }
 
-    # Self-elevate with the preferred PowerShell host (PowerShell 7 when installed,
-    # Windows PowerShell 5.1 as a guaranteed fallback). Post-registration verification
-    # below makes any silent failure of the ScheduledTasks module visible.
-    $installerHost = Get-PreferredPowerShellPath
-    $scriptArg = '"{0}"' -f $PSCommandPath
-    $dailyRunTimeArg = '"{0}"' -f $DailyRunTime
-    $childArgs = '-NoProfile -ExecutionPolicy Bypass -File {0} -DailyRunTime {1}' -f $scriptArg, $dailyRunTimeArg
-    if ($PSBoundParameters.ContainsKey('ResetWindowsUpdateBase')) {
-        $childArgs = '{0} -ResetWindowsUpdateBase:${1}' -f $childArgs, ([bool]$ResetWindowsUpdateBase).ToString().ToLowerInvariant()
+    $script:InstanceLock = Enter-WacSingleInstance -Name 'Global\WindowsAutoCleanupInstaller'
+    if (-not $script:InstanceLock) {
+        Write-InstallerMessage -Level ERROR -Message 'Another WindowsAutoCleanup installer or uninstaller is already running.'
+        return 3
     }
-    if ($SkipAclHardening) {
-        $childArgs = '{0} -SkipAclHardening' -f $childArgs
+
+    if (-not (Test-WacSystemDriveSupported)) {
+        Write-InstallerMessage -Level ERROR -Message ('WindowsAutoCleanup only supports an online system drive of C:; this machine reports {0}.' -f $env:SystemDrive)
+        return 5
     }
-    if ($NoPause) {
-        $childArgs = '{0} -NoPause' -f $childArgs
+
+    Write-InstallerMessage -Level INFO -Message 'Running elevated.' -Data @{ log = [string](Get-WacLogPath) }
+
+    Import-Module -Name 'ScheduledTasks' -ErrorAction Stop
+
+    # Fail before deploying if the run time is unusable.
+    $trigger = Get-InstallerTaskTrigger -RunTime $DailyRunTime
+
+    $deployment = Install-WacDeployment -SourceRoot $script:ScriptRoot
+    Write-InstallerMessage -Level INFO -Message 'Runtime deployed.' -Data @{ root = $deployment.DeploymentRoot; files = $deployment.FileCount }
+
+    $trust = Test-WacDeploymentTrusted -DeploymentRoot $deployment.DeploymentRoot
+    if (-not $trust.IsTrusted) {
+        foreach ($entry in $trust.Untrusted) {
+            Write-InstallerMessage -Level ERROR -Message 'A deployed path is not machine-trusted.' -Data @{ path = $entry.Path; owner = [string]$entry.Owner; reason = $entry.Reason }
+        }
+        Write-InstallerMessage -Level ERROR -Message ('Refusing to register a SYSTEM task against an untrusted deployment: {0}' -f $trust.Reason)
+        return 1
+    }
+    Write-InstallerMessage -Level INFO -Message 'Deployment trust verified.' -Data @{ checked = $trust.CheckedCount }
+
+    $taskHost = Get-WacCanonicalPowerShellHost
+    if (-not $taskHost) {
+        Write-InstallerMessage -Level ERROR -Message 'No machine-trusted PowerShell host is available for the task action.'
+        return 1
+    }
+
+    $arguments = Get-WacTaskActionArgument `
+        -RunScript $deployment.RunScript `
+        -ResetWindowsUpdateBase ([bool]$ResetWindowsUpdateBase) `
+        -PruneSupersededDrivers:$PruneSupersededDrivers `
+        -EnableLegacyDiskCleanup:$EnableLegacyDiskCleanup
+
+    $description = Get-WacTaskDescription
+
+    Remove-ConflictingTask -DeploymentRoot $deployment.DeploymentRoot
+
+    $definition = New-ScheduledTask `
+        -Action (New-ScheduledTaskAction -Execute $taskHost -Argument $arguments -WorkingDirectory $deployment.DeploymentRoot) `
+        -Trigger $trigger `
+        -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
+        -Settings (New-ScheduledTaskSettingsSet `
+            -Compatibility Win8 `
+            -Hidden `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 10)) `
+        -Description $description
+
+    Write-InstallerMessage -Level INFO -Message 'Registering the scheduled task.' -Data @{ task = ('{0}{1}' -f (Get-WacTaskFolder), (Get-WacTaskName)) }
+    Register-ScheduledTask -TaskName (Get-WacTaskName) -TaskPath (Get-WacTaskFolder) -InputObject $definition -ErrorAction Stop | Out-Null
+
+    $registered = Assert-RegisteredTask -ExpectedHost $taskHost -ExpectedArguments $arguments -ExpectedDescription $description
+
+    Write-InstallerMessage -Level INFO -Message 'Scheduled task registered and verified.' -Data @{
+        task = ('{0}{1}' -f $registered.TaskPath, $registered.TaskName)
+        execute = $taskHost
+        arguments = $arguments
+        dailyRunTime = $DailyRunTime
+        executionTimeLimit = [string]$registered.Settings.ExecutionTimeLimit
     }
 
     try {
-        $wt = Get-Command -Name 'wt.exe' -ErrorAction SilentlyContinue
-        if ($wt -and $wt.Source) {
-            $wtArgs = '"{0}" {1}' -f $installerHost, $childArgs
-            $proc = Start-Process -FilePath $wt.Source -ArgumentList $wtArgs -Verb RunAs -PassThru -Wait -ErrorAction Stop
-        }
-        else {
-            $proc = Start-Process -FilePath $installerHost -ArgumentList $childArgs -Verb RunAs -PassThru -Wait -ErrorAction Stop
-        }
-        if ($null -ne $proc.ExitCode) { exit $proc.ExitCode }
-        exit 0
+        $info = Get-ScheduledTaskInfo -TaskName (Get-WacTaskName) -TaskPath (Get-WacTaskFolder) -ErrorAction Stop
+        Write-InstallerMessage -Level INFO -Message 'Next run time read from the scheduler.' -Data @{ nextRun = [string]$info.NextRunTime }
     }
     catch {
-        throw "Failed to relaunch installer as administrator: $($_.Exception.Message)"
+        Write-InstallerMessage -Level WARNING -Message ('The next run time could not be read: {0}' -f $_.Exception.Message)
     }
+
+    Write-InstallerMessage -Level INFO -Message 'Final status: success.'
+    return 0
 }
 
-# --------------------------------------------------------------------
-# Main flow. Everything below runs only after admin elevation succeeds.
-# --------------------------------------------------------------------
+$script:LogReady = Initialize-WacRun -BaseName 'Install-WindowsAutoCleanupTask' -BudgetMinutes 30
+if (-not $script:LogReady) {
+    Write-Host '[WARNING] No log file could be created; continuing with console output only.' -ForegroundColor Yellow
+}
 
-Invoke-ElevatedRelaunchIfNeeded
+# Logged before the admin branch so a relaunch that never happens is still explained by the log.
+Write-InstallerMessage -Level INFO -Message 'Installer invoked.' -Data @{
+    host = ('{0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
+    source = $script:ScriptRoot
+    elevated = [bool](Test-WacIsAdministrator)
+    resetBase = [bool]$ResetWindowsUpdateBase
+    pruneDrivers = [bool]$PruneSupersededDrivers
+    legacyDiskCleanup = [bool]$EnableLegacyDiskCleanup
+    explicitParameters = (@($script:BoundParameter.Keys | Sort-Object) -join ',')
+}
 
+$exitCode = 1
 try {
-    Initialize-InstallerLog
-    Write-InstallerLine -Level INFO -Message ("Installer started. Log: {0}" -f $script:LogPath)
-    Write-InstallerLine -Level INFO -Message ("Admin rights active: {0}" -f (Test-IsAdministrator))
-    Write-InstallerLine -Level INFO -Message ("PowerShell host: {0} {1}" -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
-    Write-InstallerLine -Level INFO -Message ("Script folder: {0}" -f $script:ScriptRoot)
-
-    $mainScript = Join-Path -Path $script:ScriptRoot -ChildPath 'Run.ps1'
-    if (-not (Test-Path -LiteralPath $mainScript -PathType Leaf)) {
-        throw "Main script not found: $mainScript"
-    }
-    Write-InstallerLine -Level INFO -Message ("Main script: {0}" -f $mainScript)
-    Write-InstallerLine -Level INFO -Message ("Windows Update ResetBase scheduled mode: {0}" -f ([bool]$ResetWindowsUpdateBase))
-    Write-InstallerLine -Level INFO -Message ("Scheduled ACL hardening disabled: {0}" -f ([bool]$SkipAclHardening))
-
-    try {
-        $runTime = [DateTime]::ParseExact($DailyRunTime, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
-    }
-    catch {
-        throw "Invalid DailyRunTime value '$DailyRunTime'. Use 24-hour HH:mm format, for example '03:00'."
-    }
-
-    # Pick the host the scheduled task will use. Prefer pwsh.exe (PowerShell 7) when
-    # installed at task-creation time, so scheduled runs match the user's preferred host.
-    # Fall back to Windows PowerShell 5.1 (always present on supported Windows).
-    $taskHost = Get-PreferredPowerShellPath
-    if (-not (Test-Path -LiteralPath $taskHost -PathType Leaf)) {
-        throw "PowerShell executable for the task action not found: $taskHost"
-    }
-    Write-InstallerLine -Level INFO -Message ("Task host (for scheduled runs): {0}" -f $taskHost)
-
-    # Make sure the ScheduledTasks module is loaded. It is part of Windows so this should
-    # always succeed under Windows PowerShell 5.1, but we surface a clear error if not.
-    try {
-        Import-Module -Name 'ScheduledTasks' -ErrorAction Stop
-    }
-    catch {
-        throw "Could not load the ScheduledTasks module: $($_.Exception.Message)"
-    }
-
-    $quotedMainScript = '"{0}"' -f $mainScript
-    $taskArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {0} -Scheduled -ResetWindowsUpdateBase:${1}' -f $quotedMainScript, ([bool]$ResetWindowsUpdateBase).ToString().ToLowerInvariant()
-    if ($SkipAclHardening) {
-        $taskArguments = '{0} -SkipAclHardening' -f $taskArguments
-    }
-
-    $action = New-ScheduledTaskAction -Execute $taskHost -Argument $taskArguments -WorkingDirectory $script:ScriptRoot
-
-    # Build a concrete DateTime for today at the configured run time. New-ScheduledTaskTrigger
-    # requires DateTime for -At.
-    $triggerAt = [DateTime]::Today.Add($runTime.TimeOfDay)
-    $trigger = New-ScheduledTaskTrigger -Daily -At $triggerAt
-
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-
-    $settings = New-ScheduledTaskSettingsSet `
-        -Compatibility Win8 `
-        -Hidden `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable `
-        -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
-        -RestartCount 3 `
-        -RestartInterval (New-TimeSpan -Minutes 10)
-
-    $taskObject = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $TaskDescription
-
-    Write-InstallerLine -Level INFO -Message ("Registering scheduled task '{0}{1}'..." -f $TaskPath, $TaskName)
-    Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -InputObject $taskObject -Force | Out-Null
-
-    # Confirm registration by reading the task back. If this returns nothing, something
-    # went wrong silently and we want to surface that as an error.
-    $registered = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
-    if (-not $registered) {
-        throw "Register-ScheduledTask returned without throwing, but the task could not be found afterwards."
-    }
-
-    $registeredHidden = $false
-    $registeredRunLevel = $null
-    $registeredCompatibility = $null
-    $registeredUserId = $null
-    $registeredLogonType = $null
-    $registeredAction = $null
-    $registeredActionExecute = $null
-    $registeredActionArguments = $null
-    try { $registeredHidden = [bool]$registered.Settings.Hidden } catch { $registeredHidden = $false }
-    try { $registeredRunLevel = [string]$registered.Principal.RunLevel } catch { $registeredRunLevel = $null }
-    try { $registeredCompatibility = [string]$registered.Settings.Compatibility } catch { $registeredCompatibility = $null }
-    try { $registeredUserId = [string]$registered.Principal.UserId } catch { $registeredUserId = $null }
-    try { $registeredLogonType = [string]$registered.Principal.LogonType } catch { $registeredLogonType = $null }
-    try {
-        $registeredAction = @($registered.Actions)[0]
-        $registeredActionExecute = [string]$registeredAction.Execute
-        $registeredActionArguments = [string]$registeredAction.Arguments
-    }
-    catch {
-        $registeredAction = $null
-    }
-
-    if (-not $registeredHidden) {
-        throw "Scheduled task was registered, but its Hidden setting is not enabled."
-    }
-    if ($registeredRunLevel -ne 'Highest') {
-        throw "Scheduled task was registered, but its run level is '$registeredRunLevel' instead of 'Highest'."
-    }
-    if ($registeredCompatibility -ne 'Win8') {
-        throw "Scheduled task was registered, but its compatibility is '$registeredCompatibility' instead of 'Win8'."
-    }
-    if ($registeredUserId -ne 'SYSTEM' -or $registeredLogonType -ne 'ServiceAccount') {
-        throw "Scheduled task was registered, but its principal is '$registeredUserId' / '$registeredLogonType' instead of SYSTEM / ServiceAccount."
-    }
-    if (-not $registeredAction -or -not [string]::Equals($registeredActionExecute, $taskHost, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Scheduled task was registered, but its action executable is '$registeredActionExecute' instead of '$taskHost'."
-    }
-    if ($registeredActionArguments -notmatch '(^|\s)-WindowStyle\s+Hidden(\s|$)' -or $registeredActionArguments -notmatch '(^|\s)-Scheduled(\s|$)') {
-        throw "Scheduled task was registered, but its action arguments are missing -WindowStyle Hidden or -Scheduled."
-    }
-    $expectedResetBaseArgument = '-ResetWindowsUpdateBase:${0}' -f ([bool]$ResetWindowsUpdateBase).ToString().ToLowerInvariant()
-    if ($registeredActionArguments -notmatch [regex]::Escape($expectedResetBaseArgument)) {
-        throw "Scheduled task was registered, but its action arguments are missing $expectedResetBaseArgument."
-    }
-    if ($SkipAclHardening -and $registeredActionArguments -notmatch '(^|\s)-SkipAclHardening(\s|$)') {
-        throw "Scheduled task was registered, but its action arguments are missing -SkipAclHardening."
-    }
-
-    Write-InstallerLine -Level SUCCESS -Message ("Scheduled task '{0}' is registered." -f $TaskName)
-    Write-InstallerLine -Level INFO -Message ("Daily run time: {0}" -f $DailyRunTime)
-    Write-InstallerLine -Level INFO -Message ("Task path: {0}" -f $registered.TaskPath)
-    Write-InstallerLine -Level INFO -Message ("Task hidden: {0}" -f $registeredHidden)
-    Write-InstallerLine -Level INFO -Message ("Task run level: {0}" -f $registeredRunLevel)
-    Write-InstallerLine -Level INFO -Message ("Task compatibility: {0}" -f $registeredCompatibility)
-    Write-InstallerLine -Level INFO -Message ("Task principal: {0} / {1}" -f $registeredUserId, $registeredLogonType)
-    Write-InstallerLine -Level INFO -Message ("Task action: {0} {1}" -f $registeredActionExecute, $registeredActionArguments)
-    try {
-        $registeredInfo = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
-        Write-InstallerLine -Level INFO -Message ("Task next run time: {0}" -f $registeredInfo.NextRunTime)
-    }
-    catch {
-        Write-InstallerLine -Level WARN -Message ("Could not read task next run time: {0}" -f $_.Exception.Message)
-    }
-    Write-InstallerLine -Level SUCCESS -Message 'Final status: success.'
-
-    Wait-InstallerExit
-    exit 0
+    $exitCode = Invoke-Main
 }
 catch {
-    Write-InstallerLine -Level ERROR -Message ("Installer failed: {0}" -f $_.Exception.Message)
+    Write-InstallerMessage -Level ERROR -Message ('Installer failed: {0}' -f $_.Exception.Message)
     if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
-        Write-InstallerLine -Level ERROR -Message ("At: {0}" -f $_.InvocationInfo.PositionMessage)
+        Write-InstallerMessage -Level ERROR -Message ('At: {0}' -f $_.InvocationInfo.PositionMessage)
     }
-    Wait-InstallerExit
-    exit 1
+    $exitCode = 1
 }
+finally {
+    Exit-WacSingleInstance -Mutex $script:InstanceLock
+    if ($script:LogReady) {
+        [void](Remove-WacOldLog -LogDirectory (Split-Path -Parent (Get-WacLogPath)) -Pattern 'Install-WindowsAutoCleanupTask_*.log' -KeepCount 30)
+    }
+    Close-WacLog
+}
+
+Wait-InstallerExit
+exit $exitCode
