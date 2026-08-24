@@ -2,7 +2,7 @@
 
 Security, correctness and reliability release.
 
-The behaviour below is covered by 207 behavioural test cases that run on both Windows PowerShell 5.1
+The behaviour below is covered by 215 behavioural test cases that run on both Windows PowerShell 5.1
 and PowerShell 7. The safety-critical ones are **mutation-proven**: reverting the fix in a scratch
 copy of the tree was confirmed to turn the corresponding test red, so a green suite means the guard
 is really there rather than merely alleged. That check was added after an adversarial review showed
@@ -206,6 +206,22 @@ all fixed:
   now retries, and a run that produces no `TOTAL` line is a failure: missing evidence is not success.
 - The analyzer step scans the shipped file set rather than `.`, so the same command gives the same
   answer in CI and in a working tree that also holds untracked tooling.
+- **A skipped case is no longer counted as a pass.** The harness had no notion of a skip, so a case
+  that returned early because the environment could not support it was recorded as green. One case
+  did exactly that on any elevated host — which every GitHub runner is — so in CI it asserted
+  nothing and still reported success. A case now declares itself skipped *with a reason*, a skip is
+  excluded from `passed=`, and it makes its suite exit `3` and fails the run. Missing evidence and
+  proven behaviour are different outcomes.
+- That case now genuinely runs on an elevated host: it launches its child through a restricted
+  (Basic User) token, so the unprivileged path is asserted in both environments instead of being
+  waved through in one of them. The de-elevated child is self-bounded, so it cannot outlive its own
+  deadline even if the runner force-kills its parent.
+- **New: `Tests/Invoke-ElevatedVerification.ps1`.** Exit codes `5`, `3`, and `2` could not be reached
+  without administrator rights and were previously covered only through injected stubs. They are now
+  proven end to end against the real `Run.ps1` inside redirected sandboxes, and the two opt-in
+  switches can be exercised against the real `pnputil` and `cleanmgr`. The harness refuses to run
+  unelevated, derives every child's budget from its own wall timeout so it can never terminate a
+  live DISM servicing operation from outside, and never passes `/ResetBase`.
 
 ## Documentation
 

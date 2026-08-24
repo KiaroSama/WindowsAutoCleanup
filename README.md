@@ -10,7 +10,7 @@ These are the invariants the code and its regression tests are written against:
 
 - Default cleanup affects drive `C:` only.
 - `-ResetWindowsUpdateBase:$false` never results in a DISM `/ResetBase`, including across a UAC relaunch.
-- Nothing PATH-resolved or user-writable is ever registered to run as `SYSTEM`. The scheduled task references a machine-wide deployment and a canonical PowerShell host, both verified before registration.
+- Nothing PATH-resolved or user-writable is ever registered to run as `SYSTEM`. The scheduled task references a machine-wide deployment and a canonical PowerShell host, both verified before registration — and so is every **ancestor** of each, up to and including the volume root, because write access to a parent directory is enough to rename the whole deployment aside and drop a different one in its place. An ancestor is held to a deliberately narrower rule than the deployment itself: creating a *new* name beside it is harmless, so only the rights that let a non-administrator replace, rename, or re-permission an existing child count against it. The default Windows `C:\` grants `Authenticated Users` the right to create directories, and a check that ignored that distinction would refuse every correct installation.
 - Cleanup never follows a junction, symbolic link, mount point, or a reparse point swapped in mid-traversal. Every deletion re-proves by handle that the path still resolves to itself, immediately before the delete — not once per directory, which would leave a window as long as that directory takes to sweep. A reparse point found inside a target is deleted as a link without touching what it points at, and a locked file is only queued for deletion at the next boot once it has passed the same check.
 - The project folder, the deployment folder, the active log, browser history, cookies, saved passwords, Recent items, Quick Access state, and unrelated scheduled tasks survive every run.
 - Every external process and every traversal has a deadline, and the total internal budget stays below the scheduled task's execution time limit.
@@ -84,8 +84,20 @@ The uninstaller refuses to remove a task that does not carry this project's owne
 ### Run the tests
 
 ```bash
-pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Run-Tests.ps1
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Run-Tests.ps1 -Host both
 ```
+
+`-Host both` runs every suite as a child process under Windows PowerShell 5.1 *and* PowerShell 7, which is what CI does. `-Filter <name>` runs a single suite.
+
+A case that cannot run in the current environment declares itself **skipped with a reason**; a skip is never counted as a pass, it makes its suite exit `3`, and the runner fails the whole run. Missing evidence and proven behaviour are not the same outcome, and treating them as one is how a suite reports green while asserting nothing.
+
+Three exit paths cannot be reached without administrator rights, so they live in a separate harness that refuses to run unelevated:
+
+```bash
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Invoke-ElevatedVerification.ps1 -Scenario Sandboxed
+```
+
+`-Scenario Sandboxed` proves exit codes `5`, `3`, and `2` end to end inside redirected sandboxes. `-Scenario All` additionally runs `DRIVERS` and `CLEANMGR`, which exercise the two opt-in switches against the real `pnputil` and `cleanmgr` and therefore **change the machine they run on**. No scenario ever passes `/ResetBase`.
 
 ## Parameters
 
@@ -244,6 +256,7 @@ The task is registered under `\WindowsAutoCleanup\` with a `SYSTEM` principal, a
 | `Install-WindowsAutoCleanupTask.ps1` | Deploys the runtime and registers the daily task. |
 | `Uninstall-WindowsAutoCleanupTask.ps1` | Removes the task and the deployment. |
 | `Tests/` | Self-contained test harness, bounded parallel runner, and behavioural suites. |
+| `Tests/Invoke-ElevatedVerification.ps1` | Elevated-only harness for the exit paths and the opt-in switches that cannot be reached unprivileged. Refuses to run without administrator rights. |
 | `.github/workflows/ci.yml` | Analyzer and tests on Windows PowerShell 5.1 and PowerShell 7. |
 | `GITHUB_RELEASE_NOTES.md` | Release notes for the current version. |
 | `LICENSE` | MIT License. |

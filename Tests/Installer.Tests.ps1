@@ -179,10 +179,14 @@ function Invoke-SandboxedEntryPoint {
     )
     [System.IO.File]::WriteAllLines($wrapper, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
 
+    # -WindowStyle Hidden is not cosmetic here. runas.exe builds its child's startup info itself, so
+    # the CreateNoWindow we set on the runas PROCESS does not reach the process runas launches: the
+    # wrapper gets a real console that pops to the foreground and steals focus, once per case. The
+    # host hides its own window at startup when asked, which is the only lever the parent still has.
     $hostArguments = ConvertTo-WacCommandLine -ArgumentList @(
-        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
+        '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
     $childCommand = ConvertTo-WacCommandLine -ArgumentList @(
-        (Get-TestHostPath), '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
+        (Get-TestHostPath), '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $wrapper)
 
     $attempt = Start-BoundedWrapper -Label 'runas' -TimeoutSeconds $TimeoutSeconds -ResultFile $resultFile `
         -FileName (Join-Path -Path $env:SystemRoot -ChildPath 'System32\runas.exe') `

@@ -1494,11 +1494,14 @@ function Test-WacPathIsMachineTrusted {
         return $result
     }
 
-    # A NULL DACL grants EVERYONE full access, and it surfaces here as zero access rules - which the
-    # loop above would otherwise read as "nobody has write access". No real protected object has an
-    # empty rule set, so treat it as unverifiable and fail closed.
+    # Zero rules is an EMPTY DACL, not a NULL one. Measured through this exact managed API on both
+    # shipped hosts: 'O:BAG:BAD:NO_ACCESS_CONTROL' (a real NULL DACL, which grants everyone full
+    # access) comes back as ONE rule, Allow S-1-1-0 0xFFFFFFFF, so the loop above already refuses it
+    # on the write bits. It is 'O:BAG:BAD:' - a present but empty DACL - that yields zero rules.
+    # Either way there is nothing here to evaluate, and no real protected object looks like this, so
+    # fail closed rather than read an empty rule set as "nobody has write access".
     if ($rules.Count -eq 0) {
-        $result.Reason = 'The security descriptor exposes no access rules, which is what a NULL DACL (everyone, full control) looks like.'
+        $result.Reason = 'The security descriptor exposes no access rules to evaluate.'
         return $result
     }
 

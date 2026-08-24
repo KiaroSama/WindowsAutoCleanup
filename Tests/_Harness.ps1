@@ -12,6 +12,10 @@
     A suite is a plain script: dot-source this file, declare Test-Case blocks, call Complete-TestRun.
     Every case prints its line the moment it finishes, which is also what gives Run-Tests.ps1 its
     idle-progress signal.
+
+    A case that cannot run here calls Set-TestSkipped with a reason. There is deliberately no
+    outcome between "proved something" and "did not": a skip is its own outcome, it is excluded
+    from passed=, and it makes the suite exit 3.
 #>
 
 Set-StrictMode -Version 2.0
@@ -19,6 +23,10 @@ $ErrorActionPreference = 'Stop'
 
 $script:WacCases     = New-Object 'System.Collections.Generic.List[object]'
 $script:WacSandboxes = New-Object 'System.Collections.Generic.List[string]'
+
+# Prefix that marks a thrown skip. Test-Case checks for it BEFORE it treats a caught exception as a
+# failure, which is the whole mechanism: a skip cannot reach the pass branch by accident.
+$script:WacSkipToken = 'WAC-TEST-SKIP: '
 
 function Get-WacTestLocation {
     param([Parameter(Mandatory = $true)]$Invocation)
@@ -90,6 +98,23 @@ function Assert-Throws {
     if ($Pattern -and ([string]$caught) -notmatch $Pattern) {
         throw ('{0} error did not match /{1}/: {2}' -f (Get-WacTestLocation $MyInvocation), $Pattern, $caught)
     }
+}
+
+function Set-TestSkipped {
+    <#
+    .SYNOPSIS
+        Declares the running case UNABLE TO RUN here, with a reason. Never counted as a pass.
+    .DESCRIPTION
+        It THROWS rather than returns on purpose. A body that called this and then carried on would
+        assert under the very assumption it had just declared invalid, which is how the previous
+        shape of this suite reported green on a GitHub runner while asserting nothing.
+
+        The reason is mandatory because a skip fails the suite (exit 3): whoever reads that failure
+        needs to know which capability was missing, not merely that something was not run.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    throw ('{0}{1}' -f $script:WacSkipToken, $Reason)
 }
 
 function New-TestSandbox {
@@ -179,7 +204,7 @@ function Remove-TestSandbox {
 function Test-Case {
     <#
     .SYNOPSIS
-        Runs one case, records pass/fail with the failing line, and prints the result immediately.
+        Runs one case, records pass/fail/skip with the failing line, and prints it immediately.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -188,31 +213,40 @@ function Test-Case {
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $failure = $null
+    $skip = $null
 
     try {
         & $Body | Out-Null
     }
     catch {
-        $failure = [string]$_.Exception.Message
-        # A non-assertion exception carries no call-site prefix, so take one from the error record.
-        if ($failure -notmatch '^\S+\.ps1:\d+ ') {
-            $where = '<unknown>'
-            try {
-                if ($_.InvocationInfo -and $_.InvocationInfo.ScriptName) {
-                    $where = '{0}:{1}' -f (Split-Path -Leaf $_.InvocationInfo.ScriptName), $_.InvocationInfo.ScriptLineNumber
+        $message = [string]$_.Exception.Message
+
+        if ($message.StartsWith($script:WacSkipToken, [System.StringComparison]::Ordinal)) {
+            $skip = $message.Substring($script:WacSkipToken.Length)
+        }
+        else {
+            $failure = $message
+            # A non-assertion exception carries no call-site prefix, so take one from the error record.
+            if ($failure -notmatch '^\S+\.ps1:\d+ ') {
+                $where = '<unknown>'
+                try {
+                    if ($_.InvocationInfo -and $_.InvocationInfo.ScriptName) {
+                        $where = '{0}:{1}' -f (Split-Path -Leaf $_.InvocationInfo.ScriptName), $_.InvocationInfo.ScriptLineNumber
+                    }
                 }
+                catch { $where = '<unknown>' }
+                $failure = '{0} {1}' -f $where, $failure
             }
-            catch { $where = '<unknown>' }
-            $failure = '{0} {1}' -f $where, $failure
         }
     }
 
     $watch.Stop()
     $ms = [int]$watch.Elapsed.TotalMilliseconds
 
-    [void]$script:WacCases.Add([PSCustomObject]@{ Name = $Name; Failure = $failure; DurationMs = $ms })
+    [void]$script:WacCases.Add([PSCustomObject]@{ Name = $Name; Failure = $failure; Skip = $skip; DurationMs = $ms })
 
     if ($failure) { Write-Host ('FAIL  {0}  ({1} ms)  {2}' -f $Name, $ms, $failure) }
+    elseif ($skip) { Write-Host ('SKIP  {0}  ({1} ms)  {2}' -f $Name, $ms, $skip) }
     else { Write-Host ('pass  {0}  ({1} ms)' -f $Name, $ms) }
 }
 
@@ -226,11 +260,15 @@ function Complete-TestRun {
     Remove-TestSandbox
 
     $failed = @($script:WacCases | Where-Object { $_.Failure })
+    $skipped = @($script:WacCases | Where-Object { -not $_.Failure -and $_.Skip })
     $total = $script:WacCases.Count
     $elapsed = 0
     foreach ($case in $script:WacCases) { $elapsed += $case.DurationMs }
 
-    Write-Host ('TOTAL cases={0} passed={1} failed={2} duration={3}ms' -f $total, ($total - $failed.Count), $failed.Count, $elapsed)
+    # skipped= was appended rather than inserted mid-line: Run-Tests.ps1 keys its "this run proved
+    # something" check off the literal 'TOTAL cases=', and its roll-up reads skipped= by name.
+    Write-Host ('TOTAL cases={0} passed={1} failed={2} skipped={3} duration={4}ms' -f `
+            $total, ($total - $failed.Count - $skipped.Count), $failed.Count, $skipped.Count, $elapsed)
 
     # A suite that declared nothing is a silent false green, not a pass.
     if ($total -eq 0) {
@@ -239,5 +277,15 @@ function Complete-TestRun {
     }
 
     if ($failed.Count -gt 0) { exit 1 }
+
+    # A skip is missing evidence, so the suite does NOT exit 0. Exit 3 is distinct from a real
+    # assertion failure (1) and from an empty suite (2), and Run-Tests.ps1 fails the whole run on
+    # any non-zero suite exit - which is what stops "the environment could not run it" from ever
+    # reading as "it passed" again.
+    if ($skipped.Count -gt 0) {
+        foreach ($case in $skipped) { Write-Host ('FAIL  skipped, so nothing was proven: {0} -- {1}' -f $case.Name, $case.Skip) }
+        exit 3
+    }
+
     exit 0
 }
