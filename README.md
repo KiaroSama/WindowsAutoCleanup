@@ -11,7 +11,7 @@ These are the invariants the code and its regression tests are written against:
 - Default cleanup affects drive `C:` only.
 - `-ResetWindowsUpdateBase:$false` never results in a DISM `/ResetBase`, including across a UAC relaunch.
 - Nothing PATH-resolved or user-writable is ever registered to run as `SYSTEM`. The scheduled task references a machine-wide deployment and a canonical PowerShell host, both verified before registration — and so is every **ancestor** of each, up to and including the volume root, because write access to a parent directory is enough to rename the whole deployment aside and drop a different one in its place. An ancestor is held to a deliberately narrower rule than the deployment itself: creating a *new* name beside it is harmless, so only the rights that let a non-administrator replace, rename, or re-permission an existing child count against it. The default Windows `C:\` grants `Authenticated Users` the right to create directories, and a check that ignored that distinction would refuse every correct installation.
-- Cleanup never follows a junction, symbolic link, mount point, or a reparse point swapped in mid-traversal. Every deletion re-proves by handle that the path still resolves to itself, immediately before the delete — not once per directory, which would leave a window as long as that directory takes to sweep. A reparse point found inside a target is deleted as a link without touching what it points at, and a locked file is only queued for deletion at the next boot once it has passed the same check.
+- Cleanup never leaves an allow-listed root through a junction, symbolic link, mount point, or a reparse point swapped in mid-traversal. Every deletion re-proves by handle that the path still resolves to itself immediately before the delete — not once per directory, which would leave a window as long as that directory takes to sweep. This narrows the race; it does not close it, and the code no longer claims otherwise: the delete is still issued by pathname because .NET offers no delete-by-handle and no relative open on either host. What IS guaranteed is containment, and a test runs a concurrent junction-swap adversary against it and asserts sentinels outside the tree survive every iteration. A reparse point found inside a target is deleted as a link without touching what it points at. A locked file is left alone and reported skipped — queuing it for deletion at the next boot was removed, because Session Manager re-resolves the stored *name* hours later and nothing checked at registration time binds it.
 - The project folder, the deployment folder, the active log, browser history, cookies, saved passwords, Recent items, Quick Access state, and unrelated scheduled tasks survive every run.
 - Every external process and every traversal has a deadline, and the total internal budget stays below the scheduled task's execution time limit.
 - An unverifiable safety condition fails closed. A failed security check is never reported as success.
@@ -253,15 +253,22 @@ The task is registered under `\WindowsAutoCleanup\` with a `SYSTEM` principal, a
 | Path | Purpose |
 | --- | --- |
 | `Run.ps1` | Entry point: parameters, elevation, single-instance lock, orchestration, exit codes. |
-| `src/WindowsAutoCleanup.Core.psm1` | Logging, path safety, run deadline, bounded process runner, machine-trust checks. |
+| `src/WindowsAutoCleanup.Core.psm1` | Package entry point over `Native`, `Path`, `RunState`, `Process`, `Environment` and `Trust`: the P/Invoke surface, path safety, the audit log and run budget, bounded execution, machine facts, and the owner/DACL rules. |
 | `src/WindowsAutoCleanup.FileSystem.psm1` | The single no-follow, reparse-safe, long-path-safe deletion primitive. |
 | `src/WindowsAutoCleanup.Targets.psm1` | The `C:`-only allow-list. |
-| `src/WindowsAutoCleanup.Steps.psm1` | DISM, pnpclean, driver pruning, Recycle Bin, Delivery Optimization, legacy cleanmgr. |
-| `src/WindowsAutoCleanup.Deploy.psm1` | Deployment copy, machine-trust verification, scheduled-task ownership. |
+| `src/WindowsAutoCleanup.Steps.psm1` | Package entry point over `StepContract`, `RecycleBin` and `DiskCleanup`: the shared result vocabulary, DISM, Delivery Optimization, the Recycle Bin sweep and the opt-in cleanmgr step. |
+| `src/WindowsAutoCleanup.Drivers.psm1` | Package entry point over `DriverInventory` and `DriverBackup`: pnpclean, the structured pnputil inventory, and opt-in package pruning with content-addressed backups. |
+| `src/WindowsAutoCleanup.Deploy.psm1` | Package entry point over `DeploymentTree`, `DeploymentProof` and `ScheduledTask`: the shared operation lock, staging and rollback, ownership proof, and task action parsing. |
+
+A package entry point `.psm1` **dot-sources** its `.ps1` parts rather than importing them as nested
+modules, and re-exports the same names it always did, so nothing that imports it has to change. That
+is not a style choice: a nested module gets its own session state, so a call from one part to
+another resolves only while the parent happens to be imported at global scope - and every module
+here imports its dependencies from module scope, where it does not.
 | `Install-WindowsAutoCleanupTask.ps1` | Deploys the runtime and registers the daily task. |
 | `Uninstall-WindowsAutoCleanupTask.ps1` | Removes the task and the deployment. |
 | `Tests/` | Self-contained test harness, bounded parallel runner, and behavioural suites. |
-| `Tests/Invoke-ElevatedVerification.ps1` | Elevated-only harness for the exit paths and the opt-in switches that cannot be reached unprivileged. Refuses to run without administrator rights. |
+| `Tests/Invoke-ElevatedVerification.ps1` | Elevated-only harness (with its `_ElevatedVerification.*.ps1` parts) for the exit paths and the opt-in switches that cannot be reached unprivileged. Refuses to run without administrator rights, and is not one of the discovered `*.Tests.ps1` suites. |
 | `.github/workflows/ci.yml` | Analyzer and tests on Windows PowerShell 5.1 and PowerShell 7. |
 | `GITHUB_RELEASE_NOTES.md` | Release notes for the current version. |
 | `LICENSE` | MIT License. |
