@@ -130,10 +130,16 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Run.ps1 -ResetWindowsUpdateB
 | `3` | Another run already holds the machine-wide lock. |
 | `4` | Elevation was cancelled or failed. |
 | `5` | Unsupported environment: the online system drive is not `C:`. |
+| `6` | Incomplete: the run did not finish what it was asked to do, or cannot prove it did. The budget expired, a step hit its deadline, an elevated child had to be terminated, or the durable audit log could not be produced. |
+| `7` | Security refusal: a safety check refused to proceed on evidence. A cleanup path failed its identity or containment re-check, or the directory holding the run state and audit log is not machine-trusted. |
+
+A run reports its **worst** outcome: a refusal outranks a failure, which outranks incomplete work. A benign skip does not affect the code — a reparse point left alone, a protected path stepped around, or an opt-in step that is switched off all keep the run at `0`.
+
+The installer and uninstaller use the same `6` and `7`; their full tables are in each script's `.NOTES` block.
 
 ## Concurrency
 
-A machine-wide named mutex (`Global\WindowsAutoCleanup`) is taken before anything is mutated. Task Scheduler's `MultipleInstances IgnoreNew` is documented only in terms of task instances and says nothing about a manual run overlapping a scheduled one, so the mutex is the real guard. A run that cannot take the lock exits with code `3` without touching anything.
+One machine-wide named mutex (`Global\WindowsAutoCleanup`) is taken before anything is mutated, and it is shared by the cleanup runtime, the installer, the upgrade path and the uninstaller — so a cleanup run cannot overlap a deployment being replaced or removed. Task Scheduler's `MultipleInstances IgnoreNew` is documented only in terms of task instances and says nothing about a manual run overlapping a scheduled one, so the mutex is the real guard. A run that cannot take the lock exits with code `3` without touching anything.
 
 Log files are created with create-new semantics and a collision suffix, so two runs starting in the same second can never share or truncate one file.
 
@@ -151,9 +157,7 @@ Only these locations are deleted directly:
 - Location and `LocationProvider` caches
 - Microsoft Edge Chromium caches under each `Default` / `Profile N` profile
 - Microsoft Defender `LocalCopy`, `Support` and scan-history paths, best effort
-- `C:\Windows\SoftwareDistribution\Download`
 - `C:\Windows\Downloaded Program Files`
-- Delivery Optimization caches
 - `C:\Windows\Prefetch`
 - `C:\Windows.old`, when present
 - The Recycle Bin on drive `C:`
@@ -162,7 +166,7 @@ Only these locations are deleted directly:
 
 - `dism.exe /Online /Cleanup-Image /StartComponentCleanup [/ResetBase] /Quiet`
 - `rundll32.exe pnpclean.dll,RunDLL_PnpClean /DRIVERS /MAXCLEAN`
-- `Delete-DeliveryOptimizationCache` when that cmdlet is present
+- `Delete-DeliveryOptimizationCache`, and only when `Get-DOConfig -Verbose` reports the cache's `WorkingDirectory` on `C:`
 - `pnputil /export-driver` then `/delete-driver`, only under `-PruneSupersededDrivers`
 - `cleanmgr.exe /sagerun`, only under `-EnableLegacyDiskCleanup`
 
@@ -173,7 +177,8 @@ Browser history, cookies, saved passwords, `WebCache`, File Explorer history, Re
 ## Behaviour worth knowing
 
 - Deleted files do not go to the Recycle Bin.
-- A file locked by another process is queued for deletion at the next boot. Windows only records the pending operation; it does not guarantee the delete will succeed, so the log says `queuedForReboot`, never "deleted".
+- A file locked by another process is **left alone** and reported as skipped. Earlier versions queued it for deletion at the next boot through `MoveFileEx`; that was removed. Session Manager resolves the stored *name* at the next boot, so nothing checked at registration time binds what actually gets deleted hours later, and an ancestor swapped in the meantime redirects the deletion. The cost is real — a locked file survives until something releases it — and it is deliberate.
+- Deletion is **not** race-free, and this project does not claim it is. Each leaf is re-verified through a handle immediately before it is deleted, which narrows the window from per-directory to per-leaf, but the delete itself is still issued by pathname because .NET exposes no delete-by-handle and no relative open on either host. What survives an attacker swapping a junction mid-run is the containment guarantee: the tool never follows a reparse point out of an allow-listed root, and that is covered by a test that runs a concurrent junction-swap adversary and asserts external sentinels survive every iteration.
 - `DISM /ResetBase` is enabled by default. After it runs, the Windows updates installed before that point can no longer be uninstalled. Future updates are unaffected.
 - DISM exit code `3010` is treated as success with a pending reboot. Microsoft publishes no DISM exit-code table, so this maps the generic `ERROR_SUCCESS_REBOOT_REQUIRED` constant; `3017` is treated as a failure.
 - Defender Tamper Protection can lock scan-history files even for `SYSTEM`. Those are reported as skipped, with the reason.

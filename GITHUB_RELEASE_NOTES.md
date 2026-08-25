@@ -43,10 +43,12 @@ before it was fixed.
   deletion now re-proves by handle that the path still resolves to itself, immediately before the
   delete. The cost was paid for by caching the protected-root list, which had been the larger
   per-file expense.
-- **The same weakness in the delete-on-reboot path was race-free and worse.** `MoveFileEx` stores the
-  literal path string and the session manager re-resolves it at the next boot, so a locked file
-  queued today could be redirected at leisure and the delete would land anywhere, before anything
-  loaded that could object. Registration is now refused unless the path proves it resolves to itself.
+- **Delete-on-reboot is gone entirely.** `MoveFileEx` stores the literal path string and Session
+  Manager re-resolves it at the next boot, so a locked file queued today could be redirected at
+  leisure and the delete would land anywhere, before anything loaded that could object. A check at
+  registration time cannot fix that - nothing verified today binds the name resolved hours later -
+  so the mechanism was removed rather than guarded. A locked file is now left alone and reported as
+  skipped.
 - **`-ResetWindowsUpdateBase $false` with a space instead of a colon silently did the opposite.**
   Positional binding bound the switch to `$true` and dropped the leftover `$false` token into
   `-SkipCategory`, so DISM ran `/ResetBase` after the user explicitly asked it not to. `Run.ps1` now
@@ -111,19 +113,29 @@ before it was fixed.
   calling identity's bin, so a scheduled run cleared essentially nothing while reporting success, and
   the pre-check scanned every SID directory — a scope mismatch that could report a false success. The
   sweep now uses one scope for enumeration, deletion and the post-condition.
-- **Driver pruning no longer guesses.** Grouping by INF name, class and provider ignored class GUID,
-  extension identity and signer, and the date comparison was hard-coded US-first, so `03/04/2024`
-  under `en-GB` parsed as the wrong day. Pruning is now opt-in, keyed on
-  `OriginalName + ClassGuid + ExtensionId + ProviderName + SignerName`, decided on the version alone,
-  and exports a recoverable backup first. It never passes `/force`, `/uninstall` or `/reboot`.
-  Documented pnputil success codes `0`, `3010` and `1641` are no longer reported as failures.
-- **Everything is bounded.** An injectable process runner gives every external tool a deadline
-  derived from the remaining run budget, captures output without deadlocking, and terminates the
-  whole process tree on timeout — a parent-only `Kill()` left children running. The default internal
-  budget is 210 minutes, below the task's 4-hour limit. `pnputil /delete-driver` is no longer
-  unbounded.
-- **Concurrent runs can no longer corrupt shared state.** A machine-wide mutex guards every mutation
-  and a run that cannot take it exits with code `3`. Log files are created with create-new semantics
+- **Driver pruning now requires device evidence, not a name match.** Grouping by name, class,
+  provider and signer and deciding on the version alone does not prove a package is removable, and
+  on the reference machine it was measurably wrong: that logic nominated an `oem*.inf` with **two
+  running adapters bound to it**, while the package installed on nothing was the newer one. Nothing
+  was lost only because the feature is opt-in and `pnputil` declined the deletion. Removal now needs
+  the documented structured inventory (`/enum-drivers /devices /format xml`) to show a package
+  installed on no device, connected or disconnected; uncertainty always means skip. Backups are
+  content-addressed with a manifest and cryptographic hashes and a collision is refused rather than
+  overwritten, because an `oem` number can be reused and would otherwise overwrite the only copy.
+  It never passes `/force`, `/uninstall` or `/reboot`.
+- **External tools and in-process work are both bounded.** An injectable process runner gives every
+  external tool a deadline derived from the remaining run budget, captures output without
+  deadlocking, and terminates the whole process tree on timeout — a parent-only `Kill()` left
+  children running, and the terminator now binds a real kernel handle and verifies the target is
+  gone instead of treating `taskkill` merely exiting as proof. Blocking work that never leaves the
+  process — the Delivery Optimization cmdlets, WMI profile discovery, the registry snapshot, the
+  Recycle Bin scan, building the allow-list — runs under its own bound too, because a call blocked
+  in the OS blocks every deadline check behind it. The default internal budget is 210 minutes, below
+  the task's 4-hour limit.
+- **Concurrent runs can no longer corrupt shared state.** ONE machine-wide mutex, shared by the
+  cleanup runtime, the installer, the upgrade path and the uninstaller, guards every mutation, so a
+  cleanup run can no longer race a deployment being replaced or removed. A run that cannot take it
+  exits with code `3`. Log files are created with create-new semantics
   and a collision suffix, so two runs starting in the same second can no longer share one file and
   truncate the first.
 - **Elevation and exit semantics are honest.** A manual run now waits for its elevated child and
@@ -135,9 +147,13 @@ before it was fixed.
   `ntuser.dat`/`ntuser.man`) instead of treating every directory under `C:\Users` as a profile. A run
   on a non-`C:` system drive now fails with exit code `5` instead of silently mixing two Windows
   installations.
-- **The Delivery Optimization cache is purged through the supported cmdlet**
-  (`Delete-DeliveryOptimizationCache`) when it exists, instead of only deleting an undocumented path
-  that can be relocated off `C:`.
+- **The Delivery Optimization cache is purged only when it is actually on `C:`.** The cache can be
+  relocated to another drive by the `DOModifyCacheDrive` policy, so the effective location is
+  resolved first through the supported `Get-DOConfig -Verbose` (`WorkingDirectory`); a cache on
+  another drive is a named safe skip, and a location that cannot be determined purges nothing. The
+  raw `SoftwareDistribution\Download` and Delivery Optimization cache directories left the
+  allow-list altogether: they belong to running services this tool will not stop, because it cannot
+  guarantee it could restore them.
 
 ## Cleanup actually reaches the files now
 

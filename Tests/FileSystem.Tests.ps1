@@ -314,6 +314,33 @@ Test-Case 'A target shaped like a real one produces no refusals at all' {
         Assert-True ($result.SkippedProtected -ge 1)
         Assert-True (Test-Path -LiteralPath $protectedRoot) 'the protected subtree was removed'
         Assert-True (Test-Path -LiteralPath $outside) 'the junction target was followed'
+
+        # ...and AGAIN, over the same persistent state. A benign steady state that scores clean once
+        # and refuses on the next run would exit 7 every day but the first, which is precisely the
+        # defect this counter split exists to prevent. The protected subtree, the locked file and
+        # the junction target are all still here, so this pass is the state a scheduled task
+        # actually spends its life in.
+        $again = Remove-WacTree -Category 'realshape' -Path $root
+        Assert-True $again.Attempted
+        Assert-Equal 0 ([int]$again.RefusedIdentity) 'the second pass over the same state reported an identity refusal'
+        Assert-Equal 0 ([int]$again.RefusedOutOfRoot) 'the second pass over the same state reported an out-of-root refusal'
+        Assert-Equal 0 ([int]$again.Refused) 'a benign steady state was reported as a security refusal on its second run'
+        Assert-Equal 0 ([int]$again.Failed)
+        Assert-Equal 1 ([int]$again.SkippedLocked) 'the still-locked file changed classification on the second pass'
+        Assert-True ($again.SkippedProtected -ge 1) 'the protected subtree stopped being skipped'
+
+        # A real elevated run also skips reparse-point ROOTS - it scored skipReparse=3, every one of
+        # them the per-profile 'Temporary Internet Files' junction. A benign reparse skip and a
+        # benign protected skip inside the same run must still add up to zero refusals, twice.
+        $inetCache = New-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'Temporary Internet Files') -Target $outside
+        foreach ($pass in 1, 2) {
+            $routine = Remove-WacTree -Category 'realshape-inetcache' -Path $inetCache
+            Assert-False $routine.Attempted ('pass ' + $pass + ': a reparse-point root was swept')
+            Assert-Equal 1 ([int]$routine.SkippedReparse) ('pass ' + $pass + ': the reparse-point root was not a routine skip')
+            Assert-Equal 0 ([int]$routine.RefusedIdentity) ('pass ' + $pass + ': a routine reparse-point root was an identity refusal')
+            Assert-Equal 0 ([int]$routine.Refused) ('pass ' + $pass + ': a routine reparse-point root reached the refusal roll-up')
+        }
+        Assert-True (Test-Path -LiteralPath $inetCache) 'the reparse-point root itself was deleted'
     }
     finally {
         if ($handle) { try { $handle.Dispose() } catch { $null = $_ } }
@@ -549,6 +576,65 @@ Test-Case 'A protected script root survives whether it equals, sits inside, or c
         Assert-False $inside.Attempted 'a target inside the script root was swept'
         Assert-True (Test-Path -LiteralPath $plain)
         Assert-True (Test-Path -LiteralPath $inner)
+    }
+    finally {
+        Clear-WacProtectedRoot
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A leaf inside a protected root is a protected skip and never an identity refusal' {
+    <#
+        Remove-WacLeaf carries its own protected-path check, and nothing reached it. The case above
+        exercises the SWEEP's protected branch, which drops the whole subtree during enumeration so
+        no leaf inside it is ever handed to Remove-WacLeaf; every other route into this function
+        arrives with the protection already cleared. Mutating this skip to RefusedIdentity left
+        every suite green - and that is the contract-violating direction, because an everyday target
+        that happens to contain the deployment or the log directory would then score a security
+        refusal and exit 7 on EVERY run, with nothing whatsoever wrong.
+
+        Run twice over the same persistent state for exactly that reason: a benign steady state has
+        to still be benign on the second pass, which is the pass a scheduled task actually spends
+        its life in.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'fs-leafprotected'
+    try {
+        $root = New-TestDirectory (Join-Path -Path $sandbox -ChildPath 'root')
+        $deployment = New-TestDirectory (Join-Path -Path $root -ChildPath 'deployment')
+        $keep = New-TestFile -Path (Join-Path -Path $deployment -ChildPath 'Run.ps1') -Content 'MUST SURVIVE'
+
+        Clear-WacProtectedRoot
+        Add-WacProtectedRoot -Path $deployment
+
+        foreach ($pass in 1, 2) {
+            $stats = New-WacDeletionStats
+            Remove-WacLeaf -Path $keep -RootPath $root -Stats $stats
+
+            Assert-Equal 1 ([int]$stats.SkippedProtected) `
+                ('pass ' + $pass + ': a protected leaf was not recorded as a protected skip')
+            Assert-Equal 0 ([int]$stats.RefusedIdentity) `
+                ('pass ' + $pass + ': a protected leaf was reported as an identity refusal')
+            Assert-Equal 0 (Get-WacRefusedTotal -Stats $stats) `
+                ('pass ' + $pass + ': a benign protected skip reached the refusal roll-up the exit code reads')
+            Assert-Equal 0 ([int]$stats.FilesDeleted)
+            Assert-True ([System.IO.File]::Exists($keep)) ('pass ' + $pass + ': the protected file was deleted')
+        }
+
+        # The protected directory itself takes the same branch, and it is the one -DeleteRoot would
+        # reach on a target that IS the deployment.
+        $directory = New-WacDeletionStats
+        Remove-WacLeaf -Path $deployment -RootPath $root -Stats $directory -IsDirectory
+        Assert-Equal 1 ([int]$directory.SkippedProtected) 'the protected root itself was not a protected skip'
+        Assert-Equal 0 (Get-WacRefusedTotal -Stats $directory) 'deleting the protected root was reported as a refusal'
+        Assert-True (Test-Path -LiteralPath $deployment) 'the protected root was removed'
+
+        # ...and an unprotected sibling still goes, so "skip everything" fails here.
+        $junk = New-TestFile (Join-Path -Path $root -ChildPath 'junk.tmp')
+        $ordinary = New-WacDeletionStats
+        Remove-WacLeaf -Path $junk -RootPath $root -Stats $ordinary
+        Assert-Equal 1 ([int]$ordinary.FilesDeleted) 'an ordinary file beside a protected root was not deleted'
+        Assert-Equal 0 ([int]$ordinary.SkippedProtected) 'an ordinary file was written off as protected'
+        Assert-False ([System.IO.File]::Exists($junk))
     }
     finally {
         Clear-WacProtectedRoot
