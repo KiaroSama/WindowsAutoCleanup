@@ -42,7 +42,9 @@
     Allow-list categories to leave alone, matched case-insensitively against the category name.
 
 .PARAMETER LogLevel
-    DEBUG, INFO, WARNING, ERROR or CRITICAL. DEBUG adds a line per cleanup target.
+    DEBUG, INFO, WARNING, ERROR or CRITICAL. DEBUG adds a line per cleanup target. The run's own
+    verdict, and whatever produced a non-zero exit code, are written at CRITICAL whatever this is
+    set to: no level can leave a failing run with nothing to read.
 
 .PARAMETER BudgetMinutes
     Total internal run budget. Must stay below the scheduled task's execution time limit (4 hours),
@@ -162,6 +164,12 @@ function Remove-WacBootstrapLog {
     #>
     if (-not (Test-Path -LiteralPath $script:BootstrapLogPath -PathType Leaf)) { return }
     if (-not (Get-WacLogHealth).IsDurable) { return }
+
+    # The same doctrine one level up: the run log adopts this file's lines at WARNING, and at
+    # -LogLevel ERROR or CRITICAL every one of them is gated out - so the run log did NOT keep the
+    # content, and deleting the file would destroy the only surviving record of a pre-import
+    # failure. One artifact is the goal; it is not worth the evidence.
+    if ($LogLevel -ceq 'ERROR' -or $LogLevel -ceq 'CRITICAL') { return }
     try { [System.IO.File]::Delete($script:BootstrapLogPath) } catch { $null = $_ }
 }
 
@@ -234,9 +242,12 @@ function Invoke-WacElevatedRelaunch {
         The old behaviour returned 0 immediately after starting the child, so a failed cleanup looked
         like a success to anything that read the exit code (ledger P1-12).
     #>
+    # The three lines below are written at CRITICAL for the same reason the footer's verdict is:
+    # each one IS the verdict of a run that never reaches the footer, and CRITICAL is the only
+    # level -LogLevel cannot gate out. A 4 or a 6 with an empty log explains nothing.
     $host51 = Get-WacCanonicalPowerShellHost
     if (-not $host51) {
-        Write-WacLog -Level ERROR -Component 'Elevation' -Message 'No canonical, machine-trusted PowerShell host was found; refusing to relaunch.'
+        Write-WacLog -Level CRITICAL -Component 'Elevation' -Message 'No canonical, machine-trusted PowerShell host was found; refusing to relaunch.'
         return 4
     }
 
@@ -253,7 +264,7 @@ function Invoke-WacElevatedRelaunch {
         $process = Start-Process -FilePath $host51 -ArgumentList $commandLine -Verb RunAs -PassThru -ErrorAction Stop
     }
     catch {
-        Write-WacLog -Level ERROR -Component 'Elevation' -Message 'Elevation was cancelled or failed.' -Data @{ error = $_.Exception.Message }
+        Write-WacLog -Level CRITICAL -Component 'Elevation' -Message 'Elevation was cancelled or failed.' -Data @{ error = $_.Exception.Message }
         return 4
     }
 
@@ -264,7 +275,7 @@ function Invoke-WacElevatedRelaunch {
     # a small margin for process start-up.
     $waitMs = ($BudgetMinutes * 60 * 1000) + 60000
     if (-not $process.WaitForExit($waitMs)) {
-        Write-WacLog -Level ERROR -Component 'Elevation' -Message 'The elevated child exceeded the run budget; terminating its process tree.' -Data @{ pid = $process.Id }
+        Write-WacLog -Level CRITICAL -Component 'Elevation' -Message 'The elevated child exceeded the run budget; terminating its process tree.' -Data @{ pid = $process.Id }
 
         # Stop-WacProcessTree binds a real kernel handle, so $false is not "probably fine": it means
         # termination could not be ESTABLISHED and the child may still be running. Discarding that
@@ -340,6 +351,16 @@ function Write-WacRunHeader {
 
 $script:OutcomeRank = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 1; 'Failed' = 2; 'SecurityRefusal' = 3 }
 $script:OutcomeExitCode = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 6; 'Failed' = 2; 'SecurityRefusal' = 7 }
+
+# The level the run's verdict and the evidence behind it are written at, decided by the OUTCOME.
+# -LogLevel is the operator's choice about detail; it is not a choice to lose the verdict. A footer
+# hard-wired to INFO/WARNING wrote 'status=SecurityRefusal exitCode=7' into a log that -LogLevel
+# ERROR then dropped on the floor, leaving the audit log of a refusing run empty. CRITICAL is the
+# highest level the parameter accepts, so it is the only one no setting can gate out.
+$script:OutcomeLogLevel = @{
+    'Succeeded' = 'INFO'; 'SafeSkip' = 'INFO'
+    'Incomplete' = 'CRITICAL'; 'Failed' = 'CRITICAL'; 'SecurityRefusal' = 'CRITICAL'
+}
 
 function Get-WacHigherRunOutcome {
     <#
@@ -446,8 +467,6 @@ function Write-WacRunFooter {
         $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'SecurityRefusal'
     }
 
-    Write-WacLog -Level INFO -Component 'Summary' -Message 'Cleanup totals.' -Data ([hashtable]$totals)
-
     $delta = $null
     if ($null -ne $FreeBytesBefore -and $null -ne $FreeBytesAfter) { $delta = [int64]($FreeBytesAfter - $FreeBytesBefore) }
     Write-WacLog -Level INFO -Component 'Summary' -Message 'Free space on C:.' -Data @{
@@ -465,13 +484,13 @@ function Write-WacRunFooter {
 
     # The three run-level sources no step or target result carries.
     if (Test-WacDeadlineExpired) {
-        Write-WacLog -Level WARNING -Component 'Summary' -Message 'The run budget expired, so not everything this run was asked to do was attempted.'
+        Write-WacLog -Level $script:OutcomeLogLevel['Incomplete'] -Component 'Summary' -Message 'The run budget expired, so not everything this run was asked to do was attempted.'
         $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete'
     }
 
     $logHealth = Get-WacLogHealth
     if (-not $logHealth.IsDurable) {
-        Write-WacLog -Level ERROR -Component 'Summary' -Message 'The durable audit log this run was asked to produce is incomplete.' -Data @{
+        Write-WacLog -Level $script:OutcomeLogLevel['Incomplete'] -Component 'Summary' -Message 'The durable audit log this run was asked to produce is incomplete.' -Data @{
             reason = [string]$logHealth.Reason; fallback = [string]$logHealth.FallbackKind; failedWrites = $logHealth.FailedWrites
         }
         $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete'
@@ -482,14 +501,19 @@ function Write-WacRunFooter {
     # actually reached and came back untrusted can.
     $stateTrust = Get-WacStateTrust
     if ($null -ne $stateTrust -and -not $stateTrust.IsTrusted) {
-        Write-WacLog -Level CRITICAL -Component 'Summary' -Message 'The directory holding this run state and audit log is not machine-trusted.' -Data @{
+        Write-WacLog -Level $script:OutcomeLogLevel['SecurityRefusal'] -Component 'Summary' -Message 'The directory holding this run state and audit log is not machine-trusted.' -Data @{
             path = [string]$stateTrust.Path; reason = [string]$stateTrust.Reason
         }
         $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'SecurityRefusal'
     }
 
     $exitCode = [int]$script:OutcomeExitCode[$outcome]
-    $statusLevel = if ($exitCode -eq 0) { 'INFO' } else { 'WARNING' }
+    $statusLevel = [string]$script:OutcomeLogLevel[$outcome]
+
+    # The totals are written HERE, not where they are computed: they carry refusedIdentity,
+    # refusedOutOfRoot, stepIncomplete and stepRefused - the evidence for whatever the verdict
+    # turned out to be - so they are written at the verdict's level and cannot outlive it.
+    Write-WacLog -Level $statusLevel -Component 'Summary' -Message 'Cleanup totals.' -Data ([hashtable]$totals)
 
     Write-WacLog -Level $statusLevel -Component 'Run' -Message 'Final status.' -Data @{
         status = $outcome
@@ -534,7 +558,8 @@ try {
 
     if (-not (Test-WacIsAdministrator)) {
         if ($Scheduled) {
-            Write-WacLog -Level ERROR -Component 'Run' -Message 'Administrator privileges are required and a scheduled run is not elevated.'
+            # CRITICAL, not ERROR: this is the whole audit trail of a run that exits 1 here.
+            Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Administrator privileges are required and a scheduled run is not elevated.'
             exit 1
         }
         exit (Invoke-WacElevatedRelaunch)
@@ -547,7 +572,8 @@ try {
 
     $mutex = Enter-WacSingleInstance -Name $MutexName
     if (-not $mutex) {
-        Write-WacLog -Level WARNING -Component 'Run' -Message 'Another WindowsAutoCleanup run already holds the machine-wide lock; exiting without mutating anything.' -Data @{ mutex = $MutexName }
+        # Benign as an event, and still the only thing this run will ever say about why it exited 3.
+        Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Another WindowsAutoCleanup run already holds the machine-wide lock; exiting without mutating anything.' -Data @{ mutex = $MutexName }
         exit 3
     }
 
