@@ -2,11 +2,50 @@
 
 Security, correctness and reliability release.
 
-The behaviour below is covered by 215 behavioural test cases that run on both Windows PowerShell 5.1
-and PowerShell 7. The safety-critical ones are **mutation-proven**: reverting the fix in a scratch
-copy of the tree was confirmed to turn the corresponding test red, so a green suite means the guard
-is really there rather than merely alleged. That check was added after an adversarial review showed
-thirteen documented guarantees could be reverted with the old suite still passing.
+The behaviour below is covered by a behavioural suite that runs every case on both Windows
+PowerShell 5.1 and PowerShell 7. The safety-critical ones are **mutation-proven**: reverting the fix
+in a scratch copy of the tree was confirmed to turn the corresponding test red, so a green suite
+means the guard is really there rather than merely alleged. That check was added after an
+adversarial review showed thirteen documented guarantees could be reverted with the old suite still
+passing, and it has since caught more than a dozen further assertions that asserted nothing.
+
+## The deletion race is closed, and the threat model is stated
+
+Earlier drafts of this release said containment was guaranteed while the code could not deliver it.
+That is resolved rather than reworded.
+
+**Threat model:** a local standard user who can write into an allow-listed target is an attacker this
+tool defends against. It runs as `SYSTEM`, and `C:\Windows\Temp` grants `BUILTIN\Users` write access
+by default, so that user is real.
+
+**What changed:** deletion used to verify a path and then delete it *by name*, which is a second,
+independent resolution of the same name. Every leaf is now removed through a handle bound to it - one
+open, the identity proved on that handle, the unlink issued on the same handle - so there is nothing
+for an attacker to swap in between. Managed code cannot express that; it goes through
+`NtSetInformationFile`.
+
+**What is still pathname-based, said plainly:** enumeration. An ancestor swapped mid-sweep can change
+which children are *found*, but any leaf reached that way fails the handle-bound proof and is
+refused. Losing that race produces a wrong **refusal**, never a wrong deletion.
+
+## Other correctness work in this release
+
+- **A safety refusal now happens before the first mutation, not in the footer.** An untrusted or
+  *unknown* state path refuses the run, the installer and the uninstaller with nothing written, and
+  the refusal is reported without writing through the path it just refused.
+- **A scheduler error is no longer read as "no task is registered".** Task lookup is Found, Absent or
+  Failed, and only a positively identified not-found is Absent. The same distinction now blocks
+  removal, rollback and uninstall rather than letting an unanswerable query look clean.
+- **An incomplete directory walk can no longer look like an empty one.** Deployment traversal reports
+  its own completeness, and every decision that depends on it refuses to mutate when it is incomplete.
+- **A kill is only reported when it is proven.** Process-tree termination binds every identity it
+  finds and reports success only when all of them are known to have exited; the installer wrappers no
+  longer time out before the elevated child they started.
+- **Driver deletion and its backup are one commit.** A marker is written before `pnputil` is asked to
+  remove anything and cleared only once the backup record is durable on disk, so an interrupted
+  deletion can never leave an export that a later run mistakes for residue and reclaims.
+- **`cleanmgr` runs exactly the categories you selected.** The `/sagerun` profile is written exact and
+  read back before launch, so handlers a previous `sageset` left enabled are no longer swept along.
 
 > **Upgrading from 1.0.x or 1.1.0?** Read *Breaking changes* first. The scheduled task now runs a
 > machine-wide deployment instead of your checkout, logs moved, and the folder-ACL hardening
