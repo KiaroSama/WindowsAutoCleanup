@@ -24,6 +24,29 @@ $script:ManifestName = 'wac-driver-backup.json'
 $script:StubCall = New-Object 'System.Collections.Generic.List[object]'
 $script:StubResult = @{}
 
+# The stub models the driver STORE, not a recording of one enumeration. A package pnputil really
+# removed has to disappear from the next /enum-drivers, because the step now re-enumerates to prove
+# its own postcondition and a replayed constant would make that proof always fail. Set
+# LeaveInStore on the /delete-driver result to keep a package listed after a reported success -
+# that is the "pnputil lied" case, and it must be reachable.
+$script:StubDeleted = New-Object 'System.Collections.Generic.List[string]'
+
+function Remove-StubDriverFromXml {
+    <#
+    .SYNOPSIS
+        Drops one whole <Driver DriverName="..."> element from rendered enumeration output.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Xml,
+        [Parameter(Mandatory = $true)][string]$DriverName
+    )
+
+    if ([string]::IsNullOrEmpty($Xml)) { return $Xml }
+
+    $pattern = '(?s)[ \t]*<Driver DriverName="' + [regex]::Escape($DriverName) + '">.*?</Driver>\r?\n'
+    return [regex]::Replace($Xml, $pattern, '')
+}
+
 $script:RecordingInvoker = {
     param($FilePath, $ArgumentList, $TimeoutMs)
 
@@ -46,6 +69,21 @@ $script:RecordingInvoker = {
     if ($canned.ContainsKey('ExitCode')) { $exitCode = $canned['ExitCode'] }
     if ($canned.ContainsKey('TimedOut')) { $timedOut = [bool]$canned['TimedOut'] }
     if ($canned.ContainsKey('Out')) { $standardOutput = [string]$canned['Out'] }
+
+    # Exit 0 only: 3010 and 1641 mean the removal finishes at the next restart, so the package is
+    # legitimately still listed until then - which is exactly why the step skips its postcondition
+    # for those codes.
+    if ($key -eq '/delete-driver' -and -not $timedOut -and $exitCode -eq 0 -and $argv.Count -ge 2) {
+        if (-not $canned.ContainsKey('LeaveInStore') -or -not [bool]$canned['LeaveInStore']) {
+            [void]$script:StubDeleted.Add([string]$argv[1])
+        }
+    }
+
+    if ($key -eq '/enum-drivers') {
+        foreach ($gone in @($script:StubDeleted)) {
+            $standardOutput = Remove-StubDriverFromXml -Xml $standardOutput -DriverName $gone
+        }
+    }
 
     # A real /export-driver writes the package into the directory it was given. Without that the
     # export verification would have nothing to verify and every prune case would pass vacuously.
@@ -106,6 +144,7 @@ function Invoke-WithStubbedTool {
 
     $script:StubCall.Clear()
     $script:StubResult = @{}
+    $script:StubDeleted.Clear()
 
     $originalAdmin = Get-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacIsAdministrator'
     Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacIsAdministrator' -Body { return $true }
