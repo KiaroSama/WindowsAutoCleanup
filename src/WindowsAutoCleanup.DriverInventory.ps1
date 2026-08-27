@@ -250,3 +250,66 @@ function Get-WacSupersededDriver {
 
     return @($candidates.ToArray())
 }
+
+function Test-WacDriverPackageRemoved {
+    <#
+    .SYNOPSIS
+        Re-enumerates the driver store and answers whether one package is really gone.
+    .DESCRIPTION
+        pnputil's exit code says the tool believes it succeeded. This asks the store itself, which is
+        the only evidence that survives a tool that reported success and did nothing. It is the
+        POSTCONDITION: nothing may count a package as deleted until this says Removed.
+
+        Deliberately tri-state. "Still there" and "cannot tell" are different answers and must lead
+        to different outcomes - treating an unreadable enumeration as proof of removal would be the
+        same class of defect this check exists to close.
+
+        A caller must NOT invoke this after a reboot-required exit code: the removal is pending a
+        restart, so the package is legitimately still enumerable and Present would be a false alarm.
+    .OUTPUTS
+        State: Removed | Present | Unknown, plus Reason for anything that is not Removed.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$PnpUtil,
+        [Parameter(Mandatory = $true)][string]$DriverName,
+        [Parameter(Mandatory = $true)][int]$TimeoutMs,
+        [string]$Component = 'DriverPrune'
+    )
+
+    $result = [PSCustomObject]@{ State = 'Unknown'; Reason = '' }
+
+    if ($TimeoutMs -le 0) {
+        $result.Reason = 'the run budget was exhausted before the removal could be confirmed'
+        return $result
+    }
+
+    $enum = Invoke-WacProcess -FilePath $PnpUtil -ArgumentList $script:PnpUtilEnumArgument `
+        -TimeoutMs $TimeoutMs -Component $Component
+
+    if ($enum.TimedOut) {
+        $result.Reason = 'the confirming enumeration exceeded its deadline'
+        return $result
+    }
+
+    if ($script:PnpUtilSuccessCode -notcontains $enum.ExitCode) {
+        $result.Reason = 'the confirming enumeration exited with {0}' -f $enum.ExitCode
+        return $result
+    }
+
+    $parsed = ConvertFrom-WacPnpUtilDriverXml -Text ([string]$enum.StandardOutput)
+    if (-not $parsed.IsValid) {
+        $result.Reason = 'the confirming enumeration could not be parsed: {0}' -f $parsed.Reason
+        return $result
+    }
+
+    foreach ($driver in @($parsed.Driver)) {
+        if ([string]::Equals([string]$driver.DriverName, $DriverName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $result.State = 'Present'
+            $result.Reason = 'pnputil reported success but the package is still in the driver store'
+            return $result
+        }
+    }
+
+    $result.State = 'Removed'
+    return $result
+}
