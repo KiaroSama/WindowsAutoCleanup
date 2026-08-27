@@ -320,4 +320,35 @@ Test-Case 'A bootstrap log that cannot be read is a lost audit log, not a silent
     }
 }
 
+Test-Case 'The run budget is measured from the caller start and holds a shutdown margin back' {
+    # Initialize-WacRun armed its deadline from wherever it was called, so everything a caller had
+    # to do FIRST - five module imports, the machine-wide lock, the trust preflight - fell outside
+    # the budget entirely, and the caller had nothing left to write its own verdict with at the far
+    # end. Both ends are asserted here because either one alone would pass a half fix.
+    $sandbox = New-TestSandbox -Prefix 'budget'
+    try {
+        Assert-True (Initialize-WacRun -BaseName 'budget' -CandidateRoot @($sandbox) -BudgetMinutes 10 `
+                -StartUtc ([datetime]::UtcNow.AddMinutes(-9)) -ShutdownMarginSeconds 30) 'the log was not opened'
+
+        # 10 minutes from 9 minutes ago is 1 minute, less a 30 second margin: about 30 seconds left.
+        # Ignoring -StartUtc would leave ~9.5 minutes; ignoring the margin would leave ~60 seconds.
+        $remaining = Get-WacRemainingMs
+        Assert-True ($remaining -gt 20000 -and $remaining -lt 45000) `
+        ('the budget did not run from the caller start with a margin held back: {0} ms left' -f $remaining)
+
+        Close-WacLog
+
+        # And the default is unchanged for a caller with nothing to account for: the installer and
+        # the uninstaller pass neither.
+        Assert-True (Initialize-WacRun -BaseName 'budget2' -CandidateRoot @($sandbox) -BudgetMinutes 10) 'the log was not opened'
+        $plain = Get-WacRemainingMs
+        Assert-True ($plain -gt 570000 -and $plain -le 600000) `
+        ('a caller that names no start instant lost part of its budget: {0} ms left' -f $plain)
+    }
+    finally {
+        Close-WacLog
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun

@@ -43,9 +43,10 @@
          holds the machine-wide lock
       4  elevation was cancelled or failed
       5  unsupported environment (the online system drive is not C:)
-      6  the task and deployment landed, but this run's audit log is not durable
-      7  refused: something at the task path or the deployment path could not be proven to be ours,
-         and it was left exactly as it was found
+      6  refused before any change, or the task and deployment landed, but either way this run's
+         audit log is not durable
+      7  refused: the machine state directory could not be proven machine-trusted, or something at
+         the task path or the deployment path could not be proven ours. Nothing was changed
 #>
 
 # Write-Host is deliberate: the installer is a user-facing console tool and the structured
@@ -78,21 +79,44 @@ $script:ScriptRoot = Split-Path -Parent $PSCommandPath
 $script:LogReady = $false
 $script:InstanceLock = $null
 $script:Relaunched = $false
+$script:Refused = $false
 
-# The elevated child does the whole install; 20 minutes is well beyond a copy plus a registration.
-$script:ElevationTimeoutMs = 1200000
+# The elevated child's own budget, armed by Initialize-WacRun below, and the parent bound derived
+# FROM it. The parent used to wait 20 minutes for a child whose own deadline was 30, and on expiry
+# it returned while that still-mutating elevated child carried on with nobody watching. A wrapper's
+# deadline has to outlast everything the child can legitimately do - operation, rollback and
+# shutdown - or it is not waiting for the child, it is abandoning it.
+$script:RunBudgetMinutes = 30
+$script:ChildShutdownMarginMinutes = 10
+$script:ElevationTimeoutMs = ($script:RunBudgetMinutes + $script:ChildShutdownMarginMinutes) * 60000
 
 Import-Module -Name (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.Core.psm1') -DisableNameChecking -Force -ErrorAction Stop
 Import-Module -Name (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.Deploy.psm1') -DisableNameChecking -Force -ErrorAction Stop
 
+# Dot-sourced, not imported: a module can only hand a script what it EXPORTS, the Deploy package's
+# export list is fixed, and both of these are script-scope bodies rather than module surface. The
+# gate is shared with the uninstaller; the task-lifecycle part belongs to this script alone and
+# calls back into Write-InstallerMessage, which is defined below and resolved when it runs.
+. (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.EntryGate.ps1')
+. (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.InstallerTask.ps1')
+
 function Write-InstallerMessage {
+    <#
+    .SYNOPSIS
+        One line to the console and, unless -NoLog, one structured record to the run log.
+    .DESCRIPTION
+        -NoLog exists for the refusal raised when the directory this run's audit log lives in is not
+        machine-trusted: explaining that refusal through the very path it just refused would be a
+        write into a location a standard user can replace.
+    #>
     param(
         [Parameter(Mandatory = $true)][ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$Level,
         [Parameter(Mandatory = $true)][string]$Message,
-        [hashtable]$Data
+        [hashtable]$Data,
+        [switch]$NoLog
     )
 
-    if ($script:LogReady) {
+    if ($script:LogReady -and -not $NoLog) {
         if ($Data) { Write-WacLog -Level $Level -Component 'Installer' -Message $Message -Data $Data }
         else { Write-WacLog -Level $Level -Component 'Installer' -Message $Message }
     }
@@ -176,7 +200,19 @@ function Invoke-InstallerElevation {
     try { $null = $child.Handle } catch { $null = $_ }
 
     if (-not $child.WaitForExit($script:ElevationTimeoutMs)) {
-        Write-InstallerMessage -Level ERROR -Message 'The elevated installer did not finish inside its deadline; it was left running rather than killed mid-install.' -Data @{ pid = $child.Id; timeoutMs = $script:ElevationTimeoutMs }
+        # Past this point the child has outrun its OWN deadline plus the shutdown margin, so it is
+        # not "still working" - it is wedged. The outcome is reported from proof: Stop-WacProcessTree
+        # returns $true only when the target is known to have exited, and an unelevated parent cannot
+        # terminate an elevated child at all, so the operator is told which of the two happened
+        # instead of the wrapper walking away from a mutating installer in silence.
+        Write-InstallerMessage -Level ERROR -Message 'The elevated installer outran its own budget and the parent deadline.' -Data @{ pid = $child.Id; timeoutMs = $script:ElevationTimeoutMs }
+
+        if (Stop-WacProcessTree -ProcessId $child.Id) {
+            Write-InstallerMessage -Level ERROR -Message 'The elevated installer was terminated and proven gone. The deployment may be mid-install; re-run the installer.'
+        }
+        else {
+            Write-InstallerMessage -Level CRITICAL -Message 'The elevated installer could NOT be proven terminated and may still be running as administrator. Do not re-run the installer until it has exited.' -Data @{ pid = $child.Id }
+        }
         return 1
     }
 
@@ -184,209 +220,6 @@ function Invoke-InstallerElevation {
     try { $code = [int]$child.ExitCode } catch { $code = 1 }
     Write-InstallerMessage -Level INFO -Message 'The elevated installer finished.' -Data @{ exitCode = $code }
     return $code
-}
-
-function Get-InstallerTaskTrigger {
-    param([Parameter(Mandatory = $true)][string]$RunTime)
-
-    $parsed = $null
-    try {
-        $parsed = [datetime]::ParseExact($RunTime, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
-    }
-    catch {
-        throw ("Invalid DailyRunTime '{0}'. Use 24-hour HH:mm, for example '03:00'." -f $RunTime)
-    }
-
-    return (New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.Add($parsed.TimeOfDay)))
-}
-
-function Resolve-ConflictingTask {
-    <#
-    .SYNOPSIS
-        Clears our own registration - current or pre-1.2 - before re-registering, and refuses to
-        touch anyone else's.
-    .DESCRIPTION
-        Register-ScheduledTask -Force is documented only as "without prompting for confirmation";
-        nothing says it overwrites. So the installer explicitly Gets, proves ownership, then
-        Unregisters (ledger P0-4).
-
-        Ledger B2-3 changes two things here. A foreign task at EITHER path is now a REFUSAL rather
-        than a warning-and-carry-on: the pre-1.2 task ran a PATH-resolved host as SYSTEM, so leaving
-        an unrecognised one registered while adding a second one beside it is how a machine ends up
-        running two cleanup tasks, one of them the vulnerable one. And a legacy task that we DID
-        prove and could not remove is fatal too, for the same reason.
-
-        Called BEFORE anything is switched into the live deployment root, and with the machine-wide
-        lock already held, so no cleanup run can start out of the tree between here and the swap.
-    .OUTPUTS
-        Ok, Refused, Reason.
-    #>
-    param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
-
-    $result = [PSCustomObject]@{ Ok = $true; Refused = $false; Reason = $null }
-
-    foreach ($existing in (Get-WacInstalledTask -IncludeLegacy)) {
-        $label = '{0}{1}' -f [string]$existing.TaskPath, [string]$existing.TaskName
-
-        $removal = Remove-WacInstalledTask -Task $existing -DeploymentRoot $DeploymentRoot -AllowLegacyMigration
-        if ($removal.Verified) {
-            Write-InstallerMessage -Level INFO -Message 'Removed the previously registered WindowsAutoCleanup task.' -Data @{
-                task = $label; reason = [string]$removal.Reason
-            }
-            continue
-        }
-
-        if ($removal.Removed) {
-            $result.Ok = $false
-            $result.Reason = ('The task at {0} was unregistered but is still present: {1}' -f $label, [string]$removal.Reason)
-            return $result
-        }
-
-        $result.Ok = $false
-        $result.Refused = $true
-        $result.Reason = ('A task already occupies {0} and it could not be proven to be ours, so it was left untouched and nothing was registered beside it: {1}' -f $label, [string]$removal.Reason)
-        return $result
-    }
-
-    return $result
-}
-
-function Undo-Installation {
-    <#
-    .SYNOPSIS
-        Puts the machine back the way it was after a failure between the swap and the final assert.
-    .DESCRIPTION
-        Unregisters whatever this run registered - through the same ownership proof, so a task that
-        somehow is not ours is left alone rather than deleted on the way out - and restores the
-        deployment tree that Switch-WacDeploymentStage -KeepPrevious set aside.
-    #>
-    param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
-
-    foreach ($task in (Get-WacInstalledTask)) {
-        $removal = Remove-WacInstalledTask -Task $task -DeploymentRoot $DeploymentRoot
-        if ($removal.Verified) {
-            Write-InstallerMessage -Level WARNING -Message 'Rollback: the task registered by this run was unregistered.' -Data @{
-                task = ('{0}{1}' -f $removal.TaskPath, $removal.TaskName)
-            }
-        }
-        else {
-            Write-InstallerMessage -Level CRITICAL -Message 'Rollback could not unregister the task; remove it by hand before re-running.' -Data @{
-                task = ('{0}{1}' -f $removal.TaskPath, $removal.TaskName); reason = [string]$removal.Reason
-            }
-        }
-    }
-
-    $restored = Restore-WacDeploymentPrevious
-    if ($restored.Restored) {
-        Write-InstallerMessage -Level WARNING -Message 'Rollback: the deployment was restored to its previous state.' -Data @{
-            hadPrevious = [bool]$restored.HadPrevious; reason = [string]$restored.Reason
-        }
-    }
-    else {
-        Write-InstallerMessage -Level CRITICAL -Message 'Rollback could not restore the previous deployment.' -Data @{ reason = [string]$restored.Reason }
-    }
-}
-
-function Assert-RegisteredTask {
-    <#
-    .SYNOPSIS
-        Reads the task back and proves every setting the installer asked for actually landed.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$ExpectedHost,
-        [Parameter(Mandatory = $true)][string]$ExpectedArguments,
-        [Parameter(Mandatory = $true)][string]$ExpectedDescription,
-        [Parameter(Mandatory = $true)][string]$ExpectedWorkingDirectory,
-        [Parameter(Mandatory = $true)][string]$ExpectedRunTime
-    )
-
-    $task = $null
-    try {
-        $task = Get-ScheduledTask -TaskName (Get-WacTaskName) -TaskPath (Get-WacTaskFolder) -ErrorAction Stop
-    }
-    catch {
-        throw ("The task was registered without error but cannot be read back: {0}" -f $_.Exception.Message)
-    }
-    if (-not $task) { throw 'The task was registered without error but cannot be read back.' }
-
-    $actions = @($task.Actions)
-    if ($actions.Count -ne 1) {
-        throw ("The registered task has {0} actions instead of exactly one." -f $actions.Count)
-    }
-    $action = $actions[0]
-
-    $checks = @(
-        @{ Name = 'Hidden'; Actual = [string][bool]$task.Settings.Hidden; Expected = 'True' }
-        @{ Name = 'RunLevel'; Actual = [string]$task.Principal.RunLevel; Expected = 'Highest' }
-        @{ Name = 'LogonType'; Actual = [string]$task.Principal.LogonType; Expected = 'ServiceAccount' }
-        @{ Name = 'Compatibility'; Actual = [string]$task.Settings.Compatibility; Expected = 'Win8' }
-        @{ Name = 'MultipleInstances'; Actual = [string]$task.Settings.MultipleInstances; Expected = 'IgnoreNew' }
-        @{ Name = 'StartWhenAvailable'; Actual = [string][bool]$task.Settings.StartWhenAvailable; Expected = 'True' }
-        @{ Name = 'Execute'; Actual = [string]$action.Execute; Expected = $ExpectedHost }
-        @{ Name = 'Arguments'; Actual = [string]$action.Arguments; Expected = $ExpectedArguments }
-        @{ Name = 'Description'; Actual = [string]$task.Description; Expected = $ExpectedDescription }
-    )
-
-    foreach ($check in $checks) {
-        if (-not [string]::Equals([string]$check.Actual, [string]$check.Expected, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw ("The registered task's {0} is '{1}' instead of '{2}'." -f $check.Name, $check.Actual, $check.Expected)
-        }
-    }
-
-    # Compared through the canonicaliser rather than as raw text: the scheduler is free to hand a
-    # directory back with a trailing separator, and a plain string compare would fail an install
-    # that is in fact exactly right.
-    $actualWorking = Get-WacNormalizedPath -Path ([string]$action.WorkingDirectory)
-    $expectedWorking = Get-WacNormalizedPath -Path $ExpectedWorkingDirectory
-    if (-not $actualWorking -or -not $expectedWorking -or ($actualWorking -ine $expectedWorking)) {
-        throw ("The registered task's WorkingDirectory is '{0}' instead of '{1}'." -f [string]$action.WorkingDirectory, $ExpectedWorkingDirectory)
-    }
-
-    # UserId reads back as the account name on some builds and as the SID on others.
-    $userId = [string]$task.Principal.UserId
-    if ($userId -notmatch '(?i)^(SYSTEM|NT AUTHORITY\\SYSTEM|S-1-5-18)$') {
-        throw ("The registered task runs as '{0}' instead of SYSTEM." -f $userId)
-    }
-
-    # ExecutionTimeLimit comes back as an ISO 8601 duration string, not a TimeSpan.
-    $limit = [string]$task.Settings.ExecutionTimeLimit
-    $limitSpan = [timespan]::Zero
-    try { $limitSpan = [System.Xml.XmlConvert]::ToTimeSpan($limit) } catch { $limitSpan = [timespan]::Zero }
-    if ($limitSpan -ne (New-TimeSpan -Hours 4)) {
-        throw ("The registered task's ExecutionTimeLimit is '{0}' instead of 4 hours." -f $limit)
-    }
-
-    # The trigger is asserted too (ledger B2-3): a task registered with the wrong or an extra
-    # trigger runs the cleanup at a time the operator never asked for, and until now nothing read
-    # it back. StartBoundary is an ISO 8601 LOCAL datetime string, not a DateTime.
-    $triggers = @($task.Triggers)
-    if ($triggers.Count -ne 1) {
-        throw ("The registered task has {0} triggers instead of exactly one daily trigger." -f $triggers.Count)
-    }
-    $triggerKind = ''
-    try { $triggerKind = [string]$triggers[0].CimClass.CimClassName } catch { $triggerKind = '' }
-    if ($triggerKind -and $triggerKind -notmatch '(?i)Daily') {
-        throw ("The registered task's trigger is '{0}' instead of a daily trigger." -f $triggerKind)
-    }
-    # Unspecified, and it matters. Measured on both shipped hosts: given '...T20:00:00' the reading
-    # is 20:00, and given an offset form such as '...T20:00:00+02:00' it converts to the equivalent
-    # LOCAL time - which is the time the task will actually fire, and therefore the one to compare
-    # against what the operator asked for. Do not "fix" this to RoundtripKind.
-    $startBoundary = [string]$triggers[0].StartBoundary
-    $startAt = [datetime]::MinValue
-    try { $startAt = [System.Xml.XmlConvert]::ToDateTime($startBoundary, [System.Xml.XmlDateTimeSerializationMode]::Unspecified) }
-    catch { throw ("The registered task's StartBoundary '{0}' is not a datetime." -f $startBoundary) }
-    $actualRunTime = $startAt.ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
-    if (-not [string]::Equals($actualRunTime, $ExpectedRunTime, [System.StringComparison]::Ordinal)) {
-        throw ("The registered task runs daily at '{0}' instead of '{1}'." -f $actualRunTime, $ExpectedRunTime)
-    }
-
-    $ownership = Test-WacTaskIsOurs -Task $task -DeploymentRoot $ExpectedWorkingDirectory
-    if (-not $ownership.IsOurs) {
-        throw ("The registered task does not pass its own ownership proof: {0}" -f $ownership.Reason)
-    }
-
-    return $task
 }
 
 function Invoke-Main {
@@ -402,6 +235,17 @@ function Invoke-Main {
     if (-not $script:InstanceLock) {
         Write-InstallerMessage -Level ERROR -Message 'Another WindowsAutoCleanup operation - a cleanup run, an install or an uninstall - already holds the machine-wide lock.' -Data @{ lock = (Get-WacOperationLockName) }
         return 3
+    }
+
+    # Every trust question this run can be refused on is asked HERE, before the first filesystem,
+    # task or registry change. A false or unknown answer costs nothing but the mutex.
+    $safety = Get-OperationSafetyVerdict -LogHealth (Get-WacLogHealth) -StateTrust (Get-WacStateTrust)
+    if (-not $safety.Ok) {
+        $script:Refused = $true
+        # -NoLog: the path being refused is the one the log lives in, so the refusal must not be
+        # written through it. Nothing below this line runs, so nothing else writes there either.
+        Write-InstallerMessage -Level ERROR -Message $safety.Reason -NoLog
+        return $safety.ExitCode
     }
 
     if (-not (Test-WacSystemDriveSupported)) {
@@ -437,6 +281,17 @@ function Invoke-Main {
         tampered = [bool]$ownership.Tampered; reason = $ownership.Reason
     }
 
+    # Asked before anything is written, and ternary: a scheduler that cannot be queried is not a
+    # machine with no task on it. Staging already clears the .staging and .previous slots, which is
+    # a deletion, so this cannot wait until the conflict is resolved in phase 3.
+    $discovery = Get-WacInstalledTask -IncludeLegacy
+    if ($discovery.State -eq 'Failed') {
+        Write-InstallerMessage -Level ERROR -Message 'Refusing to install: the Task Scheduler could not be queried, so whether a WindowsAutoCleanup task is already registered is unknown. Nothing was staged, swapped or registered.' -Data @{
+            findings = ((@($discovery.Failure | ForEach-Object { '{0}: {1}' -f $_.TaskPath, $_.Reason })) -join '; ')
+        }
+        return 1
+    }
+
     $taskHost = Get-WacCanonicalPowerShellHost
     if (-not $taskHost) {
         Write-InstallerMessage -Level ERROR -Message 'No machine-trusted PowerShell host is available for the task action.'
@@ -469,29 +324,39 @@ function Invoke-Main {
     if (-not $conflict.Ok) {
         Write-InstallerMessage -Level ERROR -Message $conflict.Reason
         [void](Remove-WacDeployment -Path $stage.StagingRoot)
+
+        # Nothing went live, but this phase may already have removed one task before refusing on the
+        # next, or removed one whose disappearance it could not prove. Either way a registration the
+        # machine had is gone and the one that was to replace it will never exist, so whatever was
+        # captured goes back before this returns.
+        foreach ($definition in @($conflict.Captured)) { [void](Restore-CapturedTask -Definition $definition) }
+
         if ($conflict.Refused) { return 7 }
         return 1
     }
 
-    # Phase 4: the swap, then register, then read everything back. The previous tree is KEPT until
-    # the last assertion passes, so any failure from here on is fully reversible.
-    $switched = Switch-WacDeploymentStage -KeepPrevious
+    # Phase 4: the swap, then register, then read everything back - all INSIDE the rollback try. The
+    # swap used to sit outside it, so a failure in the switch itself, or in the walk that proves what
+    # actually went live, returned without restoring anything. The previous tree is KEPT until the
+    # last assertion passes, so every failure from here on is reversible.
+    $registered = $null
     $description = Get-WacTaskDescription
     $arguments = Get-WacTaskActionArgument `
-        -RunScript $switched.RunScript `
+        -RunScript (Join-Path -Path $slots.Root -ChildPath 'Run.ps1') `
         -ResetWindowsUpdateBase ([bool]$ResetWindowsUpdateBase) `
         -PruneSupersededDrivers:$PruneSupersededDrivers `
         -EnableLegacyDiskCleanup:$EnableLegacyDiskCleanup
 
-    $registered = $null
     try {
-        $live = Get-WacDeploymentOwnership -DeploymentRoot $switched.DeploymentRoot
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+
+        $live = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
         if ($live.Kind -ne 'Managed' -or $live.Tampered) {
             throw ("What went live does not match the manifest that was staged: {0}" -f $live.Reason)
         }
 
         $definition = New-ScheduledTask `
-            -Action (New-ScheduledTaskAction -Execute $taskHost -Argument $arguments -WorkingDirectory $switched.DeploymentRoot) `
+            -Action (New-ScheduledTaskAction -Execute $taskHost -Argument $arguments -WorkingDirectory $slots.Root) `
             -Trigger $trigger `
             -Principal (New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest) `
             -Settings (New-ScheduledTaskSettingsSet `
@@ -510,12 +375,16 @@ function Invoke-Main {
         Register-ScheduledTask -TaskName (Get-WacTaskName) -TaskPath (Get-WacTaskFolder) -InputObject $definition -ErrorAction Stop | Out-Null
 
         $registered = Assert-RegisteredTask -ExpectedHost $taskHost -ExpectedArguments $arguments `
-            -ExpectedDescription $description -ExpectedWorkingDirectory $switched.DeploymentRoot -ExpectedRunTime $DailyRunTime
+            -ExpectedDescription $description -ExpectedWorkingDirectory $slots.Root -ExpectedRunTime $DailyRunTime
     }
     catch {
-        Write-InstallerMessage -Level ERROR -Message ('The task could not be registered and verified: {0}' -f $_.Exception.Message)
-        Undo-Installation -DeploymentRoot $switched.DeploymentRoot
-        Write-InstallerMessage -Level ERROR -Message 'Final status: failed and rolled back. No WindowsAutoCleanup task is registered; re-run the installer once the cause above is fixed.'
+        Write-InstallerMessage -Level ERROR -Message ('The installation could not be completed: {0}' -f $_.Exception.Message)
+        if (Undo-Installation -DeploymentRoot $slots.Root -CapturedTask @($conflict.Captured)) {
+            Write-InstallerMessage -Level ERROR -Message 'Final status: failed and rolled back. The machine is as it was before this run; re-run the installer once the cause above is fixed.'
+        }
+        else {
+            Write-InstallerMessage -Level CRITICAL -Message 'Final status: failed and the rollback is INCOMPLETE. Read the CRITICAL lines above before re-running the installer.'
+        }
         return 1
     }
 
@@ -525,7 +394,7 @@ function Invoke-Main {
         task = ('{0}{1}' -f $registered.TaskPath, $registered.TaskName)
         execute = $taskHost
         arguments = $arguments
-        workingDirectory = $switched.DeploymentRoot
+        workingDirectory = $slots.Root
         dailyRunTime = $DailyRunTime
         executionTimeLimit = [string]$registered.Settings.ExecutionTimeLimit
     }
@@ -552,7 +421,7 @@ function Invoke-Main {
     return 0
 }
 
-$script:LogReady = Initialize-WacRun -BaseName 'Install-WindowsAutoCleanupTask' -BudgetMinutes 30
+$script:LogReady = Initialize-WacRun -BaseName 'Install-WindowsAutoCleanupTask' -BudgetMinutes $script:RunBudgetMinutes
 if (-not $script:LogReady) {
     Write-Host '[WARNING] No log file could be created; continuing with console output only.' -ForegroundColor Yellow
 }
@@ -585,8 +454,10 @@ finally {
     # when logging failed, and Split-Path -Parent $null is a TERMINATING parameter-binding error on
     # both shipped hosts (measured). The old spelling therefore crashed the cleanup of the very run
     # that was in the middle of reporting a log failure.
+    # Skipped after a refusal: the verdict that refused the run can BE that this directory is not
+    # machine-trusted, and pruning files inside it would be a delete through the refused path.
     $logDirectory = Get-WacLogDirectory
-    if ($logDirectory) {
+    if ($logDirectory -and -not $script:Refused) {
         [void](Remove-WacOldLog -LogDirectory $logDirectory -Pattern 'Install-WindowsAutoCleanupTask_*.log' -KeepCount 30)
     }
     Close-WacLog

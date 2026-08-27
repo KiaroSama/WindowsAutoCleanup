@@ -50,6 +50,9 @@
     Total internal run budget. Must stay below the scheduled task's execution time limit (4 hours),
     because every step's timeout is clamped to whatever is left of this budget.
 
+    It is measured from process start, so loading the modules and reaching the trust preflight come
+    out of it, and the last 30 seconds are held back so the run can always write its own verdict.
+
 .PARAMETER MutexName
     Overrides the machine-wide single-instance mutex name. Only tests should use this.
 
@@ -120,6 +123,15 @@ $script:ScriptRoot = Split-Path -Parent $script:ScriptPath
 $script:Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $script:ExitCode = 0
 
+# The budget is measured from HERE rather than from wherever Initialize-WacRun happens to arm it.
+# Loading five modules, taking the lock and reaching the trust verdict is work this run performs,
+# and a budget that starts after them is a budget that does not cover them. The margin is taken off
+# the other end for the same reason: a run that spends its final millisecond inside a cleanup step
+# has nothing left to write its own verdict with, and an unwritten verdict is the one failure mode
+# the whole exit-code contract exists to prevent.
+$script:StartUtc = (Get-Date).ToUniversalTime()
+$script:CleanupMarginSeconds = 30
+
 # ------------------------------------------------------------------------------------------------
 # Bootstrap logging
 #
@@ -173,6 +185,84 @@ function Remove-WacBootstrapLog {
     try { [System.IO.File]::Delete($script:BootstrapLogPath) } catch { $null = $_ }
 }
 
+# ------------------------------------------------------------------------------------------------
+# The machine-wide operation lock
+#
+# Taken HERE, before the first Import-Module, and not where the run used to take it. ONE lock covers
+# a cleanup run, an install and an uninstall, and an installer that holds it is free to replace the
+# very deployment this script is about to load its modules out of - so a lock taken after the import
+# does not protect the import, which is the part that most needs it.
+#
+# It is acquired before the elevation gate and released again if this run turns out to be the
+# unelevated parent of a relaunch, because the elevated child re-runs this script and takes the same
+# lock. Failing to acquire it is NOT reported here: exit 3 belongs in the durable audit log, and
+# there is no log until Initialize-WacRun has run.
+#
+# ponytail: a second, deliberately minimal copy of Core's Enter-WacSingleInstance. Nothing under
+# src\ may be loaded before the lock exists and Core lives under src\, so the alternative is no lock
+# at this point at all. Keep the two in step - Core's copy carries the reasoning behind each branch.
+# ------------------------------------------------------------------------------------------------
+
+$script:OperationLock = $null
+
+function Enter-WacBootstrapLock {
+    <#
+    .SYNOPSIS
+        Takes the machine-wide operation lock, or returns $null when another operation owns it.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $mutex = $null
+    try {
+        $createdNew = $false
+        $mutex = New-Object System.Threading.Mutex($false, $Name, [ref]$createdNew)
+    }
+    catch {
+        Write-WacBootstrapLine -Message ('The machine-wide lock {0} could not be created: {1}' -f $Name, $_.Exception.Message)
+        return $null
+    }
+
+    $owned = $false
+    try {
+        $owned = $mutex.WaitOne(0)
+    }
+    catch {
+        # AbandonedMutexException means a previous operation died holding the lock and WE NOW OWN IT.
+        # WaitOne is a .NET method, so the exception can arrive wrapped in a
+        # MethodInvocationException; treating that as "not acquired" would make every run after a
+        # crash exit 3 and never clean again.
+        $exception = $_.Exception
+        while ($exception -and
+               ($exception -is [System.Management.Automation.MethodInvocationException]) -and
+               $exception.InnerException) {
+            $exception = $exception.InnerException
+        }
+        $owned = ($exception -is [System.Threading.AbandonedMutexException])
+    }
+
+    if (-not $owned) {
+        try { $mutex.Dispose() } catch { $null = $_ }
+        return $null
+    }
+
+    return $mutex
+}
+
+function Exit-WacBootstrapLock {
+    <#
+    .SYNOPSIS
+        Releases the operation lock. Idempotent, and safe before any module exists.
+    #>
+    if (-not $script:OperationLock) { return }
+
+    $lock = $script:OperationLock
+    $script:OperationLock = $null
+    try { $lock.ReleaseMutex() } catch { $null = $_ }
+    try { $lock.Dispose() } catch { $null = $_ }
+}
+
+$script:OperationLock = Enter-WacBootstrapLock -Name $MutexName
+
 $moduleRoot = Join-Path -Path $script:ScriptRoot -ChildPath 'src'
 $script:ImportFailure = New-Object 'System.Collections.Generic.List[string]'
 foreach ($moduleName in @('Core', 'FileSystem', 'Targets', 'Steps', 'Drivers')) {
@@ -193,6 +283,19 @@ foreach ($moduleName in @('Core', 'FileSystem', 'Targets', 'Steps', 'Drivers')) 
             $moduleName, $modulePath, $_.Exception.Message)
         [void]$script:ImportFailure.Add($moduleName)
     }
+}
+
+# The run's own report - the header, the shared outcome model and the footer - is DOT-SOURCED, not
+# imported: it reads and writes this script's $script: state, and an imported module would get its
+# own copy of all of it. It is treated exactly like a required module, because a run that cannot
+# state its verdict must not clean.
+$reportPart = Join-Path -Path $moduleRoot -ChildPath 'WindowsAutoCleanup.RunReport.ps1'
+try {
+    . $reportPart
+}
+catch {
+    Write-WacBootstrapLine -Message ('The run report part failed to load from {0}: {1}' -f $reportPart, $_.Exception.Message)
+    [void]$script:ImportFailure.Add('RunReport')
 }
 
 if ($script:ImportFailure.Contains('Core')) {
@@ -258,6 +361,11 @@ function Invoke-WacElevatedRelaunch {
         host = $host51; args = $commandLine
     }
 
+    # The child re-runs this script and takes the SAME machine-wide lock, so the parent has to let
+    # go of it first or the elevated run it just started would be refused by its own parent. Nothing
+    # below this line mutates anything: the parent waits, reports the child's verdict and exits.
+    Exit-WacBootstrapLock
+
     try {
         # -ArgumentList joins an array without quoting, which corrupts any path containing a space.
         # A single pre-quoted command line is the only reliable shape here.
@@ -277,11 +385,17 @@ function Invoke-WacElevatedRelaunch {
     if (-not $process.WaitForExit($waitMs)) {
         Write-WacLog -Level CRITICAL -Component 'Elevation' -Message 'The elevated child exceeded the run budget; terminating its process tree.' -Data @{ pid = $process.Id }
 
-        # Stop-WacProcessTree binds a real kernel handle, so $false is not "probably fine": it means
-        # termination could not be ESTABLISHED and the child may still be running. Discarding that
-        # answer is what made a leaked cleanup process indistinguishable from a clean kill.
-        if (-not (Stop-WacProcessTree -ProcessId $process.Id)) {
-            Write-WacLog -Level CRITICAL -Component 'Elevation' -Message 'Termination of the elevated child could not be established; it may still be running.' -Data @{ pid = $process.Id }
+        # Stop-WacProcessTree binds a real kernel handle to the child AND to every descendant it
+        # can see, so Proven=$false is not "probably fine": it means termination could not be
+        # ESTABLISHED and part of the tree may still be deleting files. Discarding that answer is
+        # what made a leaked cleanup process indistinguishable from a clean kill.
+        $stopped = Stop-WacProcessTree -ProcessId $process.Id
+        if (-not $stopped.Proven) {
+            Write-WacLog -Level CRITICAL -Component 'Elevation' -Message 'Termination of the elevated child could not be established; it may still be running.' -Data @{
+                pid = $process.Id
+                survivors = (@($stopped.Survivor) -join ',')
+                reason = [string]$stopped.Reason
+            }
         }
 
         # Either way the child never finished the work it was started for: Incomplete, not success
@@ -295,246 +409,20 @@ function Invoke-WacElevatedRelaunch {
     return $childExit
 }
 
-function Write-WacRunHeader {
-    param([Parameter(Mandatory = $true)][string]$LogPath)
-
-    $edition = if ($PSVersionTable.ContainsKey('PSEdition')) { [string]$PSVersionTable.PSEdition } else { 'Desktop' }
-    $hostPath = $null
-    try { $hostPath = [string](Get-Process -Id $PID -ErrorAction Stop).Path } catch { $hostPath = $null }
-
-    Write-WacLog -Level INFO -Component 'Run' -Message 'WindowsAutoCleanup started.' -Data @{
-        version     = $script:Version
-        executionId = Get-WacExecutionId
-        logPath     = $LogPath
-        scriptRoot  = $script:ScriptRoot
-        scheduled   = [bool]$Scheduled
-        elevated    = (Test-WacIsAdministrator)
-        psVersion   = [string]$PSVersionTable.PSVersion
-        psEdition   = $edition
-        psHost      = $hostPath
-        budgetMin   = $BudgetMinutes
-        logLevel    = $LogLevel
-    }
-
-    try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        Write-WacLog -Level INFO -Component 'Run' -Message 'Operating system.' -Data @{
-            caption = [string]$os.Caption; build = [string]$os.BuildNumber; server = (Test-WacIsWindowsServer)
-        }
-    }
-    catch {
-        Write-WacLog -Level WARNING -Component 'Run' -Message 'Could not query the operating system version.' -Data @{ error = $_.Exception.Message }
-    }
-
-    Write-WacLog -Level INFO -Component 'Run' -Message 'Configuration.' -Data @{
-        scope                   = 'C: only'
-        resetWindowsUpdateBase  = [bool]$ResetWindowsUpdateBase
-        pruneSupersededDrivers  = [bool]$PruneSupersededDrivers
-        enableLegacyDiskCleanup = [bool]$EnableLegacyDiskCleanup
-        skipRecycleBin          = [bool]$SkipRecycleBin
-        skipCategory            = ($SkipCategory -join ',')
-    }
-
-    if ($SkipAclHardening) {
-        Write-WacLog -Level WARNING -Component 'Run' -Message '-SkipAclHardening is deprecated and ignored; the ACL hardening capability was removed in v1.2.0.'
-    }
-}
-
-# ------------------------------------------------------------------------------------------------
-# The run outcome
-#
-# Every module reports in one five-value vocabulary. Rank is the RUN-level precedence - a single
-# security refusal outranks any number of failures, a failure outranks incomplete work, and only a
-# run with none of the three exits 0. Succeeded and SafeSkip share rank 0 on purpose: a step that
-# was correctly not run (an opt-in that is off, a tool that is absent) is not a defect.
-# ------------------------------------------------------------------------------------------------
-
-$script:OutcomeRank = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 1; 'Failed' = 2; 'SecurityRefusal' = 3 }
-$script:OutcomeExitCode = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 6; 'Failed' = 2; 'SecurityRefusal' = 7 }
-
-# The level the run's verdict and the evidence behind it are written at, decided by the OUTCOME.
-# -LogLevel is the operator's choice about detail; it is not a choice to lose the verdict. A footer
-# hard-wired to INFO/WARNING wrote 'status=SecurityRefusal exitCode=7' into a log that -LogLevel
-# ERROR then dropped on the floor, leaving the audit log of a refusing run empty. CRITICAL is the
-# highest level the parameter accepts, so it is the only one no setting can gate out.
-$script:OutcomeLogLevel = @{
-    'Succeeded' = 'INFO'; 'SafeSkip' = 'INFO'
-    'Incomplete' = 'CRITICAL'; 'Failed' = 'CRITICAL'; 'SecurityRefusal' = 'CRITICAL'
-}
-
-function Get-WacHigherRunOutcome {
-    <#
-    .SYNOPSIS
-        The higher-precedence of two outcomes. Pure.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Current,
-        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Candidate
-    )
-
-    if ($script:OutcomeRank[$Candidate] -gt $script:OutcomeRank[$Current]) { return $Candidate }
-    return $Current
-}
-
-function Get-WacStepOutcome {
-    <#
-    .SYNOPSIS
-        One step result's outcome. Fails closed on a result that does not state one.
-    .DESCRIPTION
-        .Outcome is the contract and the Succeeded/Skipped/Failed booleans are derived from it, so
-        the outcome is the only thing worth reading: those booleans cannot express Incomplete or
-        SecurityRefusal, and deriving from them would exit 2 for work that was merely unfinished.
-
-        A step that states no outcome is one this mapping cannot classify, and an unclassifiable
-        step is not a success. Strict mode makes a missing property a terminating error, so the
-        property is proven present rather than probed by reading it.
-    #>
-    param([Parameter(Mandatory = $true)]$Step)
-
-    if (@($Step.PSObject.Properties.Name) -ccontains 'Outcome') { return [string]$Step.Outcome }
-    return 'Failed'
-}
-
-function Write-WacRunFooter {
-    <#
-    .SYNOPSIS
-        Writes the run's summary lines and returns the process exit code.
-    .DESCRIPTION
-        The exit code is the run's WORST outcome, not a count of failures. Incomplete work used to
-        exit 0: a run that stopped at its budget, that hit a step deadline, or that could not
-        produce the durable audit log it was asked for, all reported success.
-
-        The benign counters are deliberately NOT inputs. A real elevated run scores skipReparse and
-        skipOutOfRoot on the shipped allow-list with nothing wrong (measured: 3 and 1), so keying a
-        refusal off them would make every healthy run refuse. Only the Refused* pair - a path that
-        failed its identity or containment re-check while it was still there - and a non-trusted
-        state directory can reach 7.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$TargetResult,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$StepResult,
-        [Nullable[Int64]]$FreeBytesBefore,
-        [Nullable[Int64]]$FreeBytesAfter,
-        [bool]$RebootRequired
-    )
-
-    $script:Stopwatch.Stop()
-
-    $totals = [ordered]@{
-        files = 0L; dirs = 0L; links = 0L; bytes = 0L; queuedForReboot = 0L
-        skipLocked = 0L; skipDenied = 0L; skipNotEmpty = 0L; skipReparse = 0L
-        skipProtected = 0L; skipOutOfRoot = 0L; skipVanished = 0L; skipDeadline = 0L; failed = 0L
-        # The two counters that decide a security refusal, and the two step outcomes that used to be
-        # invisible here because the derived Failed flag swallowed them.
-        refusedIdentity = 0L; refusedOutOfRoot = 0L; stepIncomplete = 0L; stepRefused = 0L
-    }
-
-    foreach ($result in $TargetResult) {
-        $totals.files += $result.FilesDeleted
-        $totals.dirs += $result.DirectoriesDeleted
-        $totals.links += $result.ReparsePointsDeleted
-        $totals.bytes += $result.BytesDeleted
-        $totals.queuedForReboot += $result.PendingDeletes
-        $totals.skipLocked += $result.SkippedLocked
-        $totals.skipDenied += $result.SkippedDenied
-        $totals.skipNotEmpty += $result.SkippedNotEmpty
-        $totals.skipReparse += $result.SkippedReparse
-        $totals.skipProtected += $result.SkippedProtected
-        $totals.skipOutOfRoot += $result.SkippedOutOfRoot
-        $totals.skipVanished += $result.SkippedVanished
-        $totals.skipDeadline += $result.SkippedDeadline
-        $totals.failed += $result.Failed
-        $totals.refusedIdentity += $result.RefusedIdentity
-        $totals.refusedOutOfRoot += $result.RefusedOutOfRoot
-    }
-
-    $outcome = 'Succeeded'
-
-    # Each step already logged itself through Write-WacStepResult as it completed, so the footer only
-    # rolls its outcome into the totals rather than repeating every line.
-    foreach ($step in $StepResult) {
-        $stepOutcome = Get-WacStepOutcome -Step $step
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate $stepOutcome
-
-        if ($stepOutcome -ceq 'Failed') { $totals.failed++ }
-        elseif ($stepOutcome -ceq 'Incomplete') { $totals.stepIncomplete++ }
-        elseif ($stepOutcome -ceq 'SecurityRefusal') { $totals.stepRefused++ }
-    }
-
-    if ($totals.failed -gt 0) { $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Failed' }
-    if ($totals.skipDeadline -gt 0) { $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete' }
-    if (($totals.refusedIdentity + $totals.refusedOutOfRoot) -gt 0) {
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'SecurityRefusal'
-    }
-
-    $delta = $null
-    if ($null -ne $FreeBytesBefore -and $null -ne $FreeBytesAfter) { $delta = [int64]($FreeBytesAfter - $FreeBytesBefore) }
-    Write-WacLog -Level INFO -Component 'Summary' -Message 'Free space on C:.' -Data @{
-        before = (Format-WacBytes -Bytes $FreeBytesBefore)
-        after  = (Format-WacBytes -Bytes $FreeBytesAfter)
-        delta  = (Format-WacBytes -Bytes $delta)
-    }
-
-    if ($RebootRequired) {
-        Write-WacLog -Level WARNING -Component 'Summary' -Message 'A reboot is required to finish at least one cleanup step.'
-    }
-    if ($totals.queuedForReboot -gt 0) {
-        Write-WacLog -Level INFO -Component 'Summary' -Message 'Locked items were queued for deletion at the next boot. Windows only records the pending operation; it does not guarantee the delete will succeed.' -Data @{ queued = $totals.queuedForReboot }
-    }
-
-    # The three run-level sources no step or target result carries.
-    if (Test-WacDeadlineExpired) {
-        Write-WacLog -Level $script:OutcomeLogLevel['Incomplete'] -Component 'Summary' -Message 'The run budget expired, so not everything this run was asked to do was attempted.'
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete'
-    }
-
-    $logHealth = Get-WacLogHealth
-    if (-not $logHealth.IsDurable) {
-        Write-WacLog -Level $script:OutcomeLogLevel['Incomplete'] -Component 'Summary' -Message 'The durable audit log this run was asked to produce is incomplete.' -Data @{
-            reason = [string]$logHealth.Reason; fallback = [string]$logHealth.FallbackKind; failedWrites = $logHealth.FailedWrites
-        }
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete'
-    }
-
-    # $null is NOT EVALUATED, which is the correct answer for an unelevated run whose log lives in
-    # the invoking user's own profile. It must never refuse anything; only a verdict that was
-    # actually reached and came back untrusted can.
-    $stateTrust = Get-WacStateTrust
-    if ($null -ne $stateTrust -and -not $stateTrust.IsTrusted) {
-        Write-WacLog -Level $script:OutcomeLogLevel['SecurityRefusal'] -Component 'Summary' -Message 'The directory holding this run state and audit log is not machine-trusted.' -Data @{
-            path = [string]$stateTrust.Path; reason = [string]$stateTrust.Reason
-        }
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'SecurityRefusal'
-    }
-
-    $exitCode = [int]$script:OutcomeExitCode[$outcome]
-    $statusLevel = [string]$script:OutcomeLogLevel[$outcome]
-
-    # The totals are written HERE, not where they are computed: they carry refusedIdentity,
-    # refusedOutOfRoot, stepIncomplete and stepRefused - the evidence for whatever the verdict
-    # turned out to be - so they are written at the verdict's level and cannot outlive it.
-    Write-WacLog -Level $statusLevel -Component 'Summary' -Message 'Cleanup totals.' -Data ([hashtable]$totals)
-
-    Write-WacLog -Level $statusLevel -Component 'Run' -Message 'Final status.' -Data @{
-        status = $outcome
-        exitCode = $exitCode
-        elapsed = $script:Stopwatch.Elapsed.ToString('hh\:mm\:ss')
-        remainingBudgetMs = (Get-WacRemainingMs)
-    }
-
-    return $exitCode
-}
 
 # ------------------------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------------------------
 
 $script:Version = '1.2.0'
-$mutex = $null
 
 try {
+    # -StartUtc and -ShutdownMarginSeconds are what make the budget cover this run rather than the
+    # part of it that happens to come after this line. Module import, the machine-wide lock and the
+    # trust preflight all ran before it; the footer still has to run after it.
     $logInitialised = Initialize-WacRun -BaseName 'WindowsAutoCleanup' -LogLevel $LogLevel -BudgetMinutes $BudgetMinutes `
-        -BootstrapLogPath $script:BootstrapLogPath
+        -BootstrapLogPath $script:BootstrapLogPath -StartUtc $script:StartUtc `
+        -ShutdownMarginSeconds $script:CleanupMarginSeconds
     if (-not $logInitialised) {
         Write-Error ('No log file could be created in any candidate location; refusing to run silently. Any pre-import failure is in {0}.' -f $script:BootstrapLogPath)
         exit 1
@@ -570,11 +458,23 @@ try {
         exit 5
     }
 
-    $mutex = Enter-WacSingleInstance -Name $MutexName
-    if (-not $mutex) {
+    # Taken in the bootstrap, before the first Import-Module; reported here, because exit 3 belongs
+    # in the durable audit log and there was no log to write it to back then.
+    if (-not $script:OperationLock) {
         # Benign as an event, and still the only thing this run will ever say about why it exited 3.
-        Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Another WindowsAutoCleanup run already holds the machine-wide lock; exiting without mutating anything.' -Data @{ mutex = $MutexName }
+        Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Another WindowsAutoCleanup operation already holds the machine-wide lock; exiting without mutating anything.' -Data @{ mutex = $MutexName }
         exit 3
+    }
+
+    # THE GATE. Everything below this line mutates the machine - log retention deletes files, the
+    # Delivery Optimization cmdlet purges a cache, the sweep deletes, DISM and pnputil and cleanmgr
+    # run. So the run-level verdicts are reached HERE, on the state this run started in, and a
+    # refusal costs nothing because nothing has happened yet. They are asked again in the footer for
+    # what changes during the run.
+    $preflight = Get-WacRunLevelOutcome -Current 'Succeeded'
+    if ($script:OutcomeRank[$preflight] -gt 0) {
+        Write-WacLog -Level CRITICAL -Component 'Run' -Message 'A pre-cleanup check refused this run; nothing on this machine was mutated.' -Data @{ outcome = $preflight }
+        exit (Write-WacRunVerdict -Outcome $preflight)
     }
 
     # Get-WacLogDirectory, not Split-Path -Parent (Get-WacLogPath): a null path is a TERMINATING
@@ -582,7 +482,7 @@ try {
     # step on exactly the path where logging had already failed.
     [void](Remove-WacOldLog -LogDirectory (Get-WacLogDirectory) -Pattern 'WindowsAutoCleanup_*.log' -KeepCount 30)
 
-    $freeBefore = Get-WacFreeBytes -Drive 'C:'
+    $freeBefore = Get-WacRunTelemetry -What 'free space on C:' -Probe { Get-WacFreeBytes -Drive 'C:' }
     $targetResults = New-Object 'System.Collections.Generic.List[object]'
     $stepResults = New-Object 'System.Collections.Generic.List[object]'
     $effectiveSkip = New-Object 'System.Collections.Generic.List[string]'
@@ -597,7 +497,19 @@ try {
         [void]$effectiveSkip.Add('Delivery Optimization cache')
     }
 
-    foreach ($target in (Get-WacCleanupTarget -SkipCategory @($effectiveSkip.ToArray()))) {
+    # Get-WacCleanupTargetSet, not the bare builder. Building the list walks every profile's Edge
+    # directory and queries Win32_UserProfile through CIM, both of which block in the OS and are
+    # therefore outside every cooperative deadline check behind them. The bounded form returns an
+    # OUTCOME beside the list, which is the distinction the bare call cannot make: an empty
+    # allow-list and an allow-list that was never finished look identical, and the second one must
+    # not be reported as "nothing to clean" on a successful run. It is recorded as a step, so an
+    # Incomplete or Failed discovery reaches the footer's verdict like any other unfinished work.
+    $targetSet = Get-WacCleanupTargetSet -SkipCategory @($effectiveSkip.ToArray())
+    [void]$stepResults.Add((Write-WacStepResult -Component 'Targets' -Result (New-WacStepResult `
+        -Category 'Cleanup allow-list' -Outcome ([string]$targetSet.Outcome) -Attempted $true `
+        -Detail ([string]$targetSet.Detail) -DurationMs ([int]$targetSet.DurationMs))))
+
+    foreach ($target in @($targetSet.Target)) {
         if (Test-WacDeadlineExpired) {
             Write-WacLog -Level WARNING -Component 'Run' -Message 'The run budget expired; the remaining allow-list targets were not attempted.'
             break
@@ -643,7 +555,7 @@ try {
         [void]$stepResults.Add((Clear-WacRecycleBin))
     }
 
-    $freeAfter = Get-WacFreeBytes -Drive 'C:'
+    $freeAfter = Get-WacRunTelemetry -What 'free space on C:' -Probe { Get-WacFreeBytes -Drive 'C:' }
     $rebootRequired = @($stepResults | Where-Object { $_.RebootRequired }).Count -gt 0
 
     # The footer owns the mapping: the run exits on its worst outcome, not on a failure count.
@@ -660,6 +572,10 @@ catch {
     exit 1
 }
 finally {
-    Exit-WacSingleInstance -Mutex $mutex
+    # The log is closed BEFORE the lock is released. Anything waiting on the lock is the next
+    # operation on this machine - an installer replacing this deployment, the uninstaller removing
+    # it - and letting it start while this run still has an open handle on its own audit log is how
+    # a run ends up without the record of how it ended.
     Close-WacLog
+    Exit-WacBootstrapLock
 }

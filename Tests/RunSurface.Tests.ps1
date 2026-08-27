@@ -429,9 +429,25 @@ Test-Case 'The five modules import together and every Wac command Run.ps1 calls 
             $name = $node.GetCommandName()
             if ($name -and $name -match '^[A-Za-z]+-Wac[A-Za-z]+$') { $called[$name] = $true }
         }
-        foreach ($node in $script:RunAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
-            # Run.ps1 declares a few helpers of its own; those are not part of the module surface.
-            if ($called.ContainsKey($node.Name)) { [void]$called.Remove($node.Name) }
+        # Run.ps1 declares a few helpers of its own, and dot-sources one more file of them:
+        # WindowsAutoCleanup.RunReport.ps1 holds the header, the outcome model and the footer, which
+        # read this script's own $script: state and so cannot be a module. Neither set is part of
+        # the module surface. The dot-source is asserted below, so this is an exclusion for code
+        # that really is loaded and not a hole to hide an unresolved call in.
+        $reportPath = Join-Path -Path $script:SrcRoot -ChildPath 'WindowsAutoCleanup.RunReport.ps1'
+        Assert-True (Test-Path -LiteralPath $reportPath -PathType Leaf) ('the run report part is missing: ' + $reportPath)
+        Assert-True ([System.IO.File]::ReadAllText($script:RunPath).Contains("'WindowsAutoCleanup.RunReport.ps1'")) `
+            'Run.ps1 no longer loads the run report part, so its header and footer are undefined'
+
+        $reportErrors = $null
+        $reportTokens = $null
+        $reportAst = [System.Management.Automation.Language.Parser]::ParseFile($reportPath, [ref]$reportTokens, [ref]$reportErrors)
+        Assert-Equal 0 (@($reportErrors).Count) 'the run report part does not parse'
+
+        foreach ($ast in @($script:RunAst, $reportAst)) {
+            foreach ($node in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                if ($called.ContainsKey($node.Name)) { [void]$called.Remove($node.Name) }
+            }
         }
 
         $names = @($called.Keys | Sort-Object)

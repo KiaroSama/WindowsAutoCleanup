@@ -71,7 +71,15 @@ function New-WacDeploymentManifest {
     $entries = New-Object 'System.Collections.Generic.List[object]'
     $prefix = $StagingRoot.TrimEnd('\') + '\'
 
-    foreach ($item in @(Get-WacDeploymentItem -Root $StagingRoot)) {
+    # A manifest built from a walk that did not see the whole tree records fewer files than the tree
+    # holds, and every later check reads that short list as the truth about it.
+    $walk = Get-WacDeploymentItem -Root $StagingRoot
+    if (-not $walk.Complete) {
+        throw ("The staged tree could not be fully enumerated, so no manifest can describe it: {0}" -f
+            ((@($walk.Failure | ForEach-Object { '{0}: {1}' -f $_.Path, $_.Reason }) | Select-Object -First 3) -join '; '))
+    }
+
+    foreach ($item in @($walk.Entry)) {
         if ($item.IsDirectory) { continue }
         if ($item.IsReparsePoint) { throw ("The staged tree contains a reparse point: {0}" -f $item.Path) }
 
@@ -135,6 +143,9 @@ function Get-WacDeploymentOwnership {
         mutation has to ask first. Four kinds:
 
           Absent    - nothing is there. Safe to create.
+          Indeterminate - something is there and it could not be read. Refused: an unreadable
+                      directory used to enumerate as EMPTY, which walked straight into the
+                      pre-manifest adoption below and reported it as ours to replace and delete.
           Managed   - our manifest is there and its project id matches. Safe to replace or remove.
           Unmanaged - no manifest, but the top level holds ONLY the names this project deploys and
                       an empty directory or one carrying Run.ps1. That is what every deployment made
@@ -200,8 +211,21 @@ function Get-WacDeploymentOwnership {
 
     # The top level is checked before the manifest is trusted: a foreign directory could carry a
     # copied manifest, and the layout is what makes that copy implausible.
+    #
+    # -ErrorAction Stop, and its own verdict when that fails. SilentlyContinue answered an
+    # unreadable directory with an empty list, and an empty list is indistinguishable here from a
+    # directory that really holds nothing - so a deployment path nothing could read reached the
+    # pre-manifest adoption below and came back Unmanaged and IsOurs.
+    $topLevel = @()
+    try { $topLevel = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop) }
+    catch {
+        $result.Kind = 'Indeterminate'
+        $result.Reason = ('The deployment directory could not be enumerated, so nothing about it can be proven: {0}' -f $_.Exception.Message)
+        return $result
+    }
+
     $unexpected = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($entry in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+    foreach ($entry in $topLevel) {
         $known = $false
         foreach ($name in $script:DeploymentTopLevelName) {
             if ([string]::Equals([string]$entry.Name, $name, [System.StringComparison]::OrdinalIgnoreCase)) { $known = $true; break }
@@ -219,7 +243,7 @@ function Get-WacDeploymentOwnership {
     $manifest = Read-WacDeploymentManifest -DeploymentRoot $root
     if (-not $manifest) {
         $hasRun = Test-Path -LiteralPath (Join-Path -Path $root -ChildPath 'Run.ps1') -PathType Leaf
-        $isEmpty = (@(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue).Count -eq 0)
+        $isEmpty = ($topLevel.Count -eq 0)
         if (-not $hasRun -and -not $isEmpty) {
             $result.Reason = 'The directory carries no deployment manifest and no Run.ps1, so it cannot be proven ours.'
             return $result
@@ -309,9 +333,25 @@ function Test-WacDeploymentTrusted {
 
     $untrusted = New-Object 'System.Collections.Generic.List[object]'
     $toCheck = New-Object 'System.Collections.Generic.List[string]'
+    $checkedSet = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $reported = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
     [void]$toCheck.Add($root)
 
-    foreach ($item in @(Get-WacDeploymentItem -Root $root)) {
+    # An incomplete walk is a finding in its own right. The paths it never reached are precisely the
+    # ones nothing has verified, and "we could not look" has to fail closed exactly like "we looked
+    # and it is writable".
+    $walk = Get-WacDeploymentItem -Root $root
+    foreach ($problem in @($walk.Failure)) {
+        $problemPath = [string]$problem.Path
+        if (-not $reported.Add($problemPath)) { continue }
+        [void]$untrusted.Add([PSCustomObject]@{
+            Path = $problemPath
+            Reason = ('The deployment could not be fully enumerated: {0}' -f [string]$problem.Reason)
+            Owner = $null
+        })
+    }
+
+    foreach ($item in @($walk.Entry)) {
         if ($item.IsReparsePoint) {
             [void]$untrusted.Add([PSCustomObject]@{
                 Path = $item.Path
@@ -328,14 +368,10 @@ function Test-WacDeploymentTrusted {
         [void]$toCheck.Add($item.Path)
     }
 
-    $checkedSet = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    $reported = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-
     foreach ($path in $toCheck) {
         [void]$checkedSet.Add($path)
         $trust = Test-WacPathIsMachineTrusted -Path $path
-        if (-not $trust.IsTrusted) {
-            [void]$reported.Add($path)
+        if (-not $trust.IsTrusted -and $reported.Add($path)) {
             [void]$untrusted.Add([PSCustomObject]@{ Path = $path; Reason = $trust.Reason; Owner = $trust.Owner })
         }
     }

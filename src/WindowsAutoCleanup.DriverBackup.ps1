@@ -22,6 +22,11 @@ $script:BackupManifestName   = 'wac-driver-backup.json'
 # still installed. A schema-1 manifest has no such record and is therefore reclaimable.
 $script:BackupManifestSchema = 2
 
+# Written before pnputil is asked to remove a package, cleared only once the stamped manifest is
+# durable. While it exists a deletion MAY have happened - a killed run, a torn write and a commit
+# that failed all look alike from outside - so the directory is protected until a human resolves it.
+$script:BackupPendingName = 'wac-driver-delete.pending'
+
 # ---------------------------------------------------------------------------------------------
 # 4. Recoverable backups
 # ---------------------------------------------------------------------------------------------
@@ -122,7 +127,9 @@ function Get-WacDriverBackupFileHash {
             if ($relative.Length -gt $prefix.Length) {
                 $relative = $relative.Substring($prefix.Length).TrimStart('\')
             }
-            if ($relative -ieq $script:BackupManifestName) { continue }
+            # The manifest records this list so it cannot be part of it, and the pending marker is
+            # only ever written after the list was verified. Neither is export content.
+            if ($relative -ieq $script:BackupManifestName -or $relative -ieq $script:BackupPendingName) { continue }
 
             $stream = New-Object System.IO.FileStream($file.FullName, [System.IO.FileMode]::Open,
                 [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
@@ -264,6 +271,57 @@ function Test-WacDriverBackupIntact {
     return $result
 }
 
+function Set-WacDriverBackupDeletePending {
+    <#
+    .SYNOPSIS
+        Records that a deletion is about to be attempted. True only once the marker is on disk.
+    .DESCRIPTION
+        A caller that cannot write this must not delete: without the marker an interrupted deletion
+        looks exactly like an export that never finished, and the next run would reclaim the only
+        copy left of a package that is gone.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$DriverName
+    )
+
+    try {
+        $record = 'driver={0} attemptedUtc={1} executionId={2}' -f $DriverName,
+            (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), [string](Get-WacExecutionId)
+        [System.IO.File]::WriteAllText((Get-WacLongPath -Path (Join-Path -Path $Path -ChildPath $script:BackupPendingName)),
+            $record, (New-Object System.Text.UTF8Encoding($false)))
+    }
+    catch {
+        return $false
+    }
+
+    return (Test-WacDriverBackupDeletePending -Path $Path)
+}
+
+function Test-WacDriverBackupDeletePending {
+    <#
+    .SYNOPSIS
+        True while a recorded deletion attempt against this directory has not been committed.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return (Test-Path -LiteralPath (Join-Path -Path $Path -ChildPath $script:BackupPendingName) -PathType Leaf)
+}
+
+function Clear-WacDriverBackupDeletePending {
+    <#
+    .SYNOPSIS
+        Removes the marker. True only when nothing is left at its path.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $marker = Join-Path -Path $Path -ChildPath $script:BackupPendingName
+    try { [System.IO.File]::Delete((Get-WacLongPath -Path $marker)) }
+    catch { $null = $_ }
+
+    return (-not (Test-Path -LiteralPath $marker))
+}
+
 function Test-WacDriverBackupIsResidue {
     <#
     .SYNOPSIS
@@ -272,16 +330,20 @@ function Test-WacDriverBackupIsResidue {
         The backup root is PERSISTENT, so whatever a run leaves behind is what every later run walks
         into, and a guard that refuses every existing directory refuses that package forever.
 
-        Residue is a directory whose export or whose deletion never completed: a failed or killed
-        export, a manifest that was never written, or a deletion pnputil declined. In every one of
-        those the package is still in the driver store - which is the only reason it can be a
-        candidate again today - so the directory is not the only copy of anything and reclaiming it
-        destroys nothing.
+        Reclaiming needs BOTH halves, and age or a missing timestamp is neither of them:
 
-        A manifest carrying DeletedUtc is the opposite, because that stamp is written only after the
-        package really was removed. Anything else unreadable is treated as an export that never
-        finished, EXCEPT a manifest belonging to a different package: that is not ours to explain
-        away by deleting it.
+          1. NO DELETION AMBIGUITY. No pending marker, and a manifest that is absent, unreadable or
+             unstamped. The marker is written before pnputil is asked to remove anything and cleared
+             only once the stamped manifest is durable, so its absence is what proves no deletion
+             was ever attempted here.
+          2. THE PACKAGE IS STILL INSTALLED. The only caller reaches this for a candidate taken from
+             the CURRENT structured inventory, and the directory is addressed by that candidate's
+             content identity - so this directory, holding either that same identity or no manifest
+             at all, describes a package this run has just enumerated as present.
+
+        Everything else is protected. A manifest recording a DIFFERENT identity is not ours to
+        explain away by deleting it, a stamped manifest is the only copy of a package that is gone,
+        and an uncommitted deletion attempt may be.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -289,6 +351,14 @@ function Test-WacDriverBackupIsResidue {
     )
 
     $result = [PSCustomObject]@{ IsResidue = $true; Reason = 'it carries no backup manifest, so an earlier export never completed' }
+
+    # Checked FIRST and without reading anything: once a deletion may have happened, no manifest
+    # state - absent, unreadable or unstamped - can turn this directory back into ordinary residue.
+    if (Test-WacDriverBackupDeletePending -Path $Path) {
+        $result.IsResidue = $false
+        $result.Reason = 'it carries an uncommitted deletion attempt, so the package it holds may already be gone'
+        return $result
+    }
 
     $manifestPath = Join-Path -Path $Path -ChildPath $script:BackupManifestName
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $result }
@@ -370,16 +440,22 @@ function Complete-WacDriverBackup {
     .SYNOPSIS
         Stamps the deletion into the manifest, which is what turns an export into a backup.
     .DESCRIPTION
-        Called only once pnputil has really removed the package. Before the stamp the directory is a
-        copy of something still installed and a later run may reclaim it; after it, the directory is
-        the only way back and the collision guard refuses to touch it.
+        Called only once pnputil has really removed the package, and the ONLY thing that may turn an
+        export into a backup. The commit is a staged write plus File.Replace, so a reader sees either
+        the whole old manifest or the whole new one: a torn manifest reads as "no completed deletion"
+        and would invite the next run to reclaim the only copy of a package that is gone.
+        Delete-then-move is the fallback for a volume that refuses Replace, and it is safe here only
+        because the pending marker is still standing over it.
+
+        The marker comes off LAST, after the committed file has been read back, because an in-memory
+        stamp proves nothing about what survived on disk. A false return therefore leaves the
+        directory protected - the correct end state for a package that is gone and a backup that is
+        not provably recoverable.
 
         It rewrites the object THIS run built rather than re-reading the file. Measured on both
         hosts: ConvertFrom-Json leaves an ISO-8601 string alone on Windows PowerShell 5.1 but parses
         it into a [datetime] on PowerShell 7, so a read-modify-write would round-trip CreatedUtc
         through a different type on one host and could rewrite it in another form.
-        Rewriting the manifest is otherwise free - it is excluded from the hash list it records, and
-        the verification the deletion rested on has already happened.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -387,16 +463,34 @@ function Complete-WacDriverBackup {
     )
 
     $manifestPath = Get-WacLongPath -Path (Join-Path -Path $Path -ChildPath $script:BackupManifestName)
+    $stagingPath = $manifestPath + '.commit'
 
     try {
         $Manifest.DeletedUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        [System.IO.File]::WriteAllText($manifestPath, ($Manifest | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($stagingPath, ($Manifest | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
+
+        try { [System.IO.File]::Replace($stagingPath, $manifestPath, $null) }
+        catch {
+            [System.IO.File]::Delete($manifestPath)
+            [System.IO.File]::Move($stagingPath, $manifestPath)
+        }
     }
+    catch {
+        try { [System.IO.File]::Delete($stagingPath) } catch { $null = $_ }
+        return $false
+    }
+
+    $committed = $null
+    try { $committed = [System.IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -ErrorAction Stop }
     catch {
         return $false
     }
 
-    return $true
+    if ($null -eq $committed) { return $false }
+    if (@($committed.PSObject.Properties.Name) -cnotcontains 'DeletedUtc') { return $false }
+    if ([string]::IsNullOrWhiteSpace([string]$committed.DeletedUtc)) { return $false }
+
+    return (Clear-WacDriverBackupDeletePending -Path $Path)
 }
 
 function Export-WacDriverBackup {

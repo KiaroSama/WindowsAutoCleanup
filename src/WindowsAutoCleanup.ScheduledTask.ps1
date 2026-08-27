@@ -96,32 +96,124 @@ function Get-WacTaskScriptPath {
     return (Get-WacNormalizedPath -Path $value)
 }
 
+function Test-WacTaskQueryIsNotFound {
+    <#
+    .SYNOPSIS
+        True only for an error that POSITIVELY says no such task is registered.
+    .DESCRIPTION
+        Everything else - the Task Scheduler service stopped, the CIM provider missing, access
+        denied, an RPC failure, a timeout - means the question was never answered, and an unanswered
+        question is not "absent". Discovery used to swallow every one of them alike, so a machine
+        whose scheduler could not be reached looked exactly like a machine with nothing registered:
+        the installer would add a second task beside the one it could not see, and the uninstaller
+        would go on to delete the deployment that a still-registered task points at.
+
+        CommandNotFoundException is tested FIRST and is never absence. "The term 'Get-ScheduledTask'
+        is not recognized" also carries the ObjectNotFound category, and reading that as "no task"
+        would turn a missing ScheduledTasks module into a clean machine.
+    #>
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+
+    $id = ''
+    try { $id = [string]$ErrorRecord.FullyQualifiedErrorId } catch { $id = '' }
+    if ($id -match '(?i)CommandNotFound') { return $false }
+    if ($id -match '(?i)CmdletizationQuery_NotFound') { return $true }
+
+    $category = ''
+    try { $category = [string]$ErrorRecord.CategoryInfo.Category } catch { $category = '' }
+    return ($category -ieq 'ObjectNotFound')
+}
+
+function Get-WacTaskQueryResult {
+    <#
+    .SYNOPSIS
+        Found / Absent / Failed for exactly one task name at one task path.
+    .OUTPUTS
+        TaskName, TaskPath, State, Task, Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskPath,
+        [string]$TaskName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) { $TaskName = $script:TaskName }
+
+    $result = [PSCustomObject]@{
+        TaskName = $TaskName
+        TaskPath = $TaskPath
+        State = 'Failed'
+        Task = $null
+        Reason = $null
+    }
+
+    $found = @()
+    try {
+        $found = @(Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop | Where-Object { $_ })
+    }
+    catch {
+        if (Test-WacTaskQueryIsNotFound -ErrorRecord $_) {
+            $result.State = 'Absent'
+            $result.Reason = 'The scheduler reported that no task with this name is registered at this path.'
+        }
+        else {
+            $result.Reason = ('The scheduler could not be queried, so the task is neither present nor absent: {0}' -f $_.Exception.Message)
+        }
+        return $result
+    }
+
+    if ($found.Count -eq 0) {
+        $result.State = 'Absent'
+        $result.Reason = 'The scheduler returned no task and reported no error.'
+        return $result
+    }
+
+    $result.State = 'Found'
+    $result.Task = $found[0]
+    $result.Reason = 'The task is registered.'
+    return $result
+}
+
 function Get-WacInstalledTask {
     <#
     .SYNOPSIS
-        Returns the task registered at the canonical folder, and optionally the pre-1.2 task at the
-        root folder.
+        Ternary discovery of our registrations: Found, Absent or Failed - never "absent because the
+        question could not be asked".
+    .DESCRIPTION
+        Covers the canonical folder and, with -IncludeLegacy, the pre-1.2 registration at the root
+        folder. State is Failed when EITHER lookup failed, even when the other one found a task: a
+        caller that replaces a deployment or deletes a task on a half-known picture is doing it
+        blind, and that is the case this distinction exists to stop.
+    .OUTPUTS
+        State, Task (the tasks positively found), Failure (TaskPath and Reason per unanswered
+        lookup).
     #>
     [CmdletBinding()]
     param([switch]$IncludeLegacy)
 
     $found = New-Object 'System.Collections.Generic.List[object]'
+    $failures = New-Object 'System.Collections.Generic.List[object]'
 
     $paths = New-Object 'System.Collections.Generic.List[string]'
     [void]$paths.Add($script:TaskFolder)
     if ($IncludeLegacy) { [void]$paths.Add('\') }
 
     foreach ($path in $paths) {
-        try {
-            $task = Get-ScheduledTask -TaskName $script:TaskName -TaskPath $path -ErrorAction Stop
+        $query = Get-WacTaskQueryResult -TaskPath $path
+        if ($query.State -eq 'Found') { [void]$found.Add($query.Task) }
+        elseif ($query.State -eq 'Failed') {
+            [void]$failures.Add([PSCustomObject]@{ TaskPath = $path; Reason = [string]$query.Reason })
         }
-        catch {
-            continue
-        }
-        if ($task) { [void]$found.Add($task) }
     }
 
-    return @($found.ToArray())
+    $state = 'Absent'
+    if ($failures.Count -gt 0) { $state = 'Failed' }
+    elseif ($found.Count -gt 0) { $state = 'Found' }
+
+    return [PSCustomObject]@{
+        State = $state
+        Task = @($found.ToArray())
+        Failure = @($failures.ToArray())
+    }
 }
 
 function Get-WacTaskActionArgumentCandidate {
@@ -400,13 +492,27 @@ function Test-WacTaskReferencesRoot {
 function Remove-WacInstalledTask {
     <#
     .SYNOPSIS
-        Unregisters a task that passes the ownership proof, then verifies it is really gone.
+        Captures a task's exact definition, unregisters it once it passes the ownership proof, and
+        PROVES it is gone.
+    .DESCRIPTION
+        The definition is exported BEFORE the unregister and handed back on the result, because a
+        caller that removes an old registration as one step of an upgrade has to be able to put
+        exactly that registration back when a later step fails. -RequireDefinitionCapture makes
+        that mandatory: the installer passes it, since a removal it could not undo is not a step it
+        is allowed to take, and the uninstaller does not, because there is nothing to roll back to.
+
+        Verification is ternary. It used to be `try { Get-ScheduledTask } catch { $null }`, so an
+        access-denied or RPC failure on the read-back was indistinguishable from the task really
+        being gone, and an arbitrary query exception was reported as a verified removal.
+    .OUTPUTS
+        TaskName, TaskPath, Removed, Verified, Captured, Definition, CaptureReason, Reason.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Task,
         [string]$DeploymentRoot,
-        [switch]$AllowLegacyMigration
+        [switch]$AllowLegacyMigration,
+        [switch]$RequireDefinitionCapture
     )
 
     $proof = Test-WacTaskIsOurs -Task $Task -DeploymentRoot $DeploymentRoot -AllowLegacyMigration:$AllowLegacyMigration
@@ -416,12 +522,36 @@ function Remove-WacInstalledTask {
         TaskPath = $proof.TaskPath
         Removed = $false
         Verified = $false
+        Captured = $false
+        Definition = $null
+        CaptureReason = $null
         Reason = $proof.Reason
     }
 
     if (-not $proof.IsOurs) {
         Write-WacLog -Level WARNING -Component 'Deploy' -Message 'Refused to remove a task that is not ours.' -Data @{
             task = ('{0}{1}' -f $result.TaskPath, $result.TaskName); reason = $proof.Reason
+        }
+        return $result
+    }
+
+    $export = ''
+    try { $export = [string](Export-ScheduledTask -TaskName $result.TaskName -TaskPath $result.TaskPath -ErrorAction Stop) }
+    catch { $export = ''; $result.CaptureReason = $_.Exception.Message }
+
+    if ([string]::IsNullOrWhiteSpace($export)) {
+        if (-not $result.CaptureReason) { $result.CaptureReason = 'The scheduler returned an empty task definition.' }
+    }
+    else {
+        $result.Captured = $true
+        $result.Definition = $export
+        $result.CaptureReason = 'The definition was captured before the removal.'
+    }
+
+    if ($RequireDefinitionCapture -and -not $result.Captured) {
+        $result.Reason = ('The task was left registered because its definition could not be captured first, so removing it could not have been undone: {0}' -f [string]$result.CaptureReason)
+        Write-WacLog -Level ERROR -Component 'Deploy' -Message 'Refused to remove a task whose definition could not be captured.' -Data @{
+            task = ('{0}{1}' -f $result.TaskPath, $result.TaskName); reason = [string]$result.CaptureReason
         }
         return $result
     }
@@ -435,12 +565,17 @@ function Remove-WacInstalledTask {
         return $result
     }
 
-    $still = $null
-    try { $still = Get-ScheduledTask -TaskName $result.TaskName -TaskPath $result.TaskPath -ErrorAction Stop } catch { $still = $null }
-
-    if ($still) {
+    $verify = Get-WacTaskQueryResult -TaskPath $result.TaskPath -TaskName $result.TaskName
+    if ($verify.State -eq 'Found') {
         $result.Reason = 'Unregister-ScheduledTask reported success but the task is still registered.'
         Write-WacLog -Level ERROR -Component 'Deploy' -Message 'A task survived its own removal.' -Data @{ task = ('{0}{1}' -f $result.TaskPath, $result.TaskName) }
+        return $result
+    }
+    if ($verify.State -ne 'Absent') {
+        $result.Reason = ('The removal could not be verified: {0}' -f [string]$verify.Reason)
+        Write-WacLog -Level ERROR -Component 'Deploy' -Message 'A task removal could not be verified.' -Data @{
+            task = ('{0}{1}' -f $result.TaskPath, $result.TaskName); reason = [string]$verify.Reason
+        }
         return $result
     }
 

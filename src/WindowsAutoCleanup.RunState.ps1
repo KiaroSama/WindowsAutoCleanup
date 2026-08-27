@@ -297,6 +297,11 @@ function Initialize-WacRun {
         The trust check lives here rather than at the call sites because this is the one function
         every entry point already calls; a guard a caller has to remember is a guard one caller will
         forget. It VERIFIES and records - refusing the run is the orchestrator's decision.
+    .PARAMETER StartUtc
+        The instant the budget is measured from. Defaults to now, which is right for a caller whose
+        work begins here and wrong for one that had to load a module tree first.
+    .PARAMETER ShutdownMarginSeconds
+        Held back from the budget so the caller still has time to write its own verdict.
     #>
     [CmdletBinding()]
     param(
@@ -304,7 +309,9 @@ function Initialize-WacRun {
         [string[]]$CandidateRoot,
         [ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$LogLevel = 'INFO',
         [int]$BudgetMinutes = 210,
-        [string]$BootstrapLogPath
+        [string]$BootstrapLogPath,
+        [Nullable[datetime]]$StartUtc,
+        [int]$ShutdownMarginSeconds = 0
     )
 
     if (-not $CandidateRoot -or $CandidateRoot.Count -eq 0) {
@@ -326,7 +333,13 @@ function Initialize-WacRun {
 
     $script:LogLevel = $LogLevel
     $script:ExecutionId = [guid]::NewGuid().ToString('N')
-    $script:DeadlineUtc = (Get-Date).ToUniversalTime().AddMinutes($BudgetMinutes)
+    # -StartUtc is the caller's own start instant, not this line's. A budget armed where the log is
+    # opened excludes everything that had to happen first - five module imports, the machine-wide
+    # lock, the trust preflight - so a run could be well into its budget before the budget began.
+    # -ShutdownMarginSeconds comes off the other end for the mirror-image reason: a run that spends
+    # its last millisecond inside a cleanup step has nothing left to write its own verdict with.
+    $armFrom = if ($null -eq $StartUtc) { (Get-Date).ToUniversalTime() } else { [datetime]$StartUtc }
+    $script:DeadlineUtc = $armFrom.AddMinutes($BudgetMinutes).AddSeconds(-$ShutdownMarginSeconds)
     $script:LogDegraded = $false
     $script:LogOpened = $false
     $script:LogFailedWrites = 0

@@ -99,7 +99,9 @@ function New-WacDeploymentStage {
 
     New-Item -Path $slots.Staging -ItemType Directory -Force -ErrorAction Stop | Out-Null
     Copy-Item -LiteralPath $sourceRun -Destination (Join-Path -Path $slots.Staging -ChildPath 'Run.ps1') -Force -ErrorAction Stop
-    Copy-WacDeploymentTree -Source $sourceSrc -Destination (Join-Path -Path $slots.Staging -ChildPath 'src')
+    # -Depth 1 because the destination IS level 1 of the deployment - see Copy-WacDeploymentTree for
+    # what the missing 1 used to cost.
+    Copy-WacDeploymentTree -Source $sourceSrc -Destination (Join-Path -Path $slots.Staging -ChildPath 'src') -Depth 1
 
     $sourceLicense = Join-Path -Path $source -ChildPath 'LICENSE'
     if (Test-Path -LiteralPath $sourceLicense -PathType Leaf) {
@@ -176,7 +178,16 @@ function Switch-WacDeploymentStage {
         }
     }
 
-    $fileCount = @(Get-WacDeploymentItem -Root $slots.Root | Where-Object { -not $_.IsDirectory }).Count
+    # Throwing here is deliberate and the caller must be inside its rollback try: a deployment whose
+    # contents cannot be enumerated is one nothing can verify, manifest or later delete, and it has
+    # just gone live.
+    $walk = Get-WacDeploymentItem -Root $slots.Root
+    if (-not $walk.Complete) {
+        throw ("The deployment that was switched into place could not be fully enumerated: {0}" -f
+            ((@($walk.Failure | ForEach-Object { '{0}: {1}' -f $_.Path, $_.Reason }) | Select-Object -First 3) -join '; '))
+    }
+
+    $fileCount = @($walk.Entry | Where-Object { -not $_.IsDirectory }).Count
     Write-WacLog -Level INFO -Component 'Deploy' -Message 'Deployment switched into place.' -Data @{ root = $slots.Root; files = $fileCount; previousKept = $keptPrevious }
 
     return [PSCustomObject]@{

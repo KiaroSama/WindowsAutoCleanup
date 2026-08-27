@@ -6,13 +6,18 @@
 .DESCRIPTION
     Dot-sourced by WindowsAutoCleanup.Core.psm1; see that file for why the parts are dot-sourced
     rather than imported. Everything here answers the same question - how does this run start work
-    it does not control, hold it to a deadline, and prove it stopped - so the command-line quoting
-    the child is handed, the handle-bound termination that verifies it died, and the mutex that
-    stops a second run starting at all belong on one page.
+    it does not control and hold it to a deadline - so the command-line quoting the child is handed,
+    the deadline the tool is given and the mutex that stops a second run starting at all belong on
+    one page.
+
+    The other half of that sentence - proving the work STOPPED - grew its own evidence model and
+    now lives in WindowsAutoCleanup.ProcessTree.ps1, dot-sourced from here.
 #>
 
-$script:ProcessInvoker      = $null
-$script:ProcessHandleOpener = $null
+$script:ProcessInvoker = $null
+
+# Proving a tree is dead is its own responsibility and its own file; see the header there.
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ProcessTree.ps1')
 
 # ---------------------------------------------------------------------------------------------
 # Bounded external process execution
@@ -181,153 +186,6 @@ function Get-WacRelaunchArgument {
     return @($arguments.ToArray())
 }
 
-function Set-WacProcessHandleOpener {
-    <#
-    .SYNOPSIS
-        Replaces the OpenProcess call Stop-WacProcessTree binds its handle with. $null restores it.
-    .DESCRIPTION
-        The scriptblock receives (ProcessId) and must return an object exposing Handle and
-        Win32Error, in the same spirit as Set-WacProcessInvoker and Set-WacLogWriter.
-
-        It exists for exactly one arm: "the id exists but the OS will not hand over a handle". Only
-        a protected process produces that for real - PID 4 and csrss measured 5 ERROR_ACCESS_DENIED
-        on both hosts - and a case that asks the shipped code to terminate one of those is not
-        something to run on a workstation, at any privilege level.
-
-        Inject a FAILURE (Handle = IntPtr.Zero) and nothing else: a fabricated non-zero handle is
-        waited on, terminated and closed for real.
-    #>
-    param([scriptblock]$Opener)
-    $script:ProcessHandleOpener = $Opener
-}
-
-function Stop-WacProcessTree {
-    <#
-    .SYNOPSIS
-        Kills a process AND its children, and returns $true only when the target is PROVEN gone.
-    .DESCRIPTION
-        The old body returned taskkill's WaitForExit(): its EXIT CODE was never read and the target
-        was never re-checked, so "taskkill ran" was reported as "the process is dead". Measured on
-        both shipped hosts, taskkill /T /F /PID returns
-
-            0    SUCCESS: the process ... has been terminated
-            128  ERROR: The process "<pid>" not found
-            255  ERROR: ... could not be terminated (critical system process)
-
-        and all three exited, so all three used to return $true. A failed kill was indistinguishable
-        from a real one, and Invoke-WacProcess went on to report a bounded, cleaned-up timeout while
-        the tool it was supposed to have killed kept running.
-
-        The verdict comes from a kernel handle OPENED AT ENTRY and held until this call returns, and
-        that is meant literally. System.Diagnostics.Process keeps no handle of its own unless it
-        STARTED the process: HasExited, WaitForExit and Kill each re-open the raw id and close it
-        again, so a Process object handed back by Get-Process proves nothing the replaced code did
-        not - it was the same reuse window under a better name. Waiting on, and terminating through,
-        ONE bound handle is what keeps every answer attached to the process that was opened,
-        whatever Windows later does with the number.
-
-        That is also why Get-Process is gone from this path. It answers about an id, it cannot see a
-        process that exited while a handle to it is still open, and its failure does not say WHY.
-        OpenProcess does: 87 ERROR_INVALID_PARAMETER means nothing owns the id, which IS the outcome
-        the caller wanted; anything else - 5 ERROR_ACCESS_DENIED for a protected process - means the
-        state could not be read at all. Unreadable state is never reported as proof here, the same
-        way Test-WacIsReparsePoint refuses to call an unreadable descriptor safe.
-
-        taskkill's exit code is read and logged because it is the only evidence of WHY a kill did
-        not take (255 refused vs 128 raced to exit), but it is never the verdict on its own.
-    .OUTPUTS
-        [bool] $true only when the target is known to have exited.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][int]$ProcessId,
-        [int]$TimeoutMs = 10000
-    )
-
-    if ($TimeoutMs -le 0) { $TimeoutMs = 1 }
-
-    $bound = [IntPtr]::Zero
-    # -1 is not a Win32 code. It stands for "no handle could be bound at all", which is a different
-    # claim from "nothing owns this id" and must never be reported as one.
-    $openError = -1
-    if ($script:ProcessHandleOpener) {
-        $injected = & $script:ProcessHandleOpener $ProcessId
-        $bound = [IntPtr]$injected.Handle
-        $openError = [int]$injected.Win32Error
-    }
-    elseif (Initialize-WacNative) {
-        $openError = [WacNative]::OpenProcessForTermination($ProcessId, [ref]$bound)
-    }
-
-    if ($bound -eq [IntPtr]::Zero) {
-        # ERROR_INVALID_PARAMETER: nothing owns this id, so the target is gone and the caller got
-        # what it asked for. Every OTHER failure is unverifiable, and unverifiable is not success.
-        if ($openError -eq 87) { return $true }
-
-        Write-WacLog -Level WARNING -Component 'Process' -Message 'The target could not be opened, so termination is unverifiable.' -Data @{
-            pid = $ProcessId
-            win32Error = $openError
-        }
-        return $false
-    }
-
-    try {
-        # Already gone before anything was asked of it. The handle is what makes this the TARGET's
-        # own exit rather than a later occupant of the number, so no kill is needed or attempted.
-        if ([WacNative]::WaitForProcessExit($bound, 0) -eq 0) { return $true }
-
-        $exitCode = $null
-        try {
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = (Join-Path -Path $env:SystemRoot -ChildPath 'System32\taskkill.exe')
-            $psi.Arguments = ConvertTo-WacCommandLine -ArgumentList @('/T', '/F', '/PID', [string]$ProcessId)
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-
-            $killer = [System.Diagnostics.Process]::Start($psi)
-            if ($killer) {
-                [void]$killer.StandardOutput.ReadToEndAsync()
-                [void]$killer.StandardError.ReadToEndAsync()
-                if ($killer.WaitForExit($TimeoutMs)) {
-                    try { $exitCode = [int]$killer.ExitCode } catch { $exitCode = $null }
-                }
-                else {
-                    # taskkill itself overran its bound. Killing it directly is not recursion: it is
-                    # our own child and has no tree of its own worth walking.
-                    try { $killer.Kill() } catch { $null = $_ }
-                }
-                try { $killer.Dispose() } catch { $null = $_ }
-            }
-        }
-        catch {
-            $exitCode = $null
-        }
-
-        # The proof. taskkill returns once it has ASKED for termination, so the target may still be
-        # tearing down; waiting on the bound handle is the deterministic signal that it finished.
-        $verified = ([WacNative]::WaitForProcessExit($bound, $TimeoutMs) -eq 0)
-
-        if (-not $verified) {
-            # The escalation goes through the SAME handle rather than the id, so it cannot land on
-            # whatever inherited the number while taskkill was running.
-            [void][WacNative]::TerminateBoundProcess($bound)
-            $verified = ([WacNative]::WaitForProcessExit($bound, $TimeoutMs) -eq 0)
-        }
-
-        if (-not $verified) {
-            Write-WacLog -Level WARNING -Component 'Process' -Message 'Termination could not be established; the target may still be running.' -Data @{
-                pid = $ProcessId
-                taskkillExit = $(if ($null -eq $exitCode) { 'none' } else { [string]$exitCode })
-            }
-        }
-
-        return $verified
-    }
-    finally {
-        [WacNative]::CloseProcessHandle($bound)
-    }
-}
 
 function Set-WacProcessInvoker {
     <#
@@ -366,7 +224,7 @@ function Invoke-WacProcess {
         Write-WacLog -Level WARNING -Component $Component -Message 'Run budget exhausted before the tool could start.' -Data @{ tool = $FilePath }
         return [PSCustomObject]@{
             ExitCode = $null; TimedOut = $true; StandardOutput = ''; StandardError = ''
-            DurationMs = 0; Started = $false
+            DurationMs = 0; Started = $false; TerminationProven = $true
         }
     }
 
@@ -398,11 +256,27 @@ function Invoke-WacProcess {
         $exited = $process.WaitForExit($TimeoutMs)
         $timedOut = -not $exited
 
+        $terminationProven = $true
         if ($timedOut) {
             Write-WacLog -Level WARNING -Component $Component -Message 'External tool exceeded its deadline; terminating the process tree.' -Data @{
                 tool = $FilePath; pid = $process.Id; timeoutMs = $TimeoutMs
             }
-            [void](Stop-WacProcessTree -ProcessId $process.Id)
+
+            # The stop result used to be discarded, which made "we asked taskkill to kill it" and
+            # "the whole tree is provably gone" the same event to every caller. A tool this run
+            # started and could not prove it stopped is a mutator that may still be writing while
+            # the run reports its verdict, so it is recorded and written at CRITICAL - the one level
+            # -LogLevel cannot gate out.
+            $stopped = Stop-WacProcessTree -ProcessId $process.Id
+            $terminationProven = [bool]$stopped.Proven
+            if (-not $terminationProven) {
+                Write-WacLog -Level CRITICAL -Component $Component -Message 'The external tool could not be proven terminated; part of its process tree may still be running.' -Data @{
+                    tool = $FilePath; pid = $process.Id
+                    survivors = (@($stopped.Survivor) -join ',')
+                    reason = [string]$stopped.Reason
+                }
+            }
+
             [void]$process.WaitForExit(10000)
         }
 
@@ -425,6 +299,9 @@ function Invoke-WacProcess {
             StandardError = $stderr
             DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds
             Started = $true
+            # $true whenever the tool was not terminated at all. Only a bounded timeout whose tree
+            # could not be proven gone sets it $false.
+            TerminationProven = $terminationProven
         }
     }
     catch {
@@ -435,6 +312,7 @@ function Invoke-WacProcess {
         return [PSCustomObject]@{
             ExitCode = $null; TimedOut = $false; StandardOutput = ''; StandardError = [string]$_.Exception.Message
             DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds; Started = $false
+            TerminationProven = $true
         }
     }
     finally {

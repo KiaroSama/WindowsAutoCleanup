@@ -26,10 +26,21 @@ function Test-WacIsAdministrator {
 }
 
 function Test-WacIsWindowsServer {
+    <#
+    .SYNOPSIS
+        Whether this is a Server SKU, read from the local registry rather than through CIM.
+    .DESCRIPTION
+        The Win32_OperatingSystem query this used to make is an RPC round trip to the WMI service,
+        and its one caller is the run header - diagnostics written before a single cleanup step
+        starts. A diagnostic that can block the process on an unavailable service is the wrong
+        shape, so the documented InstallationType value under CurrentVersion is read instead:
+        'Client', 'Server', 'Server Core' or 'Nano Server'. A local registry read has no service to
+        wait on. Unreadable answers false, exactly as the CIM body did when the query failed.
+    #>
     try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        if ($null -ne $os.ProductType -and [int]$os.ProductType -ne 1) { return $true }
-        if ($os.Caption -match '\bServer\b') { return $true }
+        $current = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
+            -Name 'InstallationType' -ErrorAction Stop
+        return ([string]$current.InstallationType -match '(?i)\bServer\b')
     }
     catch {
         $null = $_
@@ -184,20 +195,27 @@ function Get-WacUserProfilePath {
 }
 
 function Get-WacFreeBytes {
+    <#
+    .SYNOPSIS
+        Free bytes on a drive, or $null when the volume cannot answer. Telemetry only.
+    .DESCRIPTION
+        This used to query Win32_LogicalDisk. That is an RPC round trip to the WMI service with no
+        bound of its own, made twice per run - once before the whole cleanup and once after it - so
+        a wedged WMI repository could stall the run outside every step contract. DriveInfo is
+        GetDiskFreeSpaceEx against the volume itself: no service to be unavailable, nothing to hang
+        on. The registry/CIM fallback is gone with it; a second unbounded source is not a fallback.
+
+        The value is a log line and a delta and is never an input to the run's verdict, so an
+        unreadable volume returns $null and the footer prints 'Unknown'.
+    #>
     param([string]$Drive = 'C:')
 
     try {
-        $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $Drive) -ErrorAction Stop
-        if ($disk -and $null -ne $disk.FreeSpace) { return [int64]$disk.FreeSpace }
+        $info = New-Object System.IO.DriveInfo($Drive)
+        if ($info.IsReady) { return [int64]$info.AvailableFreeSpace }
     }
     catch {
-        try {
-            $psDrive = Get-PSDrive -Name $Drive.TrimEnd(':') -ErrorAction Stop
-            if ($psDrive -and $null -ne $psDrive.Free) { return [int64]$psDrive.Free }
-        }
-        catch {
-            $null = $_
-        }
+        $null = $_
     }
 
     return $null

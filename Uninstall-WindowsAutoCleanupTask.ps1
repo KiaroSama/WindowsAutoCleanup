@@ -36,9 +36,10 @@
          holds the machine-wide lock
       4  elevation was cancelled or failed
       5  unsupported environment (the deployment root cannot be resolved)
-      6  everything of ours was removed, but this run's audit log is not durable
-      7  refused: something at the task path or the deployment path could not be proven to be ours,
-         and it was left exactly as it was found
+      6  refused before any change, or everything of ours was removed, but either way this run's
+         audit log is not durable
+      7  refused: the machine state directory could not be proven machine-trusted, or something at
+         the task path or the deployment path could not be proven ours. Nothing was changed
 #>
 
 # Write-Host is deliberate: the uninstaller is a user-facing console tool and the structured
@@ -65,19 +66,39 @@ $script:ScriptRoot = Split-Path -Parent $PSCommandPath
 $script:LogReady = $false
 $script:InstanceLock = $null
 $script:Relaunched = $false
-$script:ElevationTimeoutMs = 600000
+
+# The elevated child's own budget, and the parent bound derived FROM it. The parent used to wait 10
+# minutes for a child whose own deadline was 30, and on expiry it returned while that still-mutating
+# elevated child carried on unregistering and deleting with nobody watching. A wrapper's deadline
+# has to outlast everything the child it started can legitimately do.
+$script:RunBudgetMinutes = 30
+$script:ChildShutdownMarginMinutes = 10
+$script:ElevationTimeoutMs = ($script:RunBudgetMinutes + $script:ChildShutdownMarginMinutes) * 60000
 
 Import-Module -Name (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.Core.psm1') -DisableNameChecking -Force -ErrorAction Stop
 Import-Module -Name (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.Deploy.psm1') -DisableNameChecking -Force -ErrorAction Stop
 
+# Dot-sourced, not imported: the pre-flight gate has to be one body shared by both entry points, and
+# a module can only hand a script what it EXPORTS.
+. (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.EntryGate.ps1')
+
 function Write-UninstallerMessage {
+    <#
+    .SYNOPSIS
+        One line to the console and, unless -NoLog, one structured record to the run log.
+    .DESCRIPTION
+        -NoLog exists for the refusal raised when the directory this run's audit log lives in is not
+        machine-trusted: explaining that refusal through the very path it just refused would be a
+        write into a location a standard user can replace.
+    #>
     param(
         [Parameter(Mandatory = $true)][ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$Level,
         [Parameter(Mandatory = $true)][string]$Message,
-        [hashtable]$Data
+        [hashtable]$Data,
+        [switch]$NoLog
     )
 
-    if ($script:LogReady) {
+    if ($script:LogReady -and -not $NoLog) {
         if ($Data) { Write-WacLog -Level $Level -Component 'Uninstaller' -Message $Message -Data $Data }
         else { Write-WacLog -Level $Level -Component 'Uninstaller' -Message $Message }
     }
@@ -152,7 +173,18 @@ function Invoke-UninstallerElevation {
     try { $null = $child.Handle } catch { $null = $_ }
 
     if (-not $child.WaitForExit($script:ElevationTimeoutMs)) {
-        Write-UninstallerMessage -Level ERROR -Message 'The elevated uninstaller did not finish inside its deadline.' -Data @{ pid = $child.Id; timeoutMs = $script:ElevationTimeoutMs }
+        # Past this point the child has outrun its OWN deadline plus the shutdown margin, so it is
+        # not still working - it is wedged. Stop-WacProcessTree returns $true only when the target is
+        # PROVEN gone, and an unelevated parent cannot terminate an elevated child at all, so the
+        # operator is told which of the two happened rather than the wrapper walking away in silence.
+        Write-UninstallerMessage -Level ERROR -Message 'The elevated uninstaller outran its own budget and the parent deadline.' -Data @{ pid = $child.Id; timeoutMs = $script:ElevationTimeoutMs }
+
+        if (Stop-WacProcessTree -ProcessId $child.Id) {
+            Write-UninstallerMessage -Level ERROR -Message 'The elevated uninstaller was terminated and proven gone. The task or the deployment may be half-removed; re-run the uninstaller.'
+        }
+        else {
+            Write-UninstallerMessage -Level CRITICAL -Message 'The elevated uninstaller could NOT be proven terminated and may still be running as administrator. Do not re-run the uninstaller until it has exited.' -Data @{ pid = $child.Id }
+        }
         return 1
     }
 
@@ -175,14 +207,25 @@ function Remove-InstalledTask {
 
     $result = [PSCustomObject]@{ Clean = $true; Refused = $false; Remaining = @() }
 
-    $tasks = @(Get-WacInstalledTask -IncludeLegacy)
-    if ($tasks.Count -eq 0) {
+    # Ternary discovery: a scheduler that will not answer is not a machine with nothing registered.
+    # Treating it as one is how the uninstaller went on to delete a deployment that a task it never
+    # saw still points at.
+    $discovery = Get-WacInstalledTask -IncludeLegacy
+    if ($discovery.State -eq 'Failed') {
+        Write-UninstallerMessage -Level ERROR -Message 'The Task Scheduler could not be queried, so whether a WindowsAutoCleanup task is still registered is unknown. Nothing was unregistered, and the deployment will be kept.' -Data @{
+            findings = ((@($discovery.Failure | ForEach-Object { '{0}: {1}' -f $_.TaskPath, $_.Reason })) -join '; ')
+        }
+        $result.Clean = $false
+        return $result
+    }
+
+    if ($discovery.State -eq 'Absent') {
         Write-UninstallerMessage -Level INFO -Message 'No WindowsAutoCleanup task is registered. Nothing to remove.'
         return $result
     }
 
     $remaining = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($task in $tasks) {
+    foreach ($task in @($discovery.Task)) {
         $removal = Remove-WacInstalledTask -Task $task -DeploymentRoot $DeploymentRoot -AllowLegacyMigration
         $label = '{0}{1}' -f $removal.TaskPath, $removal.TaskName
 
@@ -301,6 +344,16 @@ function Invoke-Main {
         return 3
     }
 
+    # Every trust question this run can be refused on is asked HERE, before the log retention pass
+    # below, before any task is unregistered and before anything is deleted.
+    $safety = Get-OperationSafetyVerdict -LogHealth (Get-WacLogHealth) -StateTrust (Get-WacStateTrust)
+    if (-not $safety.Ok) {
+        # -NoLog: the path being refused is the one the log lives in, so the refusal must not be
+        # written through it - and neither the retention pass nor -RemoveLogs runs after this.
+        Write-UninstallerMessage -Level ERROR -Message $safety.Reason -NoLog
+        return $safety.ExitCode
+    }
+
     $slots = Get-WacDeploymentSlotPath
     if (-not $slots) {
         Write-UninstallerMessage -Level ERROR -Message 'The deployment root cannot be resolved on this machine.'
@@ -376,7 +429,7 @@ function Invoke-Main {
     return 0
 }
 
-$script:LogReady = Initialize-WacRun -BaseName 'Uninstall-WindowsAutoCleanupTask' -BudgetMinutes 30
+$script:LogReady = Initialize-WacRun -BaseName 'Uninstall-WindowsAutoCleanupTask' -BudgetMinutes $script:RunBudgetMinutes
 if (-not $script:LogReady) {
     Write-Host '[WARNING] No log file could be created; continuing with console output only.' -ForegroundColor Yellow
 }

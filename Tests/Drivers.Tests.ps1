@@ -31,6 +31,37 @@ $script:DriversModule = Get-Module -Name 'WindowsAutoCleanup.Drivers'
 
 . (Join-Path -Path $PSScriptRoot -ChildPath '_DriverFixtures.ps1')
 
+# The marker Invoke-WacDriverPackagePrune drops into an export directory before it asks pnputil to
+# delete, and clears only once the stamped manifest is durable.
+$script:PendingName = 'wac-driver-delete.pending'
+
+function Set-DeleteResultOverride {
+    <#
+    .SYNOPSIS
+        Delegates to the recording invoker and then overrides fields of the /delete-driver result.
+    .DESCRIPTION
+        The shared fixture models Started as "not timed out", which no real runner does: a process
+        killed on its deadline started, and one Process.Start could not launch did not. Both of the
+        states this case needs are therefore unreachable through the canned results, and the
+        override is applied on top rather than replacing the recorder, so Get-DeleteCall still sees
+        every call.
+    #>
+    param([Parameter(Mandatory = $true)][hashtable]$Override)
+
+    $inner = $script:RecordingInvoker
+    $field = $Override
+
+    Set-WacProcessInvoker -Invoker {
+        param($FilePath, $ArgumentList, $TimeoutMs)
+
+        $result = & $inner $FilePath $ArgumentList $TimeoutMs
+        if (@($ArgumentList).Count -gt 0 -and $ArgumentList[0] -eq '/delete-driver') {
+            foreach ($name in @($field.Keys)) { $result.$name = $field[$name] }
+        }
+        return $result
+    }.GetNewClosure()
+}
+
 # ---------------------------------------------------------------------------------------------
 # Invoke-WacPnpCleanHandler
 # ---------------------------------------------------------------------------------------------
@@ -644,6 +675,84 @@ Test-Case 'an enumeration with nothing to prune succeeds and touches nothing' {
             Assert-False $result.Failed
             Assert-Equal 1 $script:StubCall.Count 'a package was touched although nothing was superseded'
             Assert-True ($result.Detail -match '2 driver package\(s\) enumerated') $result.Detail
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a delete result that is not a documented success is never a skip and never a success' {
+    # Both of these used to land in the benign "pnputil declined" branch: the export was thrown
+    # away, the package was counted as skipped and the run stayed clean. They are not the same
+    # fact. A process that never started certainly removed nothing; one whose exit code nobody
+    # could read may have removed everything, so its export may be the only copy left.
+    $scenario = @(
+        @{ Name = 'the process never started'
+           Override = @{ Started = $false; TimedOut = $false; ExitCode = $null; StandardError = 'The system cannot find the file specified.' }
+           Outcome = 'Failed'; Match = 'deleted=0 skipped=0 refused=0 incomplete=0 failed=1'; Retained = 0 },
+        @{ Name = 'the exit code could not be read'
+           Override = @{ Started = $true; TimedOut = $false; ExitCode = $null; StandardError = '' }
+           Outcome = 'Incomplete'; Match = 'deleted=0 skipped=0 refused=0 incomplete=1 failed=0'; Retained = 1 }
+    )
+
+    foreach ($entry in $scenario) {
+        $sandbox = New-TestSandbox -Prefix 'dr-deleteresult'
+        try {
+            $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+            $xml = New-PnpUtilDriverXml -Row (New-SupersededPair)
+
+            Invoke-WithStubbedTool -Body {
+                $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+                Set-DeleteResultOverride -Override $entry['Override']
+                $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+                Assert-Equal 1 @(Get-DeleteCall).Count ('{0}: the deletion was never attempted' -f $entry['Name'])
+                Assert-Equal $entry['Outcome'] $result.Outcome ('{0}: {1}' -f $entry['Name'], $result.Detail)
+                Assert-True $result.Failed ('{0} was reported as a clean run: {1}' -f $entry['Name'], $result.Detail)
+                Assert-False $result.Skipped ('{0} was reported as a benign skip: {1}' -f $entry['Name'], $result.Detail)
+                Assert-False $result.Succeeded ('{0}: {1}' -f $entry['Name'], $result.Detail)
+                Assert-True ($result.Detail -match $entry['Match']) ('{0}: {1}' -f $entry['Name'], $result.Detail)
+            }
+
+            $directory = @(Get-ChildItem -LiteralPath $backupRoot -Directory)
+            Assert-Equal $entry['Retained'] $directory.Count ('{0}: the wrong number of exports was kept' -f $entry['Name'])
+
+            if ($entry['Retained'] -gt 0) {
+                Assert-True (Test-Path -LiteralPath (Join-Path -Path $directory[0].FullName -ChildPath $script:PendingName) -PathType Leaf) `
+                    ('{0}: the export that may be the only copy left carries no pending-deletion marker' -f $entry['Name'])
+            }
+        }
+        finally {
+            Remove-TestSandbox -Path $sandbox
+        }
+    }
+}
+
+Test-Case 'a deletion answered with ERROR_NO_MORE_ITEMS is still benign on the next run' {
+    # 259 means pnputil removed nothing, so the attempt behind it left no ambiguity and must not
+    # leave a pending-deletion marker standing. A marker that outlived a benign run would make the
+    # next run refuse a package it is allowed to touch - a SecurityRefusal on a healthy machine,
+    # which is the defect this project has already shipped twice.
+    $sandbox = New-TestSandbox -Prefix 'dr-259twice'
+    try {
+        $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+        $xml = New-PnpUtilDriverXml -Row (New-SupersededPair)
+
+        foreach ($pass in @('run 1', 'run 2')) {
+            Invoke-WithStubbedTool -Body {
+                $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+                $script:StubResult['/delete-driver'] = @{ ExitCode = 259 }
+                $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+                Assert-Equal 'Succeeded' $result.Outcome ('{0}: {1}' -f $pass, $result.Detail)
+                Assert-False $result.Failed ('{0}: {1}' -f $pass, $result.Detail)
+                Assert-Equal 1 @(Get-ExportCall).Count ('{0} exported nothing' -f $pass)
+                Assert-True ($result.Detail -match 'deleted=0 skipped=1') ('{0}: {1}' -f $pass, $result.Detail)
+            }
+
+            Assert-Equal 0 (@(Get-ChildItem -LiteralPath $backupRoot -Recurse -Filter $script:PendingName -File)).Count `
+                ('{0} left a pending-deletion marker behind after a deletion that removed nothing' -f $pass)
         }
     }
     finally {
