@@ -59,6 +59,26 @@ public static class WacNative
     private const int  MOVEFILE_DELAY_UNTIL_REBOOT  = 0x00000004;
     private const int  SYNCHRONIZE                  = 0x00100000;
     private const int  PROCESS_TERMINATE             = 0x00000001;
+    private const uint DELETE_ACCESS                = 0x00010000;
+    private const int  FileDispositionInformation   = 13;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_STATUS_BLOCK { public IntPtr Status; public IntPtr Information; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_DISPOSITION_INFORMATION { [MarshalAs(UnmanagedType.U1)] public bool DeleteFile; }
+
+    [DllImport("ntdll.dll", ExactSpelling = true)]
+    private static extern int NtSetInformationFile(
+        SafeFileHandle FileHandle, out IO_STATUS_BLOCK IoStatusBlock,
+        ref FILE_DISPOSITION_INFORMATION FileInformation, int Length, int FileInformationClass);
+
+    // Outcomes of DeleteBoundLeaf. Deliberately coarse: the caller maps them onto the counters it
+    // already has, and the Win32 / NTSTATUS values carry the detail.
+    public const int DELETE_OK                 = 0;
+    public const int DELETE_OPEN_FAILED        = 1;
+    public const int DELETE_IDENTITY_MISMATCH  = 2;
+    public const int DELETE_DISPOSITION_FAILED = 3;
 
     // Resolves the final on-disk path of the object named by 'path'.
     //
@@ -148,6 +168,79 @@ public static class WacNative
     public static void CloseProcessHandle(IntPtr handle)
     {
         if (handle != IntPtr.Zero) { CloseHandle(handle); }
+    }
+
+    // Deletes the object at 'path' through a handle BOUND to it, so nothing swapped between the
+    // identity check and the delete can redirect the operation.
+    //
+    // This is the whole point of the function. The predecessor opened a handle, asked it for the
+    // final path, CLOSED it, then deleted by PATHNAME - a second, independent resolution of the same
+    // name. That window was sub-millisecond rather than the multi-second per-directory one before
+    // it, but it was still a window, and this tool runs as SYSTEM over directories a standard user
+    // can write to (C:\Windows\Temp grants BUILTIN\Users write by default). Here the handle opened
+    // for the check is the same handle the disposition is set on, so the delete lands on the object
+    // that was verified, or it does not land at all.
+    //
+    // openReparsePoint deletes the LINK itself and skips the identity check, because resolving the
+    // link is exactly what must not happen when the link is the thing being removed.
+    //
+    // FILE_DISPOSITION_INFORMATION only MARKS the object; the unlink happens when the last handle
+    // closes, which is why the using block is load-bearing rather than tidy.
+    public static int DeleteBoundLeaf(
+        string path, string expectedFinalPath, bool openReparsePoint, out int win32Error, out int ntStatus)
+    {
+        win32Error = 0;
+        ntStatus = 0;
+
+        uint flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if (openReparsePoint) { flags |= FILE_FLAG_OPEN_REPARSE_POINT; }
+
+        using (SafeFileHandle handle = CreateFileW(
+            path, DELETE_ACCESS | FILE_READ_ATTRIBUTES, FILE_SHARE_READ_WRITE_DELETE, IntPtr.Zero,
+            OPEN_EXISTING, flags, IntPtr.Zero))
+        {
+            if (handle.IsInvalid)
+            {
+                win32Error = Marshal.GetLastWin32Error();
+                return DELETE_OPEN_FAILED;
+            }
+
+            if (!openReparsePoint)
+            {
+                StringBuilder buffer = new StringBuilder(1024);
+                uint length = GetFinalPathNameByHandleW(
+                    handle, buffer, (uint)buffer.Capacity, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+                if (length != 0 && length >= buffer.Capacity)
+                {
+                    buffer = new StringBuilder((int)length + 1);
+                    length = GetFinalPathNameByHandleW(
+                        handle, buffer, (uint)buffer.Capacity, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+                }
+                if (length == 0)
+                {
+                    win32Error = Marshal.GetLastWin32Error();
+                    return DELETE_IDENTITY_MISMATCH;
+                }
+
+                string actual = buffer.ToString();
+                if (actual.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) { actual = actual.Substring(4); }
+                if (!string.Equals(actual.TrimEnd('\\'), expectedFinalPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return DELETE_IDENTITY_MISMATCH;
+                }
+            }
+
+            IO_STATUS_BLOCK iosb;
+            FILE_DISPOSITION_INFORMATION disposition = new FILE_DISPOSITION_INFORMATION();
+            disposition.DeleteFile = true;
+
+            ntStatus = NtSetInformationFile(
+                handle, out iosb, ref disposition,
+                Marshal.SizeOf(typeof(FILE_DISPOSITION_INFORMATION)), FileDispositionInformation);
+
+            if (ntStatus != 0) { return DELETE_DISPOSITION_FAILED; }
+            return DELETE_OK;
+        }
     }
 }
 '@

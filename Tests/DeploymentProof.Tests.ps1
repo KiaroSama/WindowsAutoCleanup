@@ -97,7 +97,7 @@ function Get-ExpectedCheckedCount {
     $set = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
     [void]$set.Add((Get-WacNormalizedPath -Path $Root))
 
-    foreach ($item in @(Get-WacDeploymentItem -Root $Root)) {
+    foreach ($item in @((Get-WacDeploymentItem -Root $Root).Entry)) {
         if ($item.IsReparsePoint) { continue }
         if ($item.IsDirectory -or ($item.Path -match '(?i)\.psm?1$')) { [void]$set.Add($item.Path) }
     }
@@ -367,6 +367,98 @@ Test-Case 'Test-WacDeploymentTrusted keeps its findings when no canonical PowerS
 # ---------------------------------------------------------------------------------------------
 # Deployment ownership: a directory at the expected path is not evidence (ledger B2-3)
 # ---------------------------------------------------------------------------------------------
+
+function Block-TestDirectoryListing {
+    <#
+    .SYNOPSIS
+        Denies THIS account the right to list a directory, so an enumeration really fails.
+    .DESCRIPTION
+        The owner of a directory keeps READ_CONTROL and WRITE_DAC implicitly, so the ACE can always
+        be lifted again in a finally - but owner rights do NOT include listing, so the denial bites
+        on an elevated runner too. Only ever called on a directory the test created.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        ([System.Security.Principal.WindowsIdentity]::GetCurrent().User),
+        [System.Security.AccessControl.FileSystemRights]::ListDirectory,
+        [System.Security.AccessControl.AccessControlType]::Deny)))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Unblock-TestDirectoryListing {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        [void]$acl.RemoveAccessRuleAll((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            ([System.Security.Principal.WindowsIdentity]::GetCurrent().User),
+            [System.Security.AccessControl.FileSystemRights]::ListDirectory,
+            [System.Security.AccessControl.AccessControlType]::Deny)))
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    }
+    catch {
+        $null = $_
+    }
+}
+
+Test-Case 'Test-WacDeploymentTrusted fails closed when part of the deployment cannot be walked' {
+    # "We could not look" has to fail exactly like "we looked and a standard user can write there":
+    # the paths the walk never reached are precisely the ones nothing has verified.
+    Invoke-InDeploymentSandbox -Prefix 'dep-trustwalk' -Body {
+        param($sandbox)
+
+        $source = New-TestCheckout -Path (Join-Path -Path $sandbox -ChildPath 'checkout')
+        $deployment = Install-WacDeployment -SourceRoot $source
+        $closed = Join-Path -Path $deployment.DeploymentRoot -ChildPath 'src'
+
+        Block-TestDirectoryListing -Path $closed
+        try {
+            $trust = Test-WacDeploymentTrusted -DeploymentRoot $deployment.DeploymentRoot
+
+            Assert-False $trust.IsTrusted 'a deployment that could not be fully walked was called trusted'
+            $reported = @(@($trust.Untrusted) | Where-Object { $_.Reason -match 'could not be fully enumerated' })
+            Assert-True ($reported.Count -ge 1) ((@($trust.Untrusted) | ForEach-Object { [string]$_.Reason }) -join '; ')
+            Assert-True ($reported[0].Path -ieq $closed) ([string]$reported[0].Path)
+        }
+        finally {
+            Unblock-TestDirectoryListing -Path $closed
+        }
+    }
+}
+
+Test-Case 'Ownership refuses a deployment root it cannot enumerate instead of adopting it' {
+    # The old top-level scan used -ErrorAction SilentlyContinue, and an unreadable directory
+    # enumerates as EMPTY. Empty plus no readable manifest walked straight into the pre-manifest
+    # adoption branch, so a deployment path nothing could read came back Unmanaged and IsOurs - safe
+    # to replace, safe to delete.
+    Invoke-InDeploymentSandbox -Prefix 'own-unreadable' -Body {
+        param($sandbox)
+
+        $source = New-TestCheckout -Path (Join-Path -Path $sandbox -ChildPath 'checkout')
+        $deployment = Install-WacDeployment -SourceRoot $source
+
+        Block-TestDirectoryListing -Path $deployment.DeploymentRoot
+        try {
+            $ownership = Get-WacDeploymentOwnership -DeploymentRoot $deployment.DeploymentRoot
+
+            Assert-False $ownership.IsOurs 'an unreadable deployment path was proven to be ours'
+            Assert-Equal 'Indeterminate' $ownership.Kind ([string]$ownership.Reason)
+            Assert-True ([string]$ownership.Reason -match 'could not be enumerated') ([string]$ownership.Reason)
+        }
+        finally {
+            Unblock-TestDirectoryListing -Path $deployment.DeploymentRoot
+        }
+
+        # Readable again, and the same tree is Managed and ours: the refusal was about the evidence,
+        # and a benign steady state is not turned into a permanent security refusal.
+        $again = Get-WacDeploymentOwnership -DeploymentRoot $deployment.DeploymentRoot
+        Assert-Equal 'Managed' $again.Kind ([string]$again.Reason)
+        Assert-True $again.IsOurs ([string]$again.Reason)
+        Assert-False $again.Tampered ((@($again.Findings)) -join '; ')
+    }
+}
 
 Test-Case 'A fresh deployment is Managed, and a SECOND identical run is still benign' {
     # The trap this case exists for: a previous wave shipped a check whose own leftovers made every

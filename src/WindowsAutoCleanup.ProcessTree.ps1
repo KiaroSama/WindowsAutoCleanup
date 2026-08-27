@@ -1,0 +1,456 @@
+<#
+.SYNOPSIS
+    Proving that a process, and everything it started, has stopped.
+
+.DESCRIPTION
+    Dot-sourced by WindowsAutoCleanup.Process.ps1, which is itself dot-sourced by
+    WindowsAutoCleanup.Core.psm1; see Core for why the parts are dot-sourced rather than imported.
+
+    It is its own file because it is its own question. The rest of Process.ps1 is about STARTING
+    work and holding it to a deadline; everything here is about the evidence that the work is over -
+    the toolhelp snapshot that says which identities a tree is made of, the kernel handle bound to
+    each of them before anything is killed, and the structured verdict that separates "proven gone"
+    from "nobody could tell".
+#>
+
+# The injected opener seam lives with the only code that binds a handle.
+$script:ProcessHandleOpener = $null
+function Set-WacProcessHandleOpener {
+    <#
+    .SYNOPSIS
+        Replaces the OpenProcess call Stop-WacProcessTree binds its handle with. $null restores it.
+    .DESCRIPTION
+        The scriptblock receives (ProcessId) and must return an object exposing Handle and
+        Win32Error, in the same spirit as Set-WacProcessInvoker and Set-WacLogWriter.
+
+        It exists for exactly one arm: "the id exists but the OS will not hand over a handle". Only
+        a protected process produces that for real - PID 4 and csrss measured 5 ERROR_ACCESS_DENIED
+        on both hosts - and a case that asks the shipped code to terminate one of those is not
+        something to run on a workstation, at any privilege level.
+
+        Inject a FAILURE (Handle = IntPtr.Zero) and nothing else: a fabricated non-zero handle is
+        waited on, terminated and closed for real.
+    #>
+    param([scriptblock]$Opener)
+    $script:ProcessHandleOpener = $Opener
+}
+
+function Initialize-WacProcessTreeNative {
+    <#
+    .SYNOPSIS
+        Compiles the toolhelp snapshot helper Stop-WacProcessTree enumerates a tree with. Idempotent.
+    .DESCRIPTION
+        Separate from Initialize-WacNative because it answers a different question and only the
+        termination path ever asks it: WacNative binds and kills ONE identity, this one says which
+        identities a tree is made of. Returns $false when it could not be compiled, and a caller
+        that cannot read the tree must not claim a tree was terminated.
+    #>
+    if ('WacProcessTree' -as [type]) { return $true }
+
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class WacProcessTree
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct PROCESSENTRY32W
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool Process32FirstW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool Process32NextW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private const uint TH32CS_SNAPPROCESS = 0x00000002;
+
+    // Every id reachable from rootId through the parent-process-id relation, nearest generation
+    // first. One snapshot answers for the whole machine, so a deep tree costs one call rather than
+    // one per level, and no WMI/CIM service is involved - this runs on the path that has to work
+    // when something is already wedged.
+    //
+    // Windows does not reuse the id of a LIVE process, so while the root is alive an entry naming
+    // it as parent really is its child: the same relation taskkill /T walks. An ORPHAN whose own
+    // parent exited long ago can still carry a recycled number, which is why the caller binds a
+    // kernel handle to every id this returns BEFORE it kills anything, and never terminates
+    // through the number itself.
+    //
+    // null means the snapshot could not be taken or read. That is not the same answer as an empty
+    // array and the caller must not read it as one.
+    public static int[] GetDescendantIds(int rootId)
+    {
+        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1)) { return null; }
+
+        try
+        {
+            List<int> ids = new List<int>();
+            List<int> parents = new List<int>();
+
+            PROCESSENTRY32W entry = new PROCESSENTRY32W();
+            entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32W));
+            if (!Process32FirstW(snapshot, ref entry)) { return null; }
+            do
+            {
+                ids.Add((int)entry.th32ProcessID);
+                parents.Add((int)entry.th32ParentProcessID);
+            }
+            while (Process32NextW(snapshot, ref entry));
+
+            List<int> found = new List<int>();
+            List<int> frontier = new List<int>();
+            frontier.Add(rootId);
+
+            while (frontier.Count > 0)
+            {
+                List<int> next = new List<int>();
+                for (int i = 0; i < ids.Count; i++)
+                {
+                    int id = ids[i];
+                    if (id == rootId || id == 0) { continue; }
+                    if (found.Contains(id)) { continue; }
+                    if (!frontier.Contains(parents[i])) { continue; }
+                    found.Add(id);
+                    next.Add(id);
+                }
+                frontier = next;
+            }
+
+            return found.ToArray();
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+    }
+}
+'@
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-WacProcessDescendantId {
+    <#
+    .SYNOPSIS
+        The ids below one process id, or $null when the tree could not be read at all.
+    .DESCRIPTION
+        $null and an empty array are different answers and the caller has to keep them apart: one
+        means "this process has no children", the other means "nobody knows", and only the first is
+        evidence.
+    #>
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    if (-not (Initialize-WacProcessTreeNative)) { return $null }
+
+    $ids = $null
+    try { $ids = [WacProcessTree]::GetDescendantIds($ProcessId) } catch { return $null }
+    if ($null -eq $ids) { return $null }
+
+    # The comma is the whole point: `return @()` writes NOTHING to the output stream, so a process
+    # with no children came back as $null and was read as "nobody knows" - the one distinction this
+    # function exists to make. Measured: it turned a completely successful tree kill into
+    # Proven=$false.
+    return , ([int[]]$ids)
+}
+
+function Open-WacProcessBinding {
+    <#
+    .SYNOPSIS
+        A kernel handle bound to whatever owns an id at this instant, plus why it could not be bound.
+    .DESCRIPTION
+        Split out of Stop-WacProcessTree because a tree needs one of these per identity, and the
+        injected opener seam has to reach every one of them rather than only the root.
+    .OUTPUTS
+        Id, Handle (IntPtr::Zero when nothing was bound), Win32Error.
+    #>
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $handle = [IntPtr]::Zero
+    # -1 is not a Win32 code. It stands for "no handle could be bound at all", which is a different
+    # claim from "nothing owns this id" and must never be reported as one.
+    $win32 = -1
+
+    if ($script:ProcessHandleOpener) {
+        $injected = & $script:ProcessHandleOpener $ProcessId
+        $handle = [IntPtr]$injected.Handle
+        $win32 = [int]$injected.Win32Error
+    }
+    elseif (Initialize-WacNative) {
+        $win32 = [WacNative]::OpenProcessForTermination($ProcessId, [ref]$handle)
+    }
+
+    return [PSCustomObject]@{ Id = $ProcessId; Handle = $handle; Win32Error = $win32 }
+}
+
+function New-WacTerminationResult {
+    <#
+    .SYNOPSIS
+        The structured verdict Stop-WacProcessTree returns.
+    .DESCRIPTION
+        Proven is the only field a caller may treat as evidence, and it is $true ONLY when every
+        identity the call bound is known to have exited. The rest is why: Bound is what was proved,
+        Survivor is what was not, and Reason is the sentence for the log.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$Root,
+        [Parameter(Mandatory = $true)][bool]$Proven,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [AllowEmptyCollection()][int[]]$Bound = @(),
+        [AllowEmptyCollection()][int[]]$Survivor = @(),
+        $TaskkillExit = $null
+    )
+
+    return [PSCustomObject]@{
+        Root         = $Root
+        Proven       = $Proven
+        Bound        = [int[]]$Bound
+        Survivor     = [int[]]$Survivor
+        TaskkillExit = $TaskkillExit
+        Reason       = $Reason
+    }
+}
+
+function Invoke-WacTaskkillTree {
+    <#
+    .SYNOPSIS
+        Runs taskkill /T /F against one id and returns its exit code, or $null. Never throws.
+    .DESCRIPTION
+        Kept because /T is the only mechanism that reaches a whole tree in ONE call, and because its
+        exit code is the evidence of WHY a kill did not take: measured on both shipped hosts, 0 is
+        success, 128 is "not found" and 255 is "could not be terminated". Evidence, never the
+        verdict - the caller proves the outcome on its own handles.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][int]$TimeoutMs
+    )
+
+    $exitCode = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = (Join-Path -Path $env:SystemRoot -ChildPath 'System32\taskkill.exe')
+        $psi.Arguments = ConvertTo-WacCommandLine -ArgumentList @('/T', '/F', '/PID', [string]$ProcessId)
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+
+        $killer = [System.Diagnostics.Process]::Start($psi)
+        if ($killer) {
+            [void]$killer.StandardOutput.ReadToEndAsync()
+            [void]$killer.StandardError.ReadToEndAsync()
+            if ($killer.WaitForExit($TimeoutMs)) {
+                try { $exitCode = [int]$killer.ExitCode } catch { $exitCode = $null }
+            }
+            else {
+                # taskkill itself overran its bound. Killing it directly is not recursion: it is our
+                # own child and has no tree of its own worth walking.
+                try { $killer.Kill() } catch { $null = $_ }
+            }
+            try { $killer.Dispose() } catch { $null = $_ }
+        }
+    }
+    catch {
+        $exitCode = $null
+    }
+
+    return $exitCode
+}
+
+function Stop-WacProcessTree {
+    <#
+    .SYNOPSIS
+        Kills a process AND its descendants, and reports termination as PROVEN only when every one
+        of them is known to have exited.
+    .DESCRIPTION
+        Two defects, one after the other, in the same place.
+
+        The first was taking taskkill's exit as the answer. Measured on both shipped hosts,
+        taskkill /T /F /PID returns 0 (terminated), 128 (not found) and 255 (could not be
+        terminated), and all three EXIT - so "taskkill ran" was reported as "the process is dead".
+        That was fixed by binding a kernel handle to the target at entry and waiting on it.
+
+        The second is the one this body exists for: only the ROOT was ever bound. If taskkill is
+        missing, refuses, or exits 0 having killed nothing, the escalation - TerminateProcess
+        through the root's own handle - reaches the root and NOTHING BELOW IT, so the call returned
+        $true while a child of the process it was told to remove kept running and kept writing.
+
+        So the tree is bound, not just the root. Every descendant is enumerated and OPENED BEFORE
+        anything is killed, which is what keeps each later answer attached to the process that was
+        opened however Windows reuses the number, and the verdict is the conjunction over all of
+        them. A tree that cannot be enumerated at all, or an identity that cannot be opened for a
+        reason other than "nothing owns this id", leaves Proven $false: unreadable state is never
+        reported as proof, the same way Test-WacIsReparsePoint refuses to call an unreadable
+        descriptor safe.
+
+        A Windows job object with kill-on-close would be stronger still, because a job assigned AT
+        CREATION cannot be escaped by a grandchild. It is not reachable from here.
+        System.Diagnostics.Process on either shipped host exposes neither CREATE_SUSPENDED nor
+        STARTUPINFOEX's PROC_THREAD_ATTRIBUTE_JOB_LIST, so AssignProcessToJobObject could only run
+        after the child is already executing - the same escape window this pays for - and the child
+        that matters most, the elevated relaunch, runs at high integrity where a medium-integrity
+        parent cannot obtain the PROCESS_SET_QUOTA the assignment requires.
+
+        A process spawned WHILE the kill is in flight is caught by re-enumerating after each pass.
+        That loop is bounded: a tree still spawning after three passes is reported as unproven
+        rather than chased forever.
+    .OUTPUTS
+        Root, Proven, Bound, Survivor, TaskkillExit, Reason. Only Proven is evidence.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [int]$TimeoutMs = 10000
+    )
+
+    if ($TimeoutMs -le 0) { $TimeoutMs = 1 }
+    [void](Initialize-WacNative)
+
+    $root = Open-WacProcessBinding -ProcessId $ProcessId
+    if ($root.Handle -eq [IntPtr]::Zero) {
+        # ERROR_INVALID_PARAMETER: nothing owns this id, so the target is gone and the caller got
+        # what it asked for. Every OTHER failure is unverifiable, and unverifiable is not success.
+        if ($root.Win32Error -eq 87) {
+            return (New-WacTerminationResult -Root $ProcessId -Proven $true `
+                    -Reason 'Nothing owns the target id, so the target is gone.')
+        }
+
+        Write-WacLog -Level WARNING -Component 'Process' -Message 'The target could not be opened, so termination is unverifiable.' -Data @{
+            pid        = $ProcessId
+            win32Error = $root.Win32Error
+        }
+        return (New-WacTerminationResult -Root $ProcessId -Proven $false -Survivor @($ProcessId) `
+                -Reason ('The target could not be opened (Win32 error {0}), so termination is unverifiable.' -f $root.Win32Error))
+    }
+
+    $bound = New-Object 'System.Collections.Generic.List[object]'
+    [void]$bound.Add($root)
+    $unreadable = New-Object 'System.Collections.Generic.List[int]'
+    $treeUnreadable = $false
+    $taskkillExit = $null
+
+    # Binds every id in the supplied list that is not bound already. An id nothing owns any more is
+    # simply gone; an id that refuses to open is recorded and keeps the verdict at unproven.
+    $bindEach = {
+        param($Candidate)
+
+        foreach ($id in @($Candidate)) {
+            $known = $false
+            foreach ($entry in $bound) { if ([int]$entry.Id -eq [int]$id) { $known = $true; break } }
+            if ($known -or $unreadable.Contains([int]$id)) { continue }
+
+            $binding = Open-WacProcessBinding -ProcessId ([int]$id)
+            if ($binding.Handle -ne [IntPtr]::Zero) { [void]$bound.Add($binding); continue }
+            if ($binding.Win32Error -eq 87) { continue }
+            [void]$unreadable.Add([int]$id)
+        }
+    }
+
+    try {
+        $descendant = Get-WacProcessDescendantId -ProcessId $ProcessId
+        if ($null -eq $descendant) { $treeUnreadable = $true } else { & $bindEach $descendant }
+
+        # Already gone before anything was asked of it, and nothing under it. The handle is what
+        # makes this the TARGET's own exit rather than a later occupant of the number, so no kill is
+        # needed or attempted.
+        if (-not $treeUnreadable -and $unreadable.Count -eq 0 -and $bound.Count -eq 1 -and
+            [WacNative]::WaitForProcessExit($root.Handle, 0) -eq 0) {
+            return (New-WacTerminationResult -Root $ProcessId -Proven $true -Bound @($ProcessId) `
+                    -Reason 'The target had already exited and had no descendant.')
+        }
+
+        $taskkillExit = Invoke-WacTaskkillTree -ProcessId $ProcessId -TimeoutMs $TimeoutMs
+        $waitDeadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
+
+        # Anything taskkill has not already killed is escalated at once rather than waited out
+        # first. Waiting the caller's whole bound before escalating was measured at 20.8 s per case
+        # against a taskkill that killed nothing - the exact scenario this function exists for -
+        # because every bound identity was still pending and the wait had nothing to wait for.
+        # taskkill has already EXITED by this point, so whatever it did land is a few milliseconds
+        # away, and TerminateProcess against a process already tearing down is harmless.
+        #
+        # Three passes: every pass after the first exists only for a process that appeared DURING
+        # the kill, and a tree still spawning after three is not settling - the caller needs an
+        # answer more than it needs another round.
+        for ($pass = 1; $pass -le 3; $pass++) {
+            $null = $pass
+            $pending = @($bound | Where-Object { [WacNative]::WaitForProcessExit($_.Handle, 0) -ne 0 })
+
+            # The escalation goes through each identity's OWN handle rather than its id, so it
+            # cannot land on whatever inherited the number while taskkill was running.
+            foreach ($entry in $pending) { [void][WacNative]::TerminateBoundProcess($entry.Handle) }
+
+            # TerminateProcess is documented as asynchronous: it ASKS for termination and returns
+            # before the process is gone. This wait is the deterministic signal that it finished.
+            # The floor keeps a caller's very short bound from turning "asked" into "gave up"; the
+            # ceiling keeps a long one from being spent here rather than on the rescan.
+            $left = [int][Math]::Max(0, ($waitDeadline - [datetime]::UtcNow).TotalMilliseconds)
+            $killDeadline = [datetime]::UtcNow.AddMilliseconds([Math]::Min(5000, [Math]::Max(1000, $left)))
+            foreach ($entry in $pending) {
+                $wait = [int][Math]::Max(0, ($killDeadline - [datetime]::UtcNow).TotalMilliseconds)
+                [void][WacNative]::WaitForProcessExit($entry.Handle, $wait)
+            }
+
+            $descendant = Get-WacProcessDescendantId -ProcessId $ProcessId
+            if ($null -eq $descendant) { $treeUnreadable = $true; break }
+            if (@($descendant).Count -eq 0) { break }
+            & $bindEach $descendant
+        }
+
+        $survivor = New-Object 'System.Collections.Generic.List[int]'
+        foreach ($entry in $bound) {
+            if ([WacNative]::WaitForProcessExit($entry.Handle, 0) -ne 0) { [void]$survivor.Add([int]$entry.Id) }
+        }
+        foreach ($id in $unreadable) { [void]$survivor.Add([int]$id) }
+
+        $proven = (($survivor.Count -eq 0) -and (-not $treeUnreadable))
+        $reason = if ($proven) {
+            'Every bound identity in the tree is known to have exited.'
+        }
+        elseif ($treeUnreadable) {
+            'The process tree could not be enumerated, so nothing below the target was proven gone.'
+        }
+        else {
+            '{0} identity/identities in the tree could not be proven gone.' -f $survivor.Count
+        }
+
+        if (-not $proven) {
+            Write-WacLog -Level WARNING -Component 'Process' -Message 'Termination could not be established; part of the target tree may still be running.' -Data @{
+                pid            = $ProcessId
+                survivors      = (@($survivor.ToArray()) -join ',')
+                treeUnreadable = $treeUnreadable
+                taskkillExit   = $(if ($null -eq $taskkillExit) { 'none' } else { [string]$taskkillExit })
+            }
+        }
+
+        return (New-WacTerminationResult -Root $ProcessId -Proven $proven -Reason $reason `
+                -Bound @(@($bound | ForEach-Object { [int]$_.Id })) -Survivor @($survivor.ToArray()) `
+                -TaskkillExit $taskkillExit)
+    }
+    finally {
+        foreach ($entry in $bound) { [WacNative]::CloseProcessHandle($entry.Handle) }
+    }
+}

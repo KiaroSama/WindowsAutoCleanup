@@ -60,6 +60,12 @@ Test-Case 'A benign run exits 0, and the same state a second time still exits 0'
 
         $text = Get-RigLogText -Rig $rig
         Assert-True ($text -cmatch '(^|\s)skipReparse=3($|\s)') ('the benign counters never reached the totals: ' + $text)
+
+        # Free space is now read through System.IO.DriveInfo rather than Win32_LogicalDisk. Real
+        # values here are what proves the replacement actually answers on both shipped hosts; the
+        # broken-telemetry case below proves an unreadable one degrades to Unknown instead.
+        Assert-False ($text -cmatch '(^|\s)before=Unknown(\s|$)') `
+        ('free space came back unreadable on a healthy machine: ' + $text)
         Assert-False ($text.Contains('[CRITICAL]')) ('a benign run logged a CRITICAL line: ' + $text)
     }
     finally {
@@ -336,6 +342,141 @@ Test-Case 'A pre-import failure survives -LogLevel ERROR, in the run log or in t
         ('the import failure survived nowhere: log=[{0}] bootstrap=[{1}]' -f $text, $preserved)
         Assert-True ($text.Contains('A required module could not be loaded')) `
         ('the refusal to run was written below the level the operator set: ' + $text)
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A discovery that outlasts its bound is Incomplete, not an empty allow-list' {
+    # The defect in its literal shape. Run.ps1 called the UNBOUNDED builder, so a discovery that
+    # blocked in the OS produced no targets and no complaint: the run swept nothing, cleaned nothing
+    # and exited 0. Here the builder blocks for 4 s inside a 400 ms bound, so the run has to say the
+    # allow-list was never finished - and it has to finish saying it well inside its own budget.
+    $rig = New-RunRig -Prefix 'rig-discoveryslow'
+    try {
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = Invoke-RunRig -Rig $rig -TimeoutMs 60000 -Plan @{
+            targetTimeoutMs = 400
+            targetBlockMs   = 4000
+            targets         = @((New-PlanTarget -Category 'Temp' -FilesDeleted 1))
+        }
+        $watch.Stop()
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 6 -Status 'Incomplete'
+        Assert-True ($watch.Elapsed.TotalSeconds -lt 45) `
+        ('the run did not come back inside its asserted budget: {0:N1}s' -f $watch.Elapsed.TotalSeconds)
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text.Contains('The cleanup allow-list could not be built')) `
+        ('a discovery that never finished was not reported at all: ' + $text)
+        Assert-True ($text -cmatch '(^|\s)category="Cleanup allow-list"') `
+        ('the discovery outcome never became a step: ' + $text)
+
+        # The target the plan offers must NOT have been swept: a list that was never built cannot
+        # have produced one.
+        Assert-False ($text.Contains('[Result] Target complete.')) `
+        ('a target was swept out of an allow-list that was never finished: ' + $text)
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A discovery that fails outright is a step failure, not a clean run' {
+    $rig = New-RunRig -Prefix 'rig-discoveryfail'
+    try {
+        $result = Invoke-RunRig -Rig $rig -TimeoutMs 60000 -Plan @{
+            targetThrow = $true
+            targets     = @((New-PlanTarget -Category 'Temp' -FilesDeleted 1))
+        }
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 2 -Status 'Failed'
+        Assert-True ((Get-RigLogText -Rig $rig).Contains('The cleanup allow-list could not be built')) `
+        'a failed discovery never said so'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A telemetry failure degrades the header and never erases a cleanup failure' {
+    # Free space and the OS edition are diagnostics. Neither is an input to the verdict, so breaking
+    # both has to leave a run that still reaches its footer and still reports the failure it found.
+    # Before the guard, a throwing diagnostic reached the run's outer handler and turned an exit 2
+    # into a plain exit 1 - the cleanup result erased by the line that was only describing it.
+    $rig = New-RunRig -Prefix 'rig-telemetry'
+    try {
+        $result = Invoke-RunRig -Rig $rig -TimeoutMs 60000 -Plan @{
+            telemetryFails = $true
+            dismOutcome    = 'Failed'
+            targets        = @((New-PlanTarget -Category 'Temp' -FilesDeleted 2))
+        }
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 2 -Status 'Failed'
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text.Contains('A diagnostic could not be read')) `
+        ('the broken diagnostics were swallowed instead of degraded: ' + $text)
+        Assert-True ($text.Contains('Free space on C:.')) 'the footer lost the free-space line entirely'
+        Assert-True ($text -cmatch '(^|\s)before=Unknown(\s|$)') `
+        ('an unreadable free-space value was not reported as Unknown: ' + $text)
+        Assert-True ($text.Contains('[Result] Target complete.')) `
+        'the run stopped cleaning because a diagnostic failed'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A refusing pre-cleanup check mutates nothing at all' {
+    # The Group 1 defect end to end. The state directory's trust verdict was consulted only in the
+    # footer, so the run exited 7 AFTER the sweep, DISM, the driver steps and the Recycle Bin had
+    # all already run. Same exit code, same status, and now no cleanup line anywhere in the log.
+    $rig = New-RunRig -Prefix 'rig-gate'
+    try {
+        $result = Invoke-RunRig -Rig $rig -Plan @{
+            stateTrusted = $false
+            targets      = @((New-PlanTarget -Category 'Temp' -FilesDeleted 5))
+        }
+
+        Assert-RigExit -Rig $rig -Result $result -ExitCode 7 -Status 'SecurityRefusal'
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-True ($text.Contains('nothing on this machine was mutated')) `
+        ('the gate did not report that it refused before mutating: ' + $text)
+        Assert-False ($text.Contains('[Result] Target complete.')) `
+        ('the untrusted run swept a target anyway: ' + $text)
+        Assert-False ($text.Contains('Step complete.')) `
+        ('the untrusted run ran a cleanup step anyway: ' + $text)
+        Assert-False ($text.Contains('Cleanup totals.')) `
+        ('the untrusted run reached the footer, so it had already cleaned: ' + $text)
+
+        # And the retention sweep - the first thing that deletes anything - never ran either, so the
+        # gate really is ahead of every mutation and not merely ahead of the allow-list.
+        $logs = @(Get-ChildItem -LiteralPath $rig.LogDirectory -Filter 'WindowsAutoCleanup_*.log' -File)
+        Assert-Equal 1 $logs.Count 'the refusing run left more or fewer logs than the one it wrote'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A benign run stays benign over a state directory the gate has already approved twice' {
+    # The steady-state trap, now with the gate in front of it: a check that refuses on a leftover
+    # from run 1 would refuse BEFORE run 2 cleans, which is worse than refusing after. Both runs use
+    # the same sandbox, the same redirected %ProgramData% and the same driver-backup directory.
+    $rig = New-RunRig -Prefix 'rig-gatebenign'
+    try {
+        $plan = @{ targets = @((New-PlanTarget -Category 'Temp' -FilesDeleted 3 -SkippedReparse 3 -SkippedOutOfRoot 1)) }
+
+        Assert-RigExit -Rig $rig -Result (Invoke-RunRig -Rig $rig -Plan $plan) -ExitCode 0 -Status 'Succeeded'
+        Assert-RigExit -Rig $rig -Result (Invoke-RunRig -Rig $rig -Plan $plan) -ExitCode 0 -Status 'Succeeded'
+
+        $text = Get-RigLogText -Rig $rig
+        Assert-False ($text.Contains('A pre-cleanup check refused this run')) `
+        ('the gate refused a benign steady state on the second run: ' + $text)
+        Assert-False ($text.Contains('[CRITICAL]')) ('a benign second run logged a CRITICAL line: ' + $text)
     }
     finally {
         Remove-RunRig -Rig $rig

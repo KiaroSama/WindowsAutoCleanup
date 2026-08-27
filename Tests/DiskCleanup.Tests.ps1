@@ -44,8 +44,15 @@ function New-ScratchVolumeCacheKey {
     #>
     param([Parameter(Mandatory = $true)][string]$KeyPath)
 
+    # CreateSubKey rather than New-Item: the provider probes a parent by ENUMERATING it, and the two
+    # hosts create and delete their own scratch roots under HKCU:\Software at the same time, so that
+    # enumeration intermittently answers ERROR_NO_MORE_DATA. The Win32 call creates the whole chain
+    # without reading anything else under the parent.
+    $relative = $KeyPath -replace '^(?i)HKCU:\\', ''
     foreach ($handler in @('Temporary Files', 'Thumbnail Cache', 'Offline Pages Files', 'Not A Real Handler')) {
-        [void](New-Item -Path (Join-Path -Path $KeyPath -ChildPath $handler) -Force -ErrorAction Stop)
+        $created = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey(($relative + '\' + $handler))
+        if ($null -eq $created) { throw ('the scratch key {0} could not be created' -f $handler) }
+        $created.Close()
     }
 
     # One handler starts with a value another tool could have configured; the rest start absent.
@@ -128,6 +135,32 @@ function Assert-StateFlagFact {
     Assert-Equal $Expected.Exists $Actual.Exists ('presence changed for {0}' -f $Handler)
     Assert-Equal ([string]$Expected.Kind) ([string]$Actual.Kind) ('kind changed for {0}' -f $Handler)
     Assert-Equal $Expected.Text $Actual.Text ('value changed for {0}' -f $Handler)
+}
+
+$script:ObservedProfile = @{}
+
+function Set-ProfileObserver {
+    <#
+    .SYNOPSIS
+        Delegates to the recording invoker and records, as it passes, the profile cleanmgr would
+        actually have been run against - the only moment that answers "which categories did this
+        run enable", because the step puts the profile back straight afterwards.
+    #>
+    $keyPath = Get-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath'
+    $script:ObservedProfile = @{}
+    $observed = $script:ObservedProfile
+    $inner = $script:RecordingInvoker
+
+    Set-WacProcessInvoker -Invoker {
+        param($FilePath, $ArgumentList, $TimeoutMs)
+
+        foreach ($handler in @(Get-ChildItem -LiteralPath $keyPath -ErrorAction Stop)) {
+            $name = [string](Split-Path -Leaf $handler.Name)
+            $observed[$name] = (Get-StateFlagFact -KeyPath $keyPath -Handler $name -ValueName 'StateFlags9999').Text
+        }
+
+        return (& $inner $FilePath $ArgumentList $TimeoutMs)
+    }.GetNewClosure()
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -626,6 +659,138 @@ Test-Case 'the REAL bound carries arguments in and a snapshot back out' {
         Assert-Equal 'DWord' ([string]$thumbnail[0].Kind)
     }
     finally {
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'a handler nobody selected is switched off for the run and put back exactly afterwards' {
+    # A sage id is a number this project borrows, not one it owns. On a machine where someone once
+    # ran cleanmgr /sageset:9999 their handlers are ALREADY enabled, so enabling only the requested
+    # ones leaves theirs running too - and putting the profile back does not undo what they deleted.
+    $scenario = @(
+        @{ Key = 'Clean';   Name = 'a clean run';       Canned = @{ ExitCode = 0 };                        Outcome = 'Succeeded' },
+        @{ Key = 'Launch';  Name = 'a failed launch';   Canned = @{ ExitCode = $null; TimedOut = $false }; Outcome = 'Failed' },
+        @{ Key = 'Killed';  Name = 'a killed cleanmgr'; Canned = @{ ExitCode = $null; TimedOut = $true };  Outcome = 'Incomplete' }
+    )
+    $handlerName = @('Temporary Files', 'Thumbnail Cache', 'Offline Pages Files', 'Not A Real Handler')
+    $originalKeyPath = Get-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath'
+
+    try {
+        foreach ($entry in $scenario) {
+            # A key of its own per row rather than one deleted and recreated between them.
+            $key = New-ScratchVolumeCacheKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath $entry['Key'])
+            Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $key
+            # Enabled at this very sage id and requested by nobody. 'Offline Pages Files' is the one
+            # this step refuses to ENABLE, which is no reason to leave it running.
+            foreach ($stale in @('Not A Real Handler', 'Offline Pages Files')) {
+                Add-ScratchStateFlagValue -KeyPath $key -Handler $stale -ValueName 'StateFlags9999' `
+                    -Kind ([Microsoft.Win32.RegistryValueKind]::DWord) -Value 2
+            }
+
+            $expected = @{}
+            foreach ($handler in $handlerName) {
+                $expected[$handler] = Get-StateFlagFact -KeyPath $key -Handler $handler -ValueName 'StateFlags9999'
+            }
+
+            Invoke-WithStubbedTool -StubToolPath -Body {
+                $script:StubResult['/sagerun:9999'] = $entry['Canned']
+                Set-ProfileObserver
+                $result = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999 -Category @('Temporary Files', 'Thumbnail Cache')
+
+                Assert-Equal 1 $script:StubCall.Count ('{0}: cleanmgr must have run exactly once' -f $entry['Name'])
+                Assert-Equal $entry['Outcome'] $result.Outcome ('{0}: {1}' -f $entry['Name'], $result.Detail)
+
+                $seen = $script:ObservedProfile
+                Assert-Equal '2' ([string]$seen['Temporary Files']) ('{0}: a requested handler was not enabled' -f $entry['Name'])
+                Assert-Equal '2' ([string]$seen['Thumbnail Cache']) ('{0}: a requested handler was not enabled' -f $entry['Name'])
+                Assert-Equal '0' ([string]$seen['Not A Real Handler']) ('{0}: cleanmgr ran a category nobody selected' -f $entry['Name'])
+                Assert-Equal '0' ([string]$seen['Offline Pages Files']) ('{0}: cleanmgr ran a category nobody selected' -f $entry['Name'])
+            }
+
+            foreach ($handler in $handlerName) {
+                Assert-StateFlagFact -Expected $expected[$handler] `
+                    -Actual (Get-StateFlagFact -KeyPath $key -Handler $handler -ValueName 'StateFlags9999') `
+                    -Handler ('{0} after {1}' -f $handler, $entry['Name'])
+            }
+        }
+    }
+    finally {
+        Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $originalKeyPath
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'an unverifiable profile is never launched, and a restore fault is reported handler by handler' {
+    # Two registry-write faults, one table. Row 1 is a profile write that reports success and does
+    # nothing - what an enabled-but-not-really selection looks like from inside the step; row 2 is
+    # the restore of one pre-existing value failing. Both end non-success.
+    $scenario = @(
+        @{ Name = 'a profile write that changed nothing'
+           Shadow = {
+               param([Parameter(Mandatory = $true)][string]$LiteralPath, [Parameter(Mandatory = $true)][string]$Name,
+                   $PropertyType, $Value, [switch]$Force)
+               if ($LiteralPath -match 'Temporary Files') { return }
+               return (Microsoft.PowerShell.Management\New-ItemProperty -LiteralPath $LiteralPath -Name $Name -PropertyType $PropertyType -Value $Value -Force:$Force -ErrorAction Stop)
+           }
+           Key = 'NoWrite'; Ran = 0; Detail = 'did not read back as the exact requested selection'
+           After = @{ 'Temporary Files' = '<absent>'; 'Thumbnail Cache' = '7'; 'Not A Real Handler' = '2' } },
+
+        # 7 is the pre-existing Thumbnail Cache value and nothing else here ever writes it, so only
+        # that one restore fails; the profile writes themselves are 2 and 0.
+        @{ Name = 'a restore that failed on one handler'
+           Shadow = {
+               param([Parameter(Mandatory = $true)][string]$LiteralPath, [Parameter(Mandatory = $true)][string]$Name,
+                   $PropertyType, $Value, [switch]$Force)
+               if ($Value -eq 7) { throw (New-Object System.UnauthorizedAccessException('Requested registry access is not allowed.')) }
+               return (Microsoft.PowerShell.Management\New-ItemProperty -LiteralPath $LiteralPath -Name $Name -PropertyType $PropertyType -Value $Value -Force:$Force -ErrorAction Stop)
+           }
+           Key = 'NoRestore'; Ran = 1; Detail = 'could not be restored for 1 handler'
+           After = @{ 'Temporary Files' = '<absent>'; 'Thumbnail Cache' = '2'; 'Not A Real Handler' = '2' } }
+    )
+
+    $originalKeyPath = Get-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath'
+
+    try {
+        foreach ($entry in $scenario) {
+            $key = New-ScratchVolumeCacheKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath $entry['Key'])
+            Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $key
+
+            Add-ScratchStateFlagValue -KeyPath $key -Handler 'Not A Real Handler' -ValueName 'StateFlags9999' `
+                -Kind ([Microsoft.Win32.RegistryValueKind]::DWord) -Value 2
+            Set-ModuleFunctionBody -Module $script:StepModule -Name 'New-ItemProperty' -Body $entry['Shadow']
+
+            try {
+                Invoke-WithStubbedTool -StubToolPath -Body {
+                    Set-ProfileObserver
+                    $result = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999 -Category @('Temporary Files', 'Thumbnail Cache')
+
+                    Assert-Equal $entry['Ran'] $script:StubCall.Count ('{0}: cleanmgr ran the wrong number of times' -f $entry['Name'])
+                    Assert-Equal 'Incomplete' $result.Outcome ('{0}: {1}' -f $entry['Name'], $result.Detail)
+                    Assert-True $result.Failed ('{0} was reported as a clean run: {1}' -f $entry['Name'], $result.Detail)
+                    Assert-False $result.Skipped ('{0} was reported as a benign skip: {1}' -f $entry['Name'], $result.Detail)
+                    Assert-True ($result.Detail -match $entry['Detail']) ('{0}: {1}' -f $entry['Name'], $result.Detail)
+
+                    # The restore asserted below only means something if this run switched the
+                    # unrequested handler off in the first place.
+                    if ($entry['Ran'] -gt 0) {
+                        Assert-Equal '0' ([string]$script:ObservedProfile['Not A Real Handler']) `
+                            ('{0}: cleanmgr ran a category nobody selected' -f $entry['Name'])
+                    }
+                }
+            }
+            finally {
+                Remove-ModuleFunction -Module $script:StepModule -Name 'New-ItemProperty'
+            }
+
+            foreach ($handler in @($entry['After'].Keys)) {
+                Assert-Equal ([string]$entry['After'][$handler]) `
+                    (Get-StateFlagFact -KeyPath $key -Handler $handler -ValueName 'StateFlags9999').Text `
+                    ('{0}: {1} was left in the wrong state' -f $entry['Name'], $handler)
+            }
+        }
+    }
+    finally {
+        Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $originalKeyPath
         Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

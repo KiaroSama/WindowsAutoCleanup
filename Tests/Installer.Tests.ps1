@@ -530,11 +530,32 @@ function Get-CallOffset {
     return @($commands | Where-Object { $_.GetCommandName() -eq $Name } | ForEach-Object { [int]$_.Extent.StartOffset } | Sort-Object)
 }
 
+function Get-EntryPointMain {
+    <#
+    .SYNOPSIS
+        The Invoke-Main definition of one entry point.
+    .DESCRIPTION
+        Every ordering assertion below is about the order things HAPPEN, which is the order of calls
+        inside Invoke-Main - not the order in which the helper functions those calls reach are
+        defined higher up the file. Scoping the search here is what lets the rollback path have its
+        own Register-ScheduledTask without that being mistaken for a second registration.
+    #>
+    param([Parameter(Mandatory = $true)]$Ast)
+
+    $main = @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Main'
+    }, $true))
+
+    Assert-Equal 1 $main.Count 'the entry point no longer has exactly one Invoke-Main'
+    return $main[0]
+}
+
 Test-Case 'The installer resolves the existing task BEFORE it switches the new tree into place' {
     # The window this closes: copying over the live deployment first leaves the OLD task able to
     # start against the NEW files. Staging is fine - it writes to a different directory - but the
     # SWITCH must come after the old registration is gone.
-    $ast = Get-EntryPointAst -Name 'Install-WindowsAutoCleanupTask.ps1'
+    $ast = Get-EntryPointMain -Ast (Get-EntryPointAst -Name 'Install-WindowsAutoCleanupTask.ps1')
 
     $stage = @(Get-CallOffset -Ast $ast -Name 'New-WacDeploymentStage')
     $resolve = @(Get-CallOffset -Ast $ast -Name 'Resolve-ConflictingTask')
@@ -549,6 +570,16 @@ Test-Case 'The installer resolves the existing task BEFORE it switches the new t
     Assert-True ($resolve[0] -lt $switch[0]) 'the new tree is switched into place before the old task is resolved'
     Assert-True ($switch[0] -lt $register[0]) 'the task is registered before the tree it runs is live'
     Assert-True ($stage[0] -lt $switch[0]) 'the tree is switched in before it is staged'
+
+    # And the swap itself has to sit INSIDE the try whose catch rolls back, or a failure in the
+    # switch, or in the walk that proves what went live, exits without restoring anything.
+    $rollbackTry = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.TryStatementAst]
+    }, $true) | Where-Object { $_.Extent.Text -match 'Undo-Installation' })
+    Assert-Equal 1 $rollbackTry.Count 'the installer no longer has exactly one try whose catch rolls back'
+    Assert-True ($switch[0] -gt [int]$rollbackTry[0].Extent.StartOffset -and $switch[0] -lt [int]$rollbackTry[0].Extent.EndOffset) `
+        'the swap happens outside the try that rolls back, so a failed swap restores nothing'
 
     # Verification of the staged tree has to happen while it is still staged.
     $verify = @(Get-CallOffset -Ast $ast -Name 'Test-WacDeploymentTrusted')
@@ -576,8 +607,9 @@ Test-Case 'A failed registration rolls the installer back instead of leaving a h
     Assert-True ($catches.Count -ge 1) 'no catch clause rolls the installation back'
 
     # And the previous tree is only discarded after everything has been asserted.
-    $discard = @(Get-CallOffset -Ast $ast -Name 'Remove-WacDeploymentPrevious')
-    $assert = @(Get-CallOffset -Ast $ast -Name 'Assert-RegisteredTask')
+    $main = Get-EntryPointMain -Ast $ast
+    $discard = @(Get-CallOffset -Ast $main -Name 'Remove-WacDeploymentPrevious')
+    $assert = @(Get-CallOffset -Ast $main -Name 'Assert-RegisteredTask')
     Assert-Equal 1 $discard.Count
     Assert-True ($assert.Count -ge 1) 'the installer no longer reads the registered task back'
     Assert-True ($assert[0] -lt $discard[0]) 'the rollback point is thrown away before the task is verified'

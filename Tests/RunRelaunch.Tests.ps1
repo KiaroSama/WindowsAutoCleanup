@@ -33,10 +33,32 @@ Import-Module -Name (Join-Path -Path $script:SrcRoot -ChildPath 'WindowsAutoClea
 . ([scriptblock]::Create((Get-RunFunctionText -Name 'Get-WacRunRelaunchArgument')))
 . ([scriptblock]::Create((Get-RunFunctionText -Name 'Invoke-WacElevatedRelaunch')))
 
+# Also SHIPPED, not stood in for: the relaunch has to let go of the machine-wide operation lock
+# before it starts the child, because the child re-runs Run.ps1 and takes the same lock. A parent
+# that kept holding it would make its own elevated run exit 3.
+. ([scriptblock]::Create((Get-RunFunctionText -Name 'Exit-WacBootstrapLock')))
+
+function New-TestOperationLock {
+    <#
+    .SYNOPSIS
+        A stand-in for the held mutex that records the release. No kernel object is created: this
+        asserts the ORDER the shipped code releases in, not that Mutex.ReleaseMutex works.
+    #>
+    $lock = New-Object PSObject
+    Add-Member -InputObject $lock -MemberType NoteProperty -Name 'Released' -Value $false
+    Add-Member -InputObject $lock -MemberType ScriptMethod -Name 'ReleaseMutex' -Value { $this.Released = $true }
+    Add-Member -InputObject $lock -MemberType ScriptMethod -Name 'Dispose' -Value { }
+    return $lock
+}
+
 # Invoke-WacElevatedRelaunch hands the script's own bound-parameter snapshot straight to the
 # argument builder. The relaunch cases stand that builder in - the vector it really returns has its
 # own cases - so an empty table is all the call site needs.
 $script:BoundParameter = @{}
+
+# Run.ps1 holds the operation lock across the whole bootstrap, so the lifted relaunch always has one
+# to let go of. Cases that assert the release replace this with New-TestOperationLock.
+$script:OperationLock = $null
 
 function Get-RelaunchVector {
     <#
@@ -371,9 +393,17 @@ Test-Case 'An elevated child that overruns the run budget is terminated, and the
         # per case because Get-RelaunchVector rewrites the same variable. 210 is the shipped
         # default, so the wait asserted below is the one a real unelevated run asks for.
         $script:BudgetMinutes = 210
+        $lock = New-TestOperationLock
+        $script:OperationLock = $lock
         $exit = Invoke-WacElevatedRelaunch
 
         Assert-Equal 6 $exit 'a child that never finished the work it was started for did not report Incomplete'
+
+        # The child re-runs Run.ps1 and takes the SAME machine-wide lock. A parent still holding it
+        # would make its own elevated run exit 3 against itself.
+        Assert-True $lock.Released `
+            'the parent never released the machine-wide lock, so the child it started would be refused'
+        Assert-True ($null -eq $script:OperationLock) 'the released lock was left behind to be released twice'
         Assert-True ($child.WaitForExit(10000)) 'the overrunning child was left running'
         $budget = @($logged | Where-Object { $_.Message.Contains('exceeded the run budget') })
         Assert-Equal 1 $budget.Count 'the run never said why it gave up on its child'
@@ -407,8 +437,10 @@ Test-Case 'A termination that cannot be established is CRITICAL, and the child g
     # termination could not be ESTABLISHED and the child may still be running.
     function Stop-WacProcessTree {
         param([int]$ProcessId)
-        $null = $ProcessId
-        return $false
+        return [PSCustomObject]@{
+            Root = $ProcessId; Proven = $false; Bound = @($ProcessId); Survivor = @($ProcessId)
+            TaskkillExit = $null; Reason = 'test stand-in: termination could not be proven'
+        }
     }
 
     # A stand-in child: nothing has to be started to reach a wait that comes back false, and the
@@ -430,6 +462,7 @@ Test-Case 'A termination that cannot be established is CRITICAL, and the child g
     }
 
     $script:BudgetMinutes = 210
+    $script:OperationLock = New-TestOperationLock
     $exit = Invoke-WacElevatedRelaunch
 
     Assert-Equal 6 $exit 'a child that could not be proven terminated was not reported as Incomplete'

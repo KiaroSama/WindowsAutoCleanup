@@ -237,6 +237,14 @@ function Invoke-WacDriverPackagePrune {
         localized. Every surviving candidate is exported into a content-addressed directory and that
         copy is proved before its package is removed.
 
+        The deletion and its backup are ONE commit. A pending marker goes into the export directory
+        before pnputil is asked to remove anything and comes off only once the stamped manifest has
+        been read back, so from the moment a removal becomes possible the directory is protected
+        from reclamation whatever happens next. deleted and a clean outcome therefore advance only
+        when pnputil reported a documented success AND that commit is durable; a process that never
+        started, a killed one, a result with no readable exit code and a commit that failed are all
+        Incomplete or Failed, never the benign skip they used to fall into.
+
         /force, /uninstall and /reboot are never passed: they would delete a package in use, rip a
         driver off live devices, or restart the machine.
     #>
@@ -335,12 +343,13 @@ function Invoke-WacDriverPackagePrune {
     $skipped = 0
     $refused = 0
     $incomplete = 0
+    $failed = 0
     $rebootRequired = $false
     $outcome = 'Succeeded'
 
     foreach ($candidate in $candidates) {
         if (Test-WacDeadlineExpired) {
-            $remaining = $candidates.Count - $deleted - $skipped - $refused - $incomplete
+            $remaining = $candidates.Count - $deleted - $skipped - $refused - $incomplete - $failed
             $incomplete += $remaining
             $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
             Write-WacLog -Level WARNING -Component $component -Message 'The run deadline expired mid-prune.' -Data @{ remaining = $remaining }
@@ -371,30 +380,72 @@ function Invoke-WacDriverPackagePrune {
             continue
         }
 
-        # Never /force, /uninstall or /reboot.
-        $delete = Invoke-WacProcess -FilePath $pnputil -ArgumentList @('/delete-driver', [string]$candidate.DriverName) `
-            -TimeoutMs $deleteTimeoutMs -Component $component
-
-        if ($delete.TimedOut) {
-            $incomplete++
-            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
-            Write-WacLog -Level WARNING -Component $component -Message 'The deletion exceeded its deadline, so whether the package was removed is unknown.' -Data @{
+        # The marker goes down BEFORE the process is started, because from the instant pnputil may
+        # have removed something this directory stops being an ordinary export. A marker that cannot
+        # be written is therefore a reason not to delete at all.
+        if (-not (Set-WacDriverBackupDeletePending -Path $backup.Directory -DriverName ([string]$candidate.DriverName))) {
+            $failed++
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
+            [void](Remove-WacDriverBackupDirectory -Path $backup.Directory)
+            Write-WacLog -Level ERROR -Component $component -Message 'The deletion was abandoned because the pending-deletion marker could not be written.' -Data @{
                 driver = $candidate.DriverName; backup = $backup.Directory
             }
             continue
         }
 
-        if ($script:PnpUtilSuccessCode -contains $delete.ExitCode) {
-            $deleted++
-            if ($script:PnpUtilRebootCode -contains $delete.ExitCode) { $rebootRequired = $true }
+        # Never /force, /uninstall or /reboot.
+        $delete = Invoke-WacProcess -FilePath $pnputil -ArgumentList @('/delete-driver', [string]$candidate.DriverName) `
+            -TimeoutMs $deleteTimeoutMs -Component $component
 
-            # The stamp is what makes this directory a backup rather than a copy: from here the
-            # package is gone and no later run may overwrite it.
+        # Read defensively: Started is part of the runner's contract, but under Set-StrictMode 2.0 a
+        # property an injected runner omits throws rather than reading as absent.
+        $started = $true
+        if (@($delete.PSObject.Properties.Name) -ccontains 'Started') { $started = [bool]$delete.Started }
+
+        # TimedOut is answered FIRST because it is the only one of the three that says the tool ran:
+        # a process killed on its deadline may have removed the package, so nothing here may treat
+        # it as "never started" and throw the export away.
+        if ($delete.TimedOut -or ($started -and $null -eq $delete.ExitCode)) {
+            # Killed on its deadline, or exited without an exit code anyone could read. Whether the
+            # package survived is unknown, so the marker STAYS and the export is kept: it may be the
+            # only copy left of something that is already gone.
+            $incomplete++
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
+            Write-WacLog -Level WARNING -Component $component -Message 'The deletion produced no readable result, so whether the package was removed is unknown.' -Data @{
+                driver = $candidate.DriverName; backup = $backup.Directory; timedOut = [bool]$delete.TimedOut
+            }
+            continue
+        }
+
+        if (-not $started) {
+            # Process.Start itself failed, so nothing ran and nothing was removed: the export is a
+            # copy of a package that is still installed and may go. But a step that cannot start its
+            # own tool has not done its work either, and reporting that as a skip hid a broken run.
+            $failed++
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
+            [void](Remove-WacDriverBackupDirectory -Path $backup.Directory)
+            Write-WacLog -Level ERROR -Component $component -Message 'pnputil could not be started, so the package was left in place.' -Data @{
+                driver = $candidate.DriverName; error = [string]$delete.StandardError
+            }
+            continue
+        }
+
+        if ($script:PnpUtilSuccessCode -contains $delete.ExitCode) {
+            # The stamp is what makes this directory a backup rather than a copy, and it is written
+            # atomically. Only once it is durable does the count advance and the marker come off; a
+            # commit that failed leaves a removed package behind a protected export, which is a
+            # failed run and not a deletion anyone may call successful.
             if (-not (Complete-WacDriverBackup -Path $backup.Directory -Manifest $backup.Manifest)) {
-                Write-WacLog -Level WARNING -Component $component -Message 'The deletion could not be recorded in the backup manifest.' -Data @{
+                $failed++
+                $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
+                Write-WacLog -Level ERROR -Component $component -Message 'The package was removed but its backup could not be committed; the export is protected and needs manual recovery.' -Data @{
                     driver = $candidate.DriverName; backup = $backup.Directory
                 }
+                continue
             }
+
+            $deleted++
+            if ($script:PnpUtilRebootCode -contains $delete.ExitCode) { $rebootRequired = $true }
             Write-WacLog -Level INFO -Component $component -Message 'Removed a superseded driver package.' -Data @{
                 driver = $candidate.DriverName; original = $candidate.OriginalName; version = [string]$candidate.Version
                 supersededBy = $candidate.SupersededByName; exitCode = $delete.ExitCode
@@ -402,6 +453,9 @@ function Invoke-WacDriverPackagePrune {
             }
         }
         elseif ($script:PnpUtilBenignCode -contains $delete.ExitCode) {
+            # ERROR_NO_MORE_ITEMS: pnputil removed nothing, so the attempt left no ambiguity behind
+            # and the marker comes off again. The export stays exactly as reclaimable as it was.
+            [void](Clear-WacDriverBackupDeletePending -Path $backup.Directory)
             $skipped++
         }
         else {
@@ -418,8 +472,8 @@ function Invoke-WacDriverPackagePrune {
     return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
         -Outcome $outcome -Attempted $true -RebootRequired $rebootRequired `
         -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
-        -Detail ('candidates={0} deleted={1} skipped={2} refused={3} incomplete={4} enumerated={5} backup={6}' -f `
-            $candidates.Count, $deleted, $skipped, $refused, $incomplete, $enumerated, $normalizedBackupRoot)))
+        -Detail ('candidates={0} deleted={1} skipped={2} refused={3} incomplete={4} failed={5} enumerated={6} backup={7}' -f `
+            $candidates.Count, $deleted, $skipped, $refused, $incomplete, $failed, $enumerated, $normalizedBackupRoot)))
 }
 
 Export-ModuleMember -Function @(

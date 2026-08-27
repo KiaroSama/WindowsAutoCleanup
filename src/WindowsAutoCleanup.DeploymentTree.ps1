@@ -34,17 +34,47 @@ function Test-WacIsExcludedDeploymentName {
     return $false
 }
 
+function New-WacTreeWalkResult {
+    <#
+    .SYNOPSIS
+        One shape for every return out of Get-WacDeploymentItem, so no exit can forget to say
+        whether the walk saw the whole tree.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)]$Failure
+    )
+
+    return [PSCustomObject]@{
+        Entry = @($Item.ToArray())
+        Complete = ($Failure.Count -eq 0)
+        Failure = @($Failure.ToArray())
+    }
+}
+
 function Get-WacDeploymentItem {
     <#
     .SYNOPSIS
-        Depth-bounded walk that never descends into a reparse point.
+        Depth-bounded walk that never descends into a reparse point, and that SAYS when it could not
+        see the whole tree.
     .DESCRIPTION
         Get-ChildItem -Recurse follows junctions, which both loops and escapes the tree. A reparse
         point found inside a deployment is reported rather than followed, because the copy never
         creates one and its presence means something else wrote into the tree.
+
+        The walk used to swallow every enumeration error and to stop silently at the depth limit, so
+        an unreadable subtree and an empty one produced the same answer. That is how an inaccessible
+        deployment root read as "empty, therefore ours", and how a file below the depth limit became
+        invisible to the manifest, to the trust check and to the delete pass at once - copied, never
+        recorded, never deletable. Incompleteness is a first-class result now: enumeration denial, a
+        node that vanished mid-walk, a node that is neither a file nor a directory, a path that will
+        not canonicalise, and depth exhaustion each leave Complete false, and every caller that
+        would mutate on the strength of this walk has to refuse.
     .OUTPUTS
-        Records with Path, IsDirectory and IsReparsePoint. Nothing is filtered out: a delete pass
-        that skipped a name would leave the parent directory non-empty and fail.
+        Entry    - records with Path, IsDirectory and IsReparsePoint. Nothing is filtered out: a
+                   delete pass that skipped a name would leave the parent non-empty and fail.
+        Complete - false when anything at all could not be seen.
+        Failure  - Path and Reason for each of those.
     #>
     [CmdletBinding()]
     param(
@@ -53,40 +83,93 @@ function Get-WacDeploymentItem {
     )
 
     $items = New-Object 'System.Collections.Generic.List[object]'
-    if ($Depth -ge $script:MaxTreeDepth) { return @($items.ToArray()) }
+    $failures = New-Object 'System.Collections.Generic.List[object]'
+
+    if ($Depth -ge $script:MaxTreeDepth) {
+        [void]$failures.Add([PSCustomObject]@{
+            Path = $Root
+            Reason = ('The {0}-level depth limit was reached, so nothing below this directory was seen.' -f $script:MaxTreeDepth)
+        })
+        return (New-WacTreeWalkResult -Item $items -Failure $failures)
+    }
 
     $children = @()
     try {
         $children = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop)
     }
     catch {
-        return @($items.ToArray())
+        [void]$failures.Add([PSCustomObject]@{
+            Path = $Root
+            Reason = ('The directory could not be enumerated: {0}' -f $_.Exception.Message)
+        })
+        return (New-WacTreeWalkResult -Item $items -Failure $failures)
     }
 
     foreach ($entry in $children) {
-        $isDirectory = [bool]$entry.PSIsContainer
-        $isReparse = Test-WacIsReparsePoint -Path $entry.FullName
+        $path = ''
+        try { $path = [string]$entry.FullName } catch { $path = '' }
+
+        if ([string]::IsNullOrWhiteSpace($path) -or -not (Get-WacNormalizedPath -Path $path)) {
+            [void]$failures.Add([PSCustomObject]@{
+                Path = $Root
+                Reason = 'An entry under this directory has no path that can be canonicalised.'
+            })
+            continue
+        }
+
+        # Neither a file nor a directory - a device, or some other provider item - is something this
+        # walk cannot reason about, and therefore cannot claim to have accounted for.
+        $isDirectory = ($entry -is [System.IO.DirectoryInfo])
+        if (-not $isDirectory -and -not ($entry -is [System.IO.FileInfo])) {
+            [void]$failures.Add([PSCustomObject]@{
+                Path = $path
+                Reason = 'The entry is neither a file nor a directory, so the walk cannot account for it.'
+            })
+            continue
+        }
+
+        # Re-checked rather than trusting the record the enumeration handed back: an entry that has
+        # gone between then and now means the tree moved under the walk, which is missing evidence
+        # rather than an absent file.
+        if (-not (Test-Path -LiteralPath $path)) {
+            [void]$failures.Add([PSCustomObject]@{
+                Path = $path
+                Reason = 'The entry disappeared while the tree was being walked.'
+            })
+            continue
+        }
+
+        $isReparse = Test-WacIsReparsePoint -Path $path
 
         [void]$items.Add([PSCustomObject]@{
-            Path = $entry.FullName
+            Path = $path
             IsDirectory = $isDirectory
             IsReparsePoint = $isReparse
         })
 
         if ($isDirectory -and -not $isReparse) {
-            foreach ($child in (Get-WacDeploymentItem -Root $entry.FullName -Depth ($Depth + 1))) {
-                [void]$items.Add($child)
-            }
+            $child = Get-WacDeploymentItem -Root $path -Depth ($Depth + 1)
+            foreach ($record in @($child.Entry)) { [void]$items.Add($record) }
+            foreach ($problem in @($child.Failure)) { [void]$failures.Add($problem) }
         }
     }
 
-    return @($items.ToArray())
+    return (New-WacTreeWalkResult -Item $items -Failure $failures)
 }
 
 function Copy-WacDeploymentTree {
     <#
     .SYNOPSIS
         Recursive copy that skips excluded names and never follows a reparse point.
+    .DESCRIPTION
+        -Depth is the level of DESTINATION inside the deployment root, counting the root itself as
+        0, and the caller has to say so: the top-level src copy passes 1, because it lands at
+        <root>\src. That is not bookkeeping. Get-WacDeploymentItem counts from the deployment root
+        and will not enumerate past level 8, while this guard used to count from the src directory
+        instead - the two disagreed by exactly one level, so a file seven directories below src was
+        copied into the deployment and then never enumerated, never manifested, never trust-checked
+        and never deletable (measured: copied=True, enumerated=0). Counting from the same origin
+        makes the deepest copyable item and the deepest enumerable item the same item.
     #>
     [CmdletBinding()]
     param(
@@ -96,7 +179,7 @@ function Copy-WacDeploymentTree {
     )
 
     if ($Depth -ge $script:MaxTreeDepth) {
-        throw ("The source tree is deeper than {0} levels: {1}" -f $script:MaxTreeDepth, $Source)
+        throw ("The source tree is deeper than the {0} levels the deployment walk can enumerate: {1}" -f $script:MaxTreeDepth, $Source)
     }
 
     if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
@@ -233,11 +316,22 @@ function Remove-WacDeployment {
         return $result
     }
 
-    $items = @(Get-WacDeploymentItem -Root $normalized)
+    # A walk that could not see everything is not permission to delete what it did see: that would
+    # take real files out of a tree whose contents were never established, and the directory this
+    # was asked to remove would then fail as non-empty anyway.
+    $walk = Get-WacDeploymentItem -Root $normalized
+    if (-not $walk.Complete) {
+        $result.Reason = ('The tree could not be fully enumerated, so nothing was deleted: {0}' -f
+            ((@($walk.Failure | ForEach-Object { '{0}: {1}' -f $_.Path, $_.Reason }) | Select-Object -First 3) -join '; '))
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'Refused a delete over a tree that could not be fully enumerated.' -Data @{
+            path = $normalized; reason = $result.Reason
+        }
+        return $result
+    }
 
     # Deepest first by separator count, so a directory is always empty by the time it is deleted.
     # Sorting the path STRING would be culture-aware and is not a reliable depth order.
-    foreach ($item in @($items | Sort-Object -Property @{ Expression = { $_.Path.Split('\').Length } } -Descending)) {
+    foreach ($item in @($walk.Entry | Sort-Object -Property @{ Expression = { $_.Path.Split('\').Length } } -Descending)) {
         $failure = Remove-WacDeploymentEntry -Path $item.Path -IsDirectory:$item.IsDirectory
         if ($failure) { $result.Reason = $failure }
     }

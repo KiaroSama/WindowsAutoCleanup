@@ -16,28 +16,33 @@
          target is never touched, and it is never descended into;
       4. nothing that normalised and then failed a containment test is passed to a delete call.
 
-    WHAT THE HANDLE CHECKS DO AND DO NOT GUARANTEE. Read this before changing them.
+    THE DELETION RACE, AND WHY IT IS NOW CLOSED AT THE LEAF. Read this before changing anything.
 
-    Every delete here is issued BY PATHNAME, and every check is a SEPARATE pathname resolution, so
-    the checks cannot be race-free. .NET exposes no delete that takes a handle and no open that is
-    relative to a directory handle - measured on both hosts (PowerShell 5.1 / .NET Framework
-    4.0.30319 and PowerShell 7.6.5 / .NET 10): zero File/Directory overloads accept a SafeFileHandle,
-    zero accept a root-directory handle, and FileOptions.DeleteOnClose (the only handle-bound delete
-    managed code has) cannot open a directory or a file another process holds without FILE_SHARE.
-    A genuinely handle-relative design needs NtOpenFile with RootDirectory in OBJECT_ATTRIBUTES plus
-    NtSetInformationFile(FileDispositionInformation), which is native code this module does not own.
+    THREAT MODEL, decided once and in scope: a local standard user who can write into an
+    allow-listed target IS an attacker this code defends against. That is not hypothetical - the
+    tool runs as SYSTEM and the default Windows Temp grants BUILTIN\Users write.
+
+    Every leaf is now removed by Invoke-WacBoundDelete (WindowsAutoCleanup.BoundDelete.ps1), which
+    opens ONE handle, proves on that handle that it still resolves to the intended path, and sets
+    the disposition on the SAME handle. There is no second resolution of the name for an attacker to
+    win. Two predecessors were not enough: verifying once per DIRECTORY left a window of roughly
+    twelve seconds per three thousand entries, and verifying per leaf but then deleting BY PATHNAME
+    still left the sub-millisecond gap between the check returning and the kernel resolving the same
+    name again. Managed code cannot express this - measured on both hosts, zero File/Directory
+    overloads accept a SafeFileHandle - so the delete goes through
+    NtSetInformationFile(FileDispositionInformation) in WacNative.
 
     So, precisely:
-      * GUARANTEED - a redirection that is already in place when the check runs, or that persists
-        past it, is caught: the handle-verified final path will not equal the requested path and the
-        operation is refused and counted as a refusal, not a skip.
-      * NOT GUARANTEED - a redirection installed INSIDE the window between the check returning and
-        the kernel resolving the same name for the delete. That window is narrow, not absent:
-        measured over 2000 leaves per host it is at most 0.66 ms at p99 (0.39 ms on 5.1, 0.66 ms on
-        7.6.5) and 2.8 ms worst observed, where the upper bound charges the ENTIRE File.Delete call
-        to the attacker. The predecessor design verified once per DIRECTORY and left a window of
-        roughly twelve seconds per three thousand entries, so this is four orders of magnitude
-        narrower - and still not zero. Do not describe it as closed.
+      * GUARANTEED - the object deleted is the object whose identity was proved. A redirection that
+        is in place at any point up to and including the delete makes the handle resolve elsewhere,
+        and the operation is refused and counted as a refusal, not a skip. A reparse point is exempt
+        from the proof by design: it is opened with FILE_FLAG_OPEN_REPARSE_POINT and the LINK is
+        removed, never its target.
+      * STILL PATHNAME-BASED - ENUMERATION. Children are still discovered by walking the parent's
+        path, so an ancestor swapped mid-sweep can change which children are FOUND.
+        Test-WacDirectorySafeToDescend re-verifies before descending, and any leaf reached through a
+        swap fails the handle-bound identity proof and is refused rather than deleted. The
+        consequence of losing that race is therefore a wrong REFUSAL, never a wrong deletion.
 
     DELAYED DELETION IS DISABLED HERE. MoveFileEx(..., MOVEFILE_DELAY_UNTIL_REBOOT) stores the
     literal path STRING; Session Manager resolves it at the next boot, hours later, before anything
@@ -67,6 +72,11 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanu
 # %TEMP% this release exists to fix - would sweep to completion without ever looking at the clock.
 # Measured throughput is 230-520 entries/s, so 256 entries is well under a second of overshoot.
 $script:DeadlineCheckInterval = 256
+
+# Test seam for the handle-bound delete; $null means use the real native call.
+$script:BoundDeleteOverride = $null
+
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.BoundDelete.ps1')
 
 function New-WacDeletionStats {
     <#
@@ -211,35 +221,25 @@ function Remove-WacLeaf {
     if (-not (Test-WacIsOnTargetDrive -Path $normalized)) { $Stats.RefusedOutOfRoot++; return }
     if (Test-WacIsProtectedPath -Path $normalized) { $Stats.SkippedProtected++; return }
 
-    # Every check above is a STRING comparison, and a string cannot notice that an ancestor directory
-    # was replaced by a junction since the last time it was verified. Verifying once per directory
-    # left a window as long as that directory took to sweep, so the resolution is re-proved here,
-    # immediately before the delete, for anything that is not itself a link. This does not make the
-    # delete atomic with its check - it makes the window sub-millisecond instead of multi-second.
+    # Every check above is a STRING comparison, and a string cannot notice that an ancestor
+    # directory was replaced by a junction since it was last verified. The delete below closes that
+    # for good: DeleteBoundLeaf opens ONE handle, proves on that handle that it still resolves to
+    # the path we intend, and sets the disposition on the SAME handle. There is no second name
+    # resolution for an attacker to win, which is what the predecessor - verify, close, delete by
+    # pathname - still left open however small the window became.
     #
-    # A reparse point is exempt because resolving it is the whole point of deleting it: the link is
-    # removed by name and its target is never touched.
-    if (-not $IsReparsePoint -and -not (Test-WacFinalPathMatches -NormalizedPath $normalized)) {
-        # An object that simply disappeared between enumeration and deletion also fails to open, and
-        # that is the desired end state rather than a redirection attempt. Separate the two so an
-        # ordinary race is not reported - or exit-coded - as a security refusal.
-        if (Test-WacPathVanished -NormalizedPath $normalized) { $Stats.SkippedVanished++ }
-        else { $Stats.RefusedIdentity++ }
-        return
-    }
-
+    # A reparse point is exempt from the identity proof because resolving it is exactly what must
+    # not happen when the link itself is the thing being removed.
     $longPath = Get-WacLongPath -Path $normalized
+    $expected = $normalized
 
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
-        try {
-            if ($IsDirectory -or $IsReparsePoint) {
-                if ($IsDirectory) { [System.IO.Directory]::Delete($longPath, $false) }
-                else { [System.IO.File]::Delete($longPath) }
-            }
-            else {
-                [System.IO.File]::Delete($longPath)
-            }
+        $win32 = 0
+        $ntStatus = 0
+        $code = Invoke-WacBoundDelete -LongPath $longPath -ExpectedFinalPath $expected `
+            -OpenReparsePoint:$IsReparsePoint -Win32Error ([ref]$win32) -NtStatus ([ref]$ntStatus)
 
+        if ($code -eq 0) {
             if ($IsReparsePoint) { $Stats.ReparsePointsDeleted++ }
             elseif ($IsDirectory) { $Stats.DirectoriesDeleted++ }
             else {
@@ -248,60 +248,52 @@ function Remove-WacLeaf {
             }
             return
         }
-        catch {
-            # if/elseif rather than switch: `break` and `continue` inside a switch that sits inside a
-            # loop are ambiguous in PowerShell, and getting that wrong here would either skip the
-            # attribute-clearing retry or loop forever.
-            $kind = Get-WacIoFailureKind -ErrorRecord $_
 
-            if ($kind -eq 'NotFound') {
-                # Something else removed it first. That is the desired end state, not a failure.
-                $Stats.SkippedVanished++
-                return
-            }
+        $kind = Get-WacBoundDeleteKind -Code $code -Win32Error $win32 -NtStatus $ntStatus
 
-            if ($kind -eq 'Denied') {
-                if ($attempt -eq 0 -and (Clear-WacBlockingAttribute -LongPath $longPath)) { continue }
-                $Stats.SkippedDenied++
-                return
-            }
-
-            if ($kind -eq 'Busy') {
-                # For a directory this means "not empty" (children were locked); the retry pass picks
-                # it up. For a file it means the file is open in another process. That used to be
-                # queued for deletion at the next boot; it is not any more - Session Manager resolves
-                # the stored NAME hours later, which nothing checked here can bind. See the module
-                # header. The file simply stays until its owner exits and the next run takes it.
-                if ($IsDirectory -and -not $IsReparsePoint) {
-                    $Stats.SkippedNotEmpty++
-                    return
-                }
-
-                $Stats.SkippedLocked++
-                return
-            }
-
-            $Stats.Failed++
+        if ($kind -eq 'NotFound') {
+            # Something else removed it first. That is the desired end state, not a failure.
+            $Stats.SkippedVanished++
             return
         }
+
+        if ($kind -eq 'Identity') {
+            # An object that simply disappeared between enumeration and deletion also fails to
+            # resolve, and that is the desired end state rather than a redirection attempt. Separate
+            # the two so an ordinary race is not reported - or exit-coded - as a security refusal.
+            if (Test-WacPathVanished -NormalizedPath $normalized) { $Stats.SkippedVanished++ }
+            else { $Stats.RefusedIdentity++ }
+            return
+        }
+
+        if ($kind -eq 'Denied') {
+            if ($attempt -eq 0 -and (Clear-WacBlockingAttribute -LongPath $longPath)) { continue }
+            $Stats.SkippedDenied++
+            return
+        }
+
+        if ($kind -eq 'NotEmpty') {
+            # Children were locked or refused; the retry pass picks the directory up again.
+            $Stats.SkippedNotEmpty++
+            return
+        }
+
+        if ($kind -eq 'Busy') {
+            # Open in another process. That used to be queued for deletion at the next boot; it is
+            # not any more - Session Manager resolves the stored NAME hours later, which nothing
+            # checked here can bind. See the module header. It stays until its owner exits.
+            if ($IsDirectory -and -not $IsReparsePoint) {
+                $Stats.SkippedNotEmpty++
+                return
+            }
+
+            $Stats.SkippedLocked++
+            return
+        }
+
+        $Stats.Failed++
+        return
     }
-}
-
-function Test-WacDirectorySafeToDescend {
-    <#
-    .SYNOPSIS
-        Re-proves, immediately before descending, that a directory is still the object we expect.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$RootPath
-    )
-
-    if (-not (Test-WacIsWithinRoot -ChildPath $Path -RootPath $RootPath)) { return $false }
-    if (Test-WacIsReparsePoint -Path $Path) { return $false }
-    if (-not (Test-WacPathResolvesToItself -Path $Path)) { return $false }
-
-    return $true
 }
 
 function Invoke-WacTreeSweep {
@@ -673,5 +665,5 @@ Export-ModuleMember -Function @(
     'New-WacDeletionStats', 'Get-WacSkippedTotal', 'Get-WacRefusedTotal', 'Test-WacPathVanished',
     'Clear-WacBlockingAttribute', 'Remove-WacLeaf', 'Test-WacDirectorySafeToDescend',
     'Invoke-WacTreeSweep', 'Remove-WacTree', 'Remove-WacFilesByPattern', 'New-WacTreeResult',
-    'Write-WacTreeResult'
+    'Write-WacTreeResult', 'Get-WacBoundDeleteKind', 'Set-WacBoundDeleteOverride'
 )

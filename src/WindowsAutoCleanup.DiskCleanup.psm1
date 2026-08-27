@@ -263,15 +263,25 @@ function Restore-WacDiskCleanupStateFlag {
 function Enable-WacDiskCleanupCategory {
     <#
     .SYNOPSIS
-        Turns on the requested handlers for one sage profile.
+        Writes the EXACT sage profile: the requested handlers on, and every other handler that
+        carries a value for this sage id explicitly off.
     .DESCRIPTION
         Only 0 (off) and 2 (on) are documented values, so nothing else is ever written. The
-        'Offline Pages Files' handler is skipped because it has no StateFlags value at all.
+        'Offline Pages Files' handler is never ENABLED because it has no StateFlags value of its
+        own; it is still disabled like any other handler if it turns out to carry one.
+
+        Turning the requested handlers on is NOT enough. The sage id is a fixed number this project
+        borrows, and a machine where someone once ran cleanmgr /sageset with that same number
+        already carries enabled values on handlers nobody here selected - /sagerun would run those
+        too, and putting the profile back afterwards does not undo what they deleted. Every handler
+        that is not requested and DOES carry a value is therefore written to 0. One that carries no
+        value at all is already unselected, so leaving it alone keeps this the smallest write that
+        still produces the exact selection.
 
         A write that fails is COUNTED, not merely logged: a half-written profile means cleanmgr
         would run against a selection nobody chose.
     .OUTPUTS
-        Touched and Failed.
+        Touched (values actually written), Failed, and Enabled (the handler names switched on).
     #>
     param(
         [Parameter(Mandatory = $true)][ValidateRange(0, 9999)][int]$SageId,
@@ -282,16 +292,47 @@ function Enable-WacDiskCleanupCategory {
     $valueName = 'StateFlags{0:0000}' -f $SageId
     $touched = 0
     $failed = 0
+    $enabled = New-Object 'System.Collections.Generic.List[string]'
 
+    # A hashtable so the lookup is case-insensitive, which is what the registry is.
+    $requested = @{}
     foreach ($name in $Category) {
         if ($script:DiskCleanupSkipHandler -contains $name) { continue }
+        $requested[[string]$name] = $true
+    }
 
-        $key = Join-Path -Path $KeyPath -ChildPath $name
-        if (-not (Test-Path -LiteralPath $key)) { continue }
+    $handlers = @()
+    try { $handlers = @(Get-ChildItem -LiteralPath $KeyPath -ErrorAction Stop) }
+    catch {
+        # Without the whole handler list the profile cannot be made exact, so nothing is written.
+        Write-WacLog -Level WARNING -Component 'DiskCleanup' -Message 'The VolumeCaches key could not be enumerated, so no cleanmgr profile was written.' -Data @{ error = $_.Exception.Message }
+        return [PSCustomObject]@{ Touched = 0; Failed = 1; Enabled = @() }
+    }
+
+    foreach ($handler in $handlers) {
+        $name = [string](Split-Path -Leaf $handler.Name)
+        $wanted = $requested.ContainsKey($name)
+
+        if (-not $wanted) {
+            # An unrequested handler with no value is already off, and writing a 0 over nothing
+            # would only add a value someone else's profile never had.
+            $present = $false
+            try { $present = (-not (Get-WacRegistryValueFact -KeyPath ([string]$handler.PSPath) -ValueName $valueName).WasAbsent) }
+            catch {
+                $failed++
+                Write-WacLog -Level WARNING -Component 'DiskCleanup' -Message 'A StateFlags value could not be read, so the profile cannot be made exact.' -Data @{ handler = $name; error = $_.Exception.Message }
+                continue
+            }
+            if (-not $present) { continue }
+        }
+
+        $value = 0
+        if ($wanted) { $value = 2 }
 
         try {
-            [void](New-ItemProperty -LiteralPath $key -Name $valueName -PropertyType DWord -Value 2 -Force -ErrorAction Stop)
+            [void](New-ItemProperty -LiteralPath ([string]$handler.PSPath) -Name $valueName -PropertyType DWord -Value $value -Force -ErrorAction Stop)
             $touched++
+            if ($wanted) { [void]$enabled.Add($name) }
         }
         catch {
             $failed++
@@ -299,7 +340,72 @@ function Enable-WacDiskCleanupCategory {
         }
     }
 
-    return [PSCustomObject]@{ Touched = $touched; Failed = $failed }
+    return [PSCustomObject]@{ Touched = $touched; Failed = $failed; Enabled = @($enabled.ToArray()) }
+}
+
+function Test-WacDiskCleanupProfileExact {
+    <#
+    .SYNOPSIS
+        Reads the whole sage profile back and answers whether EXACTLY the expected handlers are on.
+    .DESCRIPTION
+        A write reporting success is not the same fact as the profile being right, and it is the
+        handlers this run never touched that make the difference: one of them carrying an enabled
+        value from an old cleanmgr /sageset with the same number is precisely what /sagerun would
+        run anyway. cleanmgr is started only once every handler has been read back and value 2 was
+        found on the expected ones and on nothing else.
+
+        Enabled is DWORD 2 and nothing else. That is the only documented "run this handler" value,
+        and Enable-WacDiskCleanupCategory writes a DWORD over any other kind it finds, so anything
+        that is not a DWORD 2 here is either off or a write that did not take.
+    .OUTPUTS
+        Ok, Reason and Enabled (the handler names found switched on).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(0, 9999)][int]$SageId,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected,
+        [string]$KeyPath = $script:VolumeCacheKeyPath
+    )
+
+    $valueName = 'StateFlags{0:0000}' -f $SageId
+    $result = [PSCustomObject]@{ Ok = $false; Reason = ''; Enabled = @() }
+
+    $wanted = @{}
+    foreach ($name in $Expected) { $wanted[[string]$name] = $true }
+
+    $on = New-Object 'System.Collections.Generic.List[string]'
+    $wrong = New-Object 'System.Collections.Generic.List[string]'
+
+    $handlers = @()
+    try { $handlers = @(Get-ChildItem -LiteralPath $KeyPath -ErrorAction Stop) }
+    catch {
+        $result.Reason = 'the VolumeCaches key could not be read back ({0})' -f $_.Exception.Message
+        return $result
+    }
+
+    foreach ($handler in $handlers) {
+        $name = [string](Split-Path -Leaf $handler.Name)
+
+        $fact = $null
+        try { $fact = Get-WacRegistryValueFact -KeyPath ([string]$handler.PSPath) -ValueName $valueName }
+        catch {
+            $result.Reason = 'the {0} value of {1} could not be read back ({2})' -f $valueName, $name, $_.Exception.Message
+            return $result
+        }
+
+        $isOn = ((-not $fact.WasAbsent) -and $fact.Kind -eq [Microsoft.Win32.RegistryValueKind]::DWord -and ([int]$fact.Value) -eq 2)
+        if ($isOn) { [void]$on.Add($name) }
+        if ($isOn -ne $wanted.ContainsKey($name)) { [void]$wrong.Add($name) }
+    }
+
+    $result.Enabled = @($on.ToArray())
+
+    if ($wrong.Count -gt 0) {
+        $result.Reason = '{0} handler(s) do not match the requested selection: {1}' -f $wrong.Count, ((@($wrong.ToArray()) | Sort-Object) -join ', ')
+        return $result
+    }
+
+    $result.Ok = $true
+    return $result
 }
 
 function Invoke-WacLegacyDiskCleanup {
@@ -315,6 +421,15 @@ function Invoke-WacLegacyDiskCleanup {
         snapshotted before anything is written and put back in a finally block, under its own bound
         that ignores the run budget: a rollback that is skipped because the budget expired is how
         someone else's cleanmgr profile gets destroyed.
+
+        Between those two the profile is made EXACT rather than merely extended, and then read back
+        before cleanmgr is launched. A sage id is a number, not a reservation: the one this step
+        defaults to may already carry enabled values from somebody's earlier /sageset, and /sagerun
+        would run those categories too. Restoring the profile afterwards does not undo what they
+        deleted, so the selection has to be provably right BEFORE the launch. Allocating an unused
+        sage id instead was the documented alternative and is not what this does: it would still be
+        a guess about a number this code does not own, and the guess would have to be re-made on
+        every run, while making one id exact fixes every id a caller can pass.
 
         Outcomes: an unreadable original value is a SafeSkip, because the step declines BEFORE
         mutating anything and the machine is left exactly as it was. Once state HAS been written, a
@@ -395,16 +510,28 @@ function Invoke-WacLegacyDiskCleanup {
         else {
             $enabledResult = Enable-WacDiskCleanupCategory -SageId $SageId -Category $Category -KeyPath $keyPath
             # Touched counts values actually written, so this is "did this run change anything",
-            # not "did it intend to".
+            # not "did it intend to". Switching somebody else's leftover selection off counts too.
             $mutated = ($enabledResult.Touched -gt 0)
+            $enabledHandler = @($enabledResult.Enabled)
+
+            $exact = $null
+            if ($enabledResult.Failed -eq 0 -and $enabledHandler.Count -gt 0) {
+                $exact = Test-WacDiskCleanupProfileExact -SageId $SageId -Expected $enabledHandler -KeyPath $keyPath
+            }
 
             if ($enabledResult.Failed -gt 0) {
                 $outcome = 'Incomplete'
                 $detail = '{0} cleanmgr handler(s) could not be written, so cleanmgr was not started.' -f $enabledResult.Failed
             }
-            elseif ($enabledResult.Touched -eq 0) {
+            elseif ($enabledHandler.Count -eq 0) {
                 $outcome = 'SafeSkip'
                 $detail = 'None of the requested cleanmgr handlers exist on this machine.'
+            }
+            elseif (-not $exact.Ok) {
+                # An unverified profile is a run against a selection nobody chose, and /sagerun
+                # deletes on every drive. The finally block still puts every touched value back.
+                $outcome = 'Incomplete'
+                $detail = 'The cleanmgr profile did not read back as the exact requested selection, so cleanmgr was not started: {0}' -f $exact.Reason
             }
             else {
                 $attempted = $true
@@ -419,7 +546,7 @@ function Invoke-WacLegacyDiskCleanup {
                 }
                 elseif ($run.ExitCode -eq 0) {
                     $outcome = 'Succeeded'
-                    $detail = 'cleanmgr /sagerun:{0} completed over {1} handler(s) on every drive.' -f $SageId, $enabledResult.Touched
+                    $detail = 'cleanmgr /sagerun:{0} completed over {1} handler(s) on every drive.' -f $SageId, $enabledHandler.Count
                 }
                 else {
                     $outcome = 'Failed'

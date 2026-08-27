@@ -51,6 +51,10 @@ function Get-WacTestPlan {
         pnpOutcome = 'Succeeded'
         pruneOutcome = 'SafeSkip'
         stripStepOutcome = $false
+        targetTimeoutMs = 0
+        targetBlockMs = 0
+        targetThrow = $false
+        telemetryFails = $false
     }
 
     $path = [string]$env:WAC_TEST_PLAN
@@ -73,6 +77,24 @@ $script:RealInitializeWacRun = ${function:Initialize-WacRun}
 function Test-WacIsAdministrator { return $true }
 function Test-WacSystemDriveSupported { return $true }
 
+# Telemetry, and only telemetry. Both of these are diagnostics the run writes about itself and
+# neither may reach the verdict, so the scenario that proves it has to be able to break them. They
+# delegate to the real functions unless the plan says otherwise, which keeps every other scenario
+# reading the real values.
+$script:RealGetWacFreeBytes = ${function:Get-WacFreeBytes}
+$script:RealTestWacIsWindowsServer = ${function:Test-WacIsWindowsServer}
+
+function Get-WacFreeBytes {
+    param([string]$Drive = 'C:')
+    if ((Get-WacTestPlan).telemetryFails) { throw 'test shim: the free-space source is unavailable' }
+    return (& $script:RealGetWacFreeBytes -Drive $Drive)
+}
+
+function Test-WacIsWindowsServer {
+    if ((Get-WacTestPlan).telemetryFails) { throw 'test shim: the OS edition source is unavailable' }
+    return (& $script:RealTestWacIsWindowsServer)
+}
+
 function Test-WacStatePathIsTrusted {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path, [int]$MaxDepth = 64)
 
@@ -92,7 +114,9 @@ function Initialize-WacRun {
         [string[]]$CandidateRoot,
         [ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$LogLevel = 'INFO',
         [int]$BudgetMinutes = 210,
-        [string]$BootstrapLogPath
+        [string]$BootstrapLogPath,
+        [Nullable[datetime]]$StartUtc,
+        [int]$ShutdownMarginSeconds = 0
     )
 
     $ok = & $script:RealInitializeWacRun @PSBoundParameters
@@ -146,8 +170,26 @@ function Remove-WacFilesByPattern {
 $script:ShimBody['Targets'] = @'
 . (Join-Path -Path $PSScriptRoot -ChildPath '_Plan.ps1')
 
+# The BOUND itself, lowered so a scenario can outlast it in under a second instead of two minutes.
+# Get-WacCleanupTargetSet reads this in the calling process while the builder below runs inside the
+# runspace it bounds, which is exactly the separation the scenario has to exercise.
+if ([int](Get-WacTestPlan).targetTimeoutMs -gt 0) {
+    $script:TargetBuildTimeoutMs = [int](Get-WacTestPlan).targetTimeoutMs
+}
+
 function Get-WacCleanupTarget {
     param([string[]]$SkipCategory = @())
+
+    # A discovery that BLOCKS. Building the real list walks the filesystem and queries CIM, and a
+    # call blocked in the OS is exactly what the bound exists for; a deadline loop reproduces that
+    # without needing a wedged machine.
+    $blockMs = [int](Get-WacTestPlan).targetBlockMs
+    if ($blockMs -gt 0) {
+        $blockUntil = [DateTime]::UtcNow.AddMilliseconds($blockMs)
+        while ([DateTime]::UtcNow -lt $blockUntil) { Start-Sleep -Milliseconds 100 }
+    }
+
+    if ((Get-WacTestPlan).targetThrow) { throw 'test shim: the allow-list could not be built' }
 
     $skip = @($SkipCategory)
     foreach ($spec in @((Get-WacTestPlan).targets)) {

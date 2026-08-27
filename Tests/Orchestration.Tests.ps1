@@ -153,10 +153,6 @@ Test-Case 'Driver pruning tracks its opt-in switch and always names a backup roo
     Assert-True ($backup.IndexOf('DriverBackup', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) $backup
 }
 
-# ---------------------------------------------------------------------------------------------
-# Safety gates
-# ---------------------------------------------------------------------------------------------
-
 Test-Case 'All three protected roots are registered before any target is swept' {
     $calls = @(Get-CommandCall -Ast $script:RunAst -Name 'Add-WacProtectedRoot')
     Assert-Equal 3 $calls.Count 'Run.ps1 no longer registers exactly three protected roots'
@@ -170,21 +166,67 @@ Test-Case 'All three protected roots are registered before any target is swept' 
 
     # Registration must happen before the target loop, or the roots protect nothing.
     $addOffset = ($calls | ForEach-Object { $_.Extent.StartOffset } | Sort-Object)[0]
-    $sweep = @(Get-CommandCall -Ast $script:RunAst -Name 'Get-WacCleanupTarget')
+    $sweep = @(Get-CommandCall -Ast $script:RunAst -Name 'Get-WacCleanupTargetSet')
     Assert-Equal 1 $sweep.Count
     Assert-True ($addOffset -lt $sweep[0].Extent.StartOffset) `
         'the protected roots are registered after the cleanup targets are enumerated'
 }
 
-Test-Case 'The single-instance lock and the system-drive gate are both wired to an exit' {
+Test-Case 'The allow-list is built through the BOUNDED builder, never the bare one' {
+    # The inversion of what this file used to assert. Get-WacCleanupTarget walks every profile's
+    # Edge directory and queries Win32_UserProfile through CIM; both block in the OS, which blocks
+    # every cooperative deadline check sitting behind them. Worse, it cannot say it failed: an
+    # allow-list that was never finished and an allow-list with nothing in it are the same empty
+    # array, so a timed-out discovery used to read as a clean run with nothing to clean.
+    Assert-Equal 0 (@(Get-CommandCall -Ast $script:RunAst -Name 'Get-WacCleanupTarget')).Count `
+        'Run.ps1 calls the unbounded allow-list builder directly'
+
+    $sweep = @(Get-CommandCall -Ast $script:RunAst -Name 'Get-WacCleanupTargetSet')
+    Assert-Equal 1 $sweep.Count 'Run.ps1 no longer builds the allow-list under a bound'
+
+    # And the outcome has to be consumed, not just the list: a step result is what carries an
+    # Incomplete or Failed discovery into the footer's verdict.
+    $text = [System.IO.File]::ReadAllText($script:RunPath)
+    Assert-True ($text -match '(?s)Get-WacCleanupTargetSet.{0,900}?New-WacStepResult.{0,200}?\$targetSet\.Outcome') `
+        'the discovery outcome is never recorded as a step, so a failed discovery cannot reach the verdict'
+}
+
+# ---------------------------------------------------------------------------------------------
+# Safety gates
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'The machine-wide lock is taken before the first module is loaded' {
+    # An installer holding the SAME lock is free to replace the deployment this script loads its
+    # modules out of, so a lock taken after Import-Module does not protect the import - the part
+    # that most needs protecting. Core's Enter-WacSingleInstance cannot be used for it: Core is one
+    # of the files the lock exists to keep still.
     $text = [System.IO.File]::ReadAllText($script:RunPath)
 
-    # Behavioural coverage for the lock itself lives in the case below; this asserts the ORCHESTRATION
-    # keeps both gates, because a reviewer removed each of them with the suite still green.
-    $mutexCalls = @(Get-CommandCall -Ast $script:RunAst -Name 'Enter-WacSingleInstance')
-    Assert-Equal 1 $mutexCalls.Count 'Run.ps1 no longer takes the machine-wide lock'
-    Assert-True ($text -match '(?s)Enter-WacSingleInstance.{0,600}?exit 3') `
-        'failing to take the lock no longer exits with the documented code 3'
+    Assert-Equal 0 (@(Get-CommandCall -Ast $script:RunAst -Name 'Enter-WacSingleInstance')).Count `
+        'Run.ps1 takes the lock through a module it has to load first'
+
+    $lock = @(Get-CommandCall -Ast $script:RunAst -Name 'Enter-WacBootstrapLock')
+    Assert-Equal 1 $lock.Count 'Run.ps1 no longer takes the machine-wide lock in its bootstrap'
+
+    $imports = @(Get-CommandCall -Ast $script:RunAst -Name 'Import-Module')
+    Assert-True ($imports.Count -ge 1) 'Run.ps1 imports no modules at all'
+    $firstImport = ($imports | ForEach-Object { $_.Extent.StartOffset } | Sort-Object)[0]
+    Assert-True ($lock[0].Extent.StartOffset -lt $firstImport) `
+        'the machine-wide lock is taken after a mutable deployed module has already been loaded'
+
+    # The lock name still has to be the one the installer and uninstaller take; Deploy.Tests.ps1
+    # pins the two literals against each other.
+    Assert-Equal '$MutexName' (Get-BoundArgumentText -Command $lock[0] -Parameter 'Name') `
+        'the bootstrap lock no longer takes the name -MutexName carries'
+
+    Assert-True ($text -match '(?s)\$script:OperationLock.{0,600}?exit 3') `
+        'failing to hold the lock no longer exits with the documented code 3'
+    Assert-True ((@(Get-CommandCall -Ast $script:RunAst -Name 'Exit-WacBootstrapLock')).Count -ge 2) `
+        'the lock is never released: the elevated relaunch and the shutdown both have to let go of it'
+}
+
+Test-Case 'The system-drive gate is wired to an exit' {
+    $text = [System.IO.File]::ReadAllText($script:RunPath)
 
     $driveCalls = @(Get-CommandCall -Ast $script:RunAst -Name 'Test-WacSystemDriveSupported')
     Assert-Equal 1 $driveCalls.Count 'Run.ps1 no longer checks the online system drive'
@@ -192,10 +234,77 @@ Test-Case 'The single-instance lock and the system-drive gate are both wired to 
         'an unsupported system drive no longer exits with the documented code 5'
 }
 
-# The lock's own runtime behaviour - a SECOND PROCESS being refused while it is held, and the lock
-# becoming available again after Exit-WacSingleInstance - is proven in Core.Tests.ps1. It cannot be
-# proven through Run.ps1 from a test: exit code 3 is only reachable after the elevation check, so an
-# unelevated run never gets that far and an elevated one would perform a real machine-wide cleanup.
+Test-Case 'The run-level verdicts are reached BEFORE anything on the machine is mutated' {
+    # Ledger: Initialize-WacRun recorded the state directory's trust verdict and Run.ps1 read it
+    # only in the footer, so a SECURITY refusal arrived after the sweep, DISM, the driver step and
+    # the Recycle Bin had all already run. A refusal after the damage is a report, not a control.
+    $gate = @(Get-CommandCall -Ast $script:RunAst -Name 'Get-WacRunLevelOutcome')
+    Assert-Equal 1 $gate.Count 'Run.ps1 no longer asks for the run-level verdicts before it cleans'
+    $gateOffset = $gate[0].Extent.StartOffset
+
+    foreach ($mutator in @('Remove-WacOldLog', 'Clear-WacDeliveryOptimizationCache',
+            'Get-WacCleanupTargetSet', 'Invoke-WacComponentCleanup', 'Invoke-WacPnpCleanHandler',
+            'Invoke-WacDriverPackagePrune', 'Invoke-WacLegacyDiskCleanup', 'Clear-WacRecycleBin')) {
+        foreach ($call in @(Get-CommandCall -Ast $script:RunAst -Name $mutator)) {
+            Assert-True ($gateOffset -lt $call.Extent.StartOffset) `
+                ('{0} runs before the run-level verdicts are reached' -f $mutator)
+        }
+    }
+
+    # And a refusing gate has to leave the same verdict line a footer would, or a run that exits 7
+    # here would have no status= in its own audit log.
+    $text = [System.IO.File]::ReadAllText($script:RunPath)
+    Assert-True ($text -match '(?s)\$preflight.{0,600}?exit \(Write-WacRunVerdict -Outcome \$preflight\)') `
+        'the pre-cleanup gate exits without writing the run verdict'
+}
+
+Test-Case 'The run budget is armed from process start and keeps a shutdown margin' {
+    # Initialize-WacRun arms its deadline from wherever it is called, which left module import and
+    # the trust preflight outside the budget entirely, and left the footer nothing to run in.
+    $calls = @(Get-CommandCall -Ast $script:RunAst -Name 'Initialize-WacRun')
+    Assert-Equal 1 $calls.Count
+
+    Assert-Equal '$script:StartUtc' (Get-BoundArgumentText -Command $calls[0] -Parameter 'StartUtc') `
+        'the budget is armed where the log is opened, so module import and the lock fall outside it'
+    Assert-Equal '$script:CleanupMarginSeconds' (Get-BoundArgumentText -Command $calls[0] -Parameter 'ShutdownMarginSeconds') `
+        'the run keeps no time back to write its own verdict in'
+
+    # And the two values have to be captured before the modules are loaded, not after.
+    $startAssign = @($script:RunAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+    }, $true) | Where-Object { $_.Left.Extent.Text -eq '$script:StartUtc' })
+    Assert-Equal 1 $startAssign.Count 'Run.ps1 no longer records when the process itself started'
+
+    $imports = @(Get-CommandCall -Ast $script:RunAst -Name 'Import-Module')
+    $firstImport = ($imports | ForEach-Object { $_.Extent.StartOffset } | Sort-Object)[0]
+    Assert-True ($startAssign[0].Extent.StartOffset -lt $firstImport) `
+        'the start instant is captured after the modules are already loaded'
+}
+
+Test-Case 'Nothing on the run entry path queries CIM directly' {
+    # Free space and the OS caption were Win32_LogicalDisk and Win32_OperatingSystem queries: RPC
+    # round trips to the WMI service, made twice and once per run OUTSIDE every step contract, with
+    # no bound of their own. Diagnostics that can stall the whole run before a single cleanup step
+    # starts. Win32_UserProfile is still queried, but from inside Get-WacCleanupTargetSet, which is
+    # what bounds it.
+    $reportPath = Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.RunReport.ps1'
+    $reportErrors = $null
+    $reportTokens = $null
+    $reportAst = [System.Management.Automation.Language.Parser]::ParseFile($reportPath, [ref]$reportTokens, [ref]$reportErrors)
+    Assert-Equal 0 (@($reportErrors).Count) 'the run report part does not parse'
+
+    foreach ($pair in @(@{ Name = 'Run.ps1'; Ast = $script:RunAst }, @{ Name = 'RunReport'; Ast = $reportAst })) {
+        foreach ($cmdlet in @('Get-CimInstance', 'Get-WmiObject', 'New-CimSession')) {
+            Assert-Equal 0 (@(Get-CommandCall -Ast $pair.Ast -Name $cmdlet)).Count `
+                ('{0} makes an unbounded {1} call on the run entry path' -f $pair.Name, $cmdlet)
+        }
+    }
+}
+
+# The lock's own runtime behaviour - a SECOND PROCESS being refused while it is held - is proven
+# end to end in RunExitCode.Tests.ps1, which holds the rig's lock from the test process and asserts
+# the child's exit 3.
 
 
 Test-Case 'Log retention stays at the documented 30' {
