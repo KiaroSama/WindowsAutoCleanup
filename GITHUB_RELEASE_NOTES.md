@@ -117,6 +117,25 @@ before it was fixed.
 - **The task ownership proof accepted any rooted executable.** A task carrying this project's
   sentinel but running an arbitrary binary as `SYSTEM` was judged "ours". The executable must now be
   a canonical machine-wide PowerShell host.
+- **The state-trust verdict was reached after the log directory and log file had already been
+  created.** An elevated run created its state directory, opened the run log inside it, and only then
+  asked whether that directory was machine-trusted -- so the refusal itself travelled through the path
+  being refused. Every candidate root is now verified BEFORE anything is created, and a run with no
+  trusted candidate creates nothing at all. The ordering is fixed; the binding is not. The directory
+  is verified by pathname and the log file is then created by pathname, so a residual window remains
+  between the two -- unlike deletion, which proves identity on the handle it unlinks through. Closing
+  it needs a handle-relative create, which managed code cannot express.
+- **The wrapper treated an unproven termination as proof.** Both UAC wrappers branched on a
+  `PSCustomObject`, which is always truthy, so an elevated child that could not be proven terminated
+  was reported "proven gone; re-run". They now branch on the boolean, name the surviving process, and
+  return a new exit code `8` that forbids a retry.
+- **A driver-package deletion was believed on the tool's exit code.** Every started
+  `pnputil /delete-driver` is now confirmed against the driver store itself, so exit `259` and any
+  undocumented non-zero exit no longer clear the pending marker or reclaim the backup on the tool's
+  word alone.
+- **The driver backup root was trusted without being checked.** Driver pruning now refuses with a
+  security refusal when its backup root, or an existing identity directory inside it, is not
+  machine-trusted -- the same walk the log directory already got.
 
 ## Security fixes
 
@@ -222,6 +241,13 @@ all fixed:
   code, reboot-required state, remaining budget and free-space delta are all recorded.
 - The run aborts instead of continuing silently when no log file can be created anywhere. Retention
   keeps the newest 30 run logs.
+- **A security refusal can now be log-less.** When no candidate state directory is machine-trusted the
+  run creates nothing -- no directory, no log file -- and the refusal goes to the Windows event log, or
+  the console, instead of to a run log. Look there, not in `%ProgramData%\WindowsAutoCleanup\Logs`,
+  after an exit `7` that left no log behind.
+- The pre-import bootstrap log in `%TEMP%` now carries a per-run GUID as well as the process id, so
+  anything matching `WindowsAutoCleanup-bootstrap-<PID>.log` exactly must match
+  `WindowsAutoCleanup-bootstrap-*.log` instead.
 
 ## Other correctness fixes from the review
 

@@ -58,6 +58,10 @@ function New-WacLogFile {
         New-Item -Force truncates an existing file, so two runs starting in the same second used to
         share one log and the first one's content was lost. CreateNew fails instead, and the suffix
         loop makes the name collision-proof. Returns the opened StreamWriter, or $null.
+
+        Root names WHICH candidate the file landed in. The caller has already reached one trust
+        verdict per candidate root and has to attach the verdict for the one actually used;
+        re-deriving that from the path would be a second answer to a question already answered.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$BaseName,
@@ -91,7 +95,7 @@ function New-WacLogFile {
                     [System.IO.FileShare]::Read)
                 $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
                 $writer.AutoFlush = $true
-                return [PSCustomObject]@{ Path = $path; Writer = $writer }
+                return [PSCustomObject]@{ Path = $path; Writer = $writer; Root = $root }
             }
             catch {
                 # A CreateNew collision surfaces as IOException, but a constructor exception reaches
@@ -131,8 +135,15 @@ function Set-WacLogWriter {
         (a VHD, a quota) cost far more than the path being proved. Anything exposing WriteLine is
         accepted; pass $null to detach. Close-WacLog already tolerates an object without Flush or
         Dispose, because it wraps both.
+
+        The outgoing writer is CLOSED, not merely dropped. A test that swaps a real log for a
+        throwing stub would otherwise abandon an open FileStream on its own sandbox, which then
+        cannot be deleted - Remove-TestSandbox fails silently and the directory survives the run.
+        Measured before this: one leaked directory per host, per swapping case. No shipped code
+        calls this function, so closing here changes nothing outside the tests it exists for.
     #>
     param([object]$Writer)
+    Close-WacLog
     $script:LogWriter = $Writer
 }
 
@@ -232,7 +243,13 @@ function Get-WacStateTrust {
     .DESCRIPTION
         $null means NOT EVALUATED, which is the correct answer for an unelevated run: that log lives
         in the invoking user's own profile, the user owns it by construction, and no SYSTEM audit
-        claim rests on it. Only an elevated run makes a machine-trust claim worth refusing on.
+        claim rests on it. It is equally the answer when the caller named its own -CandidateRoot,
+        because then the location is the caller's choice and not a claim this module made. Only an
+        elevated run using the roots this module chose makes a machine-trust claim to refuse on.
+
+        A non-$null verdict with IsTrusted false can only be seen through Initialize-WacRun
+        returning $false: a trusted root is the precondition for opening the log, not a fact
+        discovered afterwards.
     #>
     return $script:StateTrust
 }
@@ -281,11 +298,44 @@ function Copy-WacBootstrapLog {
     }
 }
 
+function Get-WacStateRootVerdict {
+    <#
+    .SYNOPSIS
+        The trust verdict for one candidate state root, with an unanswerable question reported as a
+        refusal instead of as an exception.
+    .DESCRIPTION
+        Not exported, and deliberately its own function: FALSE and UNKNOWN have to be
+        indistinguishable to the caller. A check that came back untrusted, a check that returned
+        nothing at all, and a check that threw all mean the same thing here - the trust question was
+        not answered yes - and the one thing none of them may do is let the run touch the path
+        anyway. Returning a synthesised IsTrusted=$false verdict rather than $null also keeps the
+        answer usable by everything downstream: Get-WacRunLevelOutcome and
+        Get-OperationSafetyVerdict both read .IsTrusted, and $null already means NOT EVALUATED.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $reason = 'The trust check produced no verdict at all.'
+    try {
+        $verdict = Test-WacStatePathIsTrusted -Path $Path
+        # Reading .IsTrusted is the presence test: strict mode turns a missing property into a
+        # terminating error, which the catch below turns into a refusal rather than into a crash.
+        if ($null -ne $verdict -and $null -ne $verdict.IsTrusted) { return $verdict }
+    }
+    catch {
+        $reason = ('The trust question could not be answered: {0}' -f $_.Exception.Message)
+    }
+
+    return [PSCustomObject]@{
+        Path = $Path; IsTrusted = $false; Reason = $reason
+        Checked = @(); Failures = @(); Writers = @()
+    }
+}
+
 function Initialize-WacRun {
     <#
     .SYNOPSIS
-        Opens the run log, arms the overall deadline, adopts any bootstrap log and verifies that the
-        directory the log landed in is machine-trusted.
+        Verifies that a machine-trusted state directory exists, and only then opens the run log,
+        arms the overall deadline and adopts any bootstrap log.
     .DESCRIPTION
         Returns $true only when a log file was really created. The old code assigned $LogPath even
         after every fallback failed, so later writes silently went nowhere while the run reported
@@ -296,7 +346,9 @@ function Initialize-WacRun {
 
         The trust check lives here rather than at the call sites because this is the one function
         every entry point already calls; a guard a caller has to remember is a guard one caller will
-        forget. It VERIFIES and records - refusing the run is the orchestrator's decision.
+        forget. It runs BEFORE the log is created, and a root it refuses is never touched at all.
+        The caller still owns the exit code; what this function owns is that no directory, file,
+        write, append, copy or delete reaches a path whose trust it is about to deny.
     .PARAMETER StartUtc
         The instant the budget is measured from. Defaults to now, which is right for a caller whose
         work begins here and wrong for one that had to load a module tree first.
@@ -314,7 +366,13 @@ function Initialize-WacRun {
         [int]$ShutdownMarginSeconds = 0
     )
 
+    # Whether the MODULE chose the roots, which is also whether this run makes a machine-trust
+    # claim worth verifying. A caller that named its own -CandidateRoot has taken that location on
+    # itself; no shipped entry point does, and RunSurface.Tests pins that none of them starts.
+    $moduleChoseRoot = $false
+
     if (-not $CandidateRoot -or $CandidateRoot.Count -eq 0) {
+        $moduleChoseRoot = $true
         if (Test-WacIsAdministrator) {
             $CandidateRoot = @(
                 (Join-Path -Path (Get-WacDataRoot) -ChildPath 'Logs'),
@@ -347,6 +405,70 @@ function Initialize-WacRun {
     $script:LogFailReason = $null
     $script:StateTrust = $null
 
+    # THE TRUST PREFLIGHT, and it really is a PRE-flight now. It used to run after New-WacLogFile
+    # had already created the directory and the log file, so the refusal was written THROUGH the
+    # very path it was refusing and the documented guarantee - nothing written before a refusal -
+    # was false. Every candidate is resolved and verified here, before any New-Item, any
+    # FileStream(CreateNew), any append, any copy and any delete can reach it.
+    #
+    # Only a run using the roots THIS MODULE chose has a machine-trust claim: an unelevated run
+    # logs inside the invoking user's own profile, which the user owns by construction. Both leave
+    # the verdict $null - NOT EVALUATED - which is the answer Get-WacStateTrust documents and which
+    # the run-level gate already treats as benign, so a benign unelevated run still exits 0.
+    #
+    # RESIDUAL WINDOW, stated rather than papered over. The check is by pathname and the create
+    # that follows is by pathname, so the two are not bound to one handle: managed code cannot open
+    # a leaf relative to a directory handle, and the native surface this module has offers no such
+    # primitive. What closes the gap for the modeled adversary - a local standard user who can write
+    # into these paths - is WHAT the check proves: Test-WacStatePathIsTrusted refuses unless the
+    # leaf and every ancestor up to the volume root are owned by an administrative principal, are
+    # free of reparse points, and grant no non-administrator Delete, DeleteSubdirectoriesAndFiles,
+    # ChangePermissions, TakeOwnership or GENERIC_ALL. Renaming the root aside and dropping a
+    # junction in its place needs exactly one of those rights, so a standard user cannot perform the
+    # swap the window would need. An administrator can - and an administrator needs no race.
+    # A user who can only CREATE names in the leaf cannot redirect the open either: CreateNew fails
+    # on a name that already exists, whatever that name happens to point at.
+    # Kept whole for the protected-root registration below. Narrowing $CandidateRoot to the trusted
+    # ones is right for CREATING the log and wrong for deciding what cleanup must never delete: a
+    # root this run refuses to write into is still a root it must not sweep.
+    $allCandidateRoot = @($CandidateRoot)
+
+    $verdictByRoot = $null
+    if ($moduleChoseRoot -and (Test-WacIsAdministrator)) {
+        $verdictByRoot = @{}
+        $trustedRoot = New-Object 'System.Collections.Generic.List[string]'
+        $refusal = New-Object 'System.Collections.Generic.List[string]'
+        $firstRefusal = $null
+
+        foreach ($root in $CandidateRoot) {
+            if ([string]::IsNullOrWhiteSpace($root)) { continue }
+
+            $verdict = Get-WacStateRootVerdict -Path $root
+            $verdictByRoot[$root] = $verdict
+            if ($verdict.IsTrusted) {
+                [void]$trustedRoot.Add($root)
+                continue
+            }
+
+            if (-not $firstRefusal) { $firstRefusal = $verdict }
+            [void]$refusal.Add(('{0}: {1}' -f $root, [string]$verdict.Reason))
+        }
+
+        if ($trustedRoot.Count -eq 0) {
+            $script:LogPath = $null
+            $script:LogWriter = $null
+            $script:StateTrust = $firstRefusal
+
+            $reason = ('No machine-trusted state directory was found, so none of them was created, opened or written to: {0}' -f ($refusal -join ' | '))
+            Set-WacLogDegraded -Reason $reason
+            $script:LogFallbackKind = Write-WacFallbackLine -Line (
+                '[{0} UTC] [CRITICAL] [Log] {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'), $reason)
+            return $false
+        }
+
+        $CandidateRoot = @($trustedRoot.ToArray())
+    }
+
     $created = New-WacLogFile -BaseName $BaseName -CandidateRoot $CandidateRoot
     if (-not $created) {
         $script:LogPath = $null
@@ -363,21 +485,19 @@ function Initialize-WacRun {
     $script:LogWriter = $created.Writer
     $script:LogOpened = $true
 
-    foreach ($root in $CandidateRoot) { Add-WacProtectedRoot -Path $root }
+    foreach ($root in $allCandidateRoot) { Add-WacProtectedRoot -Path $root }
     Add-WacProtectedRoot -Path (Get-WacDataRoot)
     Add-WacProtectedRoot -Path (Get-WacDeploymentRoot)
 
     if ($BootstrapLogPath) { [void](Copy-WacBootstrapLog -Path $BootstrapLogPath) }
 
-    # Only an elevated run writes into the machine-wide state root and hands SYSTEM an audit trail,
-    # so only an elevated run has a trust claim to verify. See Get-WacStateTrust for why $null is
-    # the right answer otherwise.
-    if (Test-WacIsAdministrator) {
-        $script:StateTrust = Test-WacStatePathIsTrusted -Path (Split-Path -Parent $script:LogPath)
-        if (-not $script:StateTrust.IsTrusted) {
-            Write-WacLog -Level ERROR -Component 'Log' -Message 'The audit log directory is not machine-trusted.' -Data @{
-                path = $script:StateTrust.Path; reason = $script:StateTrust.Reason
-            }
+    # The verdict for the root the log ACTUALLY landed in, reached before that root was touched.
+    # It is recorded rather than re-taken: asking again now would answer a different question at a
+    # different instant, and the answer that matters is the one the creation was allowed on.
+    if ($verdictByRoot -and $verdictByRoot.ContainsKey($created.Root)) {
+        $script:StateTrust = $verdictByRoot[$created.Root]
+        Write-WacLog -Level INFO -Component 'Log' -Message 'The machine state directory was verified before anything was created in it.' -Data @{
+            path = [string]$script:StateTrust.Path; reason = [string]$script:StateTrust.Reason
         }
     }
 

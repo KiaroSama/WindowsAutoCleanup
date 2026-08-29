@@ -507,6 +507,12 @@ function Export-WacDriverBackup {
                        record is this tool's own residue and is reclaimed instead, because the
                        package it holds is still installed.
           containment- the identity directory would fall outside the backup root. REFUSED.
+          trust      - the identity directory is not on a local fixed volume, has a reparse point
+                       in its chain, or is owned by or replaceable by a non-administrator. REFUSED,
+                       and for an EXISTING directory the refusal comes before its manifest is read:
+                       a directory a standard user can rewrite must not be allowed to say whether
+                       an earlier deletion is reclaimable, and must not be deleted on its say-so
+                       either.
           timeout    - the export was killed on its deadline, so what is on disk is unknown.
           empty      - /export-driver reported success and produced no .inf. Nothing recoverable.
           mismatch   - the export changed between being hashed and being trusted.
@@ -539,6 +545,17 @@ function Export-WacDriverBackup {
     $result.Directory = $directory
 
     if (Test-Path -LiteralPath $directory) {
+        # BEFORE anything inside is read. The backup root passed this same walk, but an ACE that is
+        # inherit-only THERE grants nothing on the root and everything on the children under it, so
+        # an existing identity directory is asked in its own right - and asked first, because the
+        # next thing this function does is believe that directory's manifest.
+        $existingTrust = Test-WacStatePathIsTrusted -Path $directory
+        if (-not $existingTrust.IsTrusted) {
+            $result.Outcome = 'SecurityRefusal'
+            $result.Reason = 'an export directory with the same package identity already exists and is not machine-trusted ({0})' -f [string]$existingTrust.Reason
+            return $result
+        }
+
         # The root is persistent, so refusing on sight refused this package on every later run - and
         # the two states that got it there, a declined deletion and a failed export, are both
         # benign. Only a directory that is the only copy of something may refuse.

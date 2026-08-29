@@ -65,6 +65,21 @@ function Remove-TestJunction {
     }
 }
 
+function New-SandboxDirectory {
+    <#
+    .SYNOPSIS
+        Creates a directory inside the sandbox and returns its path.
+    .DESCRIPTION
+        Local to this suite on purpose: the equivalent helper lives in FileSystem.Tests.ps1, and a
+        suite that borrows a function from another suite only works while both happen to be loaded
+        in the same process - which they never are, because every suite runs as its own child.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    [void][System.IO.Directory]::CreateDirectory($Path)
+    return $Path
+}
+
 function New-EscapeFixture {
     <#
     .SYNOPSIS
@@ -416,6 +431,94 @@ Test-Case 'An ordinary reparse-point root is a skip and never a refusal' {
     }
     finally {
         Remove-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'Temporary Internet Files')
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A reparse LEAF reached through a swapped ancestor is refused, not unlinked' {
+    <#
+        The hole this closes, and it was the orchestrator's own: DeleteBoundLeaf used to skip the
+        identity proof whenever openReparsePoint was set, on the reasoning that resolving a link is
+        exactly what must not happen when the link is the thing being removed.
+
+        That reasoning was half right. FILE_FLAG_OPEN_REPARSE_POINT stops the FINAL component being
+        followed; every INTERMEDIATE component is still resolved. So an ancestor swapped to a
+        junction redirected the open to a DIFFERENT link entirely - one outside the allow-list - and
+        because the identity branch was skipped, expectedFinalPath was ignored and that outside link
+        was unlinked.
+
+        The fix is structural: the parent is opened and proved, then the leaf is opened RELATIVE to
+        that handle. Here the ancestor is swapped BEFORE the call, so the parent's proved final path
+        does not match and the whole operation is refused with nothing touched.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'race-reparse-leaf'
+    try {
+        $root = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'root')
+        $real = New-SandboxDirectory -Path (Join-Path -Path $root -ChildPath 'real')
+
+        # What the sweep believes it is deleting: a junction inside the allow-listed root.
+        $ownTarget = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'ownTarget')
+        $ownLink = Join-Path -Path $real -ChildPath 'link'
+        New-TestJunction -Link $ownLink -Target $ownTarget
+
+        # What an ancestor swap would substitute: a junction the tool has no business touching,
+        # pointing at a sentinel that must survive.
+        $decoy = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'decoy')
+        $outsideTarget = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'outsideTarget')
+        $sentinel = Join-Path -Path $outsideTarget -ChildPath 'sentinel.txt'
+        [System.IO.File]::WriteAllText($sentinel, 'must survive')
+        $decoyLink = Join-Path -Path $decoy -ChildPath 'link'
+        New-TestJunction -Link $decoyLink -Target $outsideTarget
+
+        # The swap. 'root\real' now resolves to 'decoy', so 'root\real\link' names decoy\link.
+        Remove-TestJunction -Link $ownLink
+        [System.IO.Directory]::Delete($real, $true)
+        New-TestJunction -Link $real -Target $decoy
+
+        $stats = New-WacDeletionStats
+        Remove-WacLeaf -Path (Join-Path -Path $real -ChildPath 'link') -RootPath $root -Stats $stats -IsReparsePoint
+
+        Assert-Equal 1 ([int]$stats.RefusedIdentity) 'the redirected reparse leaf was not refused on identity'
+        Assert-Equal 0 ([int]$stats.ReparsePointsDeleted) 'a redirected link was counted as deleted'
+        Assert-True (Test-Path -LiteralPath $decoyLink) 'the link OUTSIDE the allow-list was unlinked'
+        Assert-True (Test-Path -LiteralPath $sentinel) 'the sentinel behind the outside link did not survive'
+    }
+    finally {
+        foreach ($link in @((Join-Path -Path $sandbox -ChildPath 'root\real'),
+                            (Join-Path -Path $sandbox -ChildPath 'decoy\link'))) {
+            if (Test-Path -LiteralPath $link) { Remove-TestJunction -Link $link }
+        }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'An ordinary reparse leaf inside its real parent is still deleted as a link' {
+    <#
+        The other direction, and the one that matters for every normal run: the containment proof
+        must not turn routine link removal into a refusal. A junction inside the allow-list is
+        unlinked and whatever it points at is untouched.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'race-reparse-benign'
+    try {
+        $root = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'root')
+        $target = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'target')
+        $keep = Join-Path -Path $target -ChildPath 'keep.txt'
+        [System.IO.File]::WriteAllText($keep, 'untouched')
+
+        $link = Join-Path -Path $root -ChildPath 'link'
+        New-TestJunction -Link $link -Target $target
+
+        $stats = New-WacDeletionStats
+        Remove-WacLeaf -Path $link -RootPath $root -Stats $stats -IsReparsePoint
+
+        Assert-Equal 1 ([int]$stats.ReparsePointsDeleted) 'an ordinary link inside the root was not deleted'
+        Assert-Equal 0 ([int]$stats.RefusedIdentity) 'an ordinary link was refused as an identity mismatch'
+        Assert-False (Test-Path -LiteralPath $link) 'the link is still there'
+        Assert-True (Test-Path -LiteralPath $keep) 'the link target was followed and its content deleted'
+    }
+    finally {
+        $link = Join-Path -Path $sandbox -ChildPath 'root\link'
+        if (Test-Path -LiteralPath $link) { Remove-TestJunction -Link $link }
         Remove-TestSandbox -Path $sandbox
     }
 }

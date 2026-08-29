@@ -93,19 +93,30 @@ function ConvertFrom-WacPnpUtilDriverXml {
         IsValid answers "is this the structured format", HasDeviceEvidence answers "did /devices
         actually take effect". They are separate because the second is the feature detection: no
         version table is consulted anywhere, the output itself is the evidence.
+
+        PublishedName is a SEPARATE, minimal inventory and the reason it exists is that Driver is
+        not one. Driver is the list a PRUNING decision may read, so a row missing a field that
+        decision consults is dropped from it - and a dropped row is invisible, which is exactly what
+        a "has this package gone?" question must not be answered from. PublishedName therefore
+        records every DriverName the enumeration published, validated on its own and on nothing
+        else, so a row too incomplete to prune is still complete enough to prove PRESENCE.
+        NameInventoryComplete says whether that name list is trustworthy: false the moment any
+        <Driver> element failed to yield a name, because then absence from the list means nothing.
     .OUTPUTS
-        IsValid, HasDeviceEvidence, Reason, DroppedRow, Driver (DriverName, OriginalName,
-        ProviderName, ClassName, ClassGuid, ExtensionId, SignerName, Version, VersionText,
-        DeviceCount, Key).
+        IsValid, HasDeviceEvidence, Reason, DroppedRow, PublishedName, NameInventoryComplete,
+        Driver (DriverName, OriginalName, ProviderName, ClassName, ClassGuid, ExtensionId,
+        SignerName, Version, VersionText, DeviceCount, Key).
     #>
     param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Text)
 
     $result = [PSCustomObject]@{
-        IsValid           = $false
-        HasDeviceEvidence = $false
-        Reason            = ''
-        DroppedRow        = 0
-        Driver            = @()
+        IsValid               = $false
+        HasDeviceEvidence     = $false
+        Reason                = ''
+        DroppedRow            = 0
+        PublishedName         = @()
+        NameInventoryComplete = $false
+        Driver                = @()
     }
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
@@ -138,6 +149,8 @@ function ConvertFrom-WacPnpUtilDriverXml {
     }
 
     $drivers = New-Object 'System.Collections.Generic.List[object]'
+    $publishedName = New-Object 'System.Collections.Generic.List[string]'
+    $nameComplete = $true
     $dropped = 0
     $deviceEvidence = $false
 
@@ -154,6 +167,14 @@ function ConvertFrom-WacPnpUtilDriverXml {
 
         $deviceCount = @($node.SelectNodes('Devices/Device')).Count
         if ($deviceCount -gt 0) { $deviceEvidence = $true }
+
+        # The name inventory is built BEFORE the pruning fields are judged and depends on none of
+        # them: this row may be far too incomplete to delete anything on and still be conclusive
+        # proof that the package is published. An element that yields no name at all is the one
+        # thing that can poison it, and it poisons only the completeness flag - never the names
+        # every other element did produce.
+        if ([string]::IsNullOrWhiteSpace($driverName)) { $nameComplete = $false }
+        else { [void]$publishedName.Add($driverName) }
 
         if ([string]::IsNullOrWhiteSpace($driverName) -or [string]::IsNullOrWhiteSpace($originalName) -or
             [string]::IsNullOrWhiteSpace($providerName) -or [string]::IsNullOrWhiteSpace($classGuid) -or
@@ -180,6 +201,8 @@ function ConvertFrom-WacPnpUtilDriverXml {
     $result.IsValid = $true
     $result.DroppedRow = $dropped
     $result.HasDeviceEvidence = $deviceEvidence
+    $result.PublishedName = @($publishedName.ToArray())
+    $result.NameInventoryComplete = $nameComplete
     $result.Driver = @($drivers.ToArray())
 
     if (-not $deviceEvidence) {
@@ -264,6 +287,13 @@ function Test-WacDriverPackageRemoved {
         to different outcomes - treating an unreadable enumeration as proof of removal would be the
         same class of defect this check exists to close.
 
+        It reads PublishedName, never Driver. Driver is the pruning list, and the parse DROPS a row
+        from it whose decision fields are incomplete - so a well-formed enumeration that still lists
+        the requested package, in a row missing one detail field, would have answered Removed while
+        the package sat in the store. Presence is now decided from the name inventory, which is
+        validated on the DriverName attribute alone, and ABSENCE is only ever an answer while
+        NameInventoryComplete says every published element yielded a name. Anything else is Unknown.
+
         A caller must NOT invoke this after a reboot-required exit code: the removal is pending a
         restart, so the package is legitimately still enumerable and Present would be a false alarm.
     .OUTPUTS
@@ -302,12 +332,19 @@ function Test-WacDriverPackageRemoved {
         return $result
     }
 
-    foreach ($driver in @($parsed.Driver)) {
-        if ([string]::Equals([string]$driver.DriverName, $DriverName, [System.StringComparison]::OrdinalIgnoreCase)) {
+    foreach ($published in @($parsed.PublishedName)) {
+        if ([string]::Equals([string]$published, $DriverName, [System.StringComparison]::OrdinalIgnoreCase)) {
             $result.State = 'Present'
-            $result.Reason = 'pnputil reported success but the package is still in the driver store'
+            $result.Reason = 'the package is still in the driver store'
             return $result
         }
+    }
+
+    if (-not $parsed.NameInventoryComplete) {
+        # At least one <Driver> element published no name, so the confirming inventory is not a
+        # complete list of what is installed and "not in it" proves nothing at all.
+        $result.Reason = 'the confirming enumeration carried a package it could not name, so the store listing is incomplete'
+        return $result
     }
 
     $result.State = 'Removed'

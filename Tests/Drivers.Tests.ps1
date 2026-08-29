@@ -31,6 +31,24 @@ $script:DriversModule = Get-Module -Name 'WindowsAutoCleanup.Drivers'
 
 . (Join-Path -Path $PSScriptRoot -ChildPath '_DriverFixtures.ps1')
 
+# The step now walks its backup root for machine trust before it exports anything, and every case in
+# this suite drives a root inside a TEMP sandbox - which is genuinely user-writable and therefore
+# genuinely untrusted, on this developer machine and on an elevated runner alike. Answering that one
+# walk yes keeps each case about the behaviour it names. The walk itself, and the refusals it
+# produces, are measured against real injected roots in DriverBackup.Tests.ps1.
+$script:RealStatePathTrust = Get-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted'
+Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted' -Body {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path,
+        [ValidateRange(1, 128)][int]$MaxDepth = 64
+    )
+    $null = $MaxDepth
+    return [PSCustomObject]@{
+        Path = $Path; IsTrusted = $true; Reason = 'sandbox trust forced for this suite'
+        Checked = @($Path); Failures = @(); Writers = @()
+    }
+}
+
 # The marker Invoke-WacDriverPackagePrune drops into an export directory before it asks pnputil to
 # delete, and clears only once the stamped manifest is durable.
 $script:PendingName = 'wac-driver-delete.pending'

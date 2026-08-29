@@ -68,10 +68,19 @@ function Get-WacBoundDeleteKind {
     .SYNOPSIS
         Maps a DeleteBoundLeaf result onto the failure kinds the counters are written against.
     .DESCRIPTION
-        Measured on both hosts rather than assumed: a missing file opens with Win32 2, a non-empty
-        directory refuses the disposition with STATUS_DIRECTORY_NOT_EMPTY (0xC0000101), and a
-        read-only file refuses it with STATUS_CANNOT_DELETE (0xC0000121) - which is why that maps to
-        Denied and earns the attribute-clearing retry rather than a hard failure.
+        An open failure now has TWO possible error channels, because the delete is anchored: the
+        PARENT is opened with CreateFileW and reports Win32, while the leaf is opened relative to
+        that handle with NtOpenFile and reports NTSTATUS. Reading only one of them is how a
+        perfectly ordinary vanished file became a hard failure - measured, and the reason this
+        function takes both.
+
+        Every value below was measured on both hosts, not assumed:
+          missing leaf            NTSTATUS 0xC0000034  (win32 0)
+          missing parent          Win32 2              (NTSTATUS 0)
+          leaf locked by a writer NTSTATUS 0xC0000043  (win32 0)
+          non-empty directory     NTSTATUS 0xC0000101  on the disposition
+          read-only file          NTSTATUS 0xC0000121  on the disposition, which is why that maps to
+                                  Denied and earns the attribute-clearing retry, not a failure.
     #>
     param(
         [Parameter(Mandatory = $true)][int]$Code,
@@ -85,19 +94,37 @@ function Get-WacBoundDeleteKind {
         if ($Win32Error -eq 2 -or $Win32Error -eq 3) { return 'NotFound' }
         if ($Win32Error -eq 5) { return 'Denied' }
         if ($Win32Error -eq 32 -or $Win32Error -eq 33) { return 'Busy' }
-        return 'Other'
+        if ($Win32Error -ne 0) { return 'Other' }
+        return (Get-WacNtStatusKind -NtStatus $NtStatus)
     }
 
     if ($Code -eq 3) {
-        # Compared as unsigned text: an NTSTATUS is a negative [int] in PowerShell.
-        $status = '0x{0:X8}' -f $NtStatus
-        if ($status -eq '0xC0000101') { return 'NotEmpty' }
-        if ($status -eq '0xC0000121' -or $status -eq '0xC0000022') { return 'Denied' }
-        if ($status -eq '0xC0000043' -or $status -eq '0xC0000019') { return 'Busy' }
-        if ($status -eq '0xC0000034' -or $status -eq '0xC000003A') { return 'NotFound' }
-        return 'Other'
+        $kind = Get-WacNtStatusKind -NtStatus $NtStatus
+        if ($kind -eq 'Other' -and (('0x{0:X8}' -f $NtStatus) -eq '0xC0000101')) { return 'NotEmpty' }
+        return $kind
     }
 
+    return 'Other'
+}
+
+function Get-WacNtStatusKind {
+    <#
+    .SYNOPSIS
+        One NTSTATUS to one failure kind, shared by the open and the disposition.
+    .DESCRIPTION
+        Compared as unsigned TEXT on purpose: an NTSTATUS is a negative [int] in PowerShell, and
+        comparing those numerically is how a sign-extension mistake turns a benign result into a
+        failure without anyone noticing.
+    #>
+    param([Parameter(Mandatory = $true)][int]$NtStatus)
+
+    $status = '0x{0:X8}' -f $NtStatus
+
+    if ($status -eq '0xC0000101') { return 'NotEmpty' }
+    if ($status -eq '0xC0000121' -or $status -eq '0xC0000022') { return 'Denied' }
+    if ($status -eq '0xC0000043' -or $status -eq '0xC0000019') { return 'Busy' }
+    # DELETE_PENDING is the desired end state arriving from somewhere else, not a failure.
+    if ($status -eq '0xC0000034' -or $status -eq '0xC000003A' -or $status -eq '0xC0000056') { return 'NotFound' }
     return 'Other'
 }
 

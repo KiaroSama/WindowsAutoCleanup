@@ -240,10 +240,18 @@ function Invoke-WacDriverPackagePrune {
         The deletion and its backup are ONE commit. A pending marker goes into the export directory
         before pnputil is asked to remove anything and comes off only once the stamped manifest has
         been read back, so from the moment a removal becomes possible the directory is protected
-        from reclamation whatever happens next. deleted and a clean outcome therefore advance only
-        when pnputil reported a documented success AND that commit is durable; a process that never
-        started, a killed one, a result with no readable exit code and a commit that failed are all
-        Incomplete or Failed, never the benign skip they used to fall into.
+        from reclamation whatever happens next.
+
+        An exit code never decides what happened to the store. Every attempt that STARTED is
+        followed by a bounded confirming enumeration - a documented success, the benign 259 and an
+        undocumented non-zero alike - and only that answer clears the marker, reclaims the export or
+        advances a count: Removed commits the backup, Present clears or reclaims it now that the
+        non-deletion is proved, and Unknown keeps both the marker and the export and returns
+        Incomplete. Reboot-required codes are the sole exception, because there the package is
+        legitimately still enumerable until the restart. deleted and a clean outcome therefore
+        advance only from a proven store postcondition PLUS a durable commit; a process that never
+        started, a killed one, a result with no readable exit code, a commit that failed and a
+        removal that happened behind an undocumented exit code are all Incomplete or Failed.
 
         /force, /uninstall and /reboot are never passed: they would delete a package in use, rip a
         driver off live devices, or restart the machine.
@@ -284,6 +292,32 @@ function Invoke-WacDriverPackagePrune {
     if (-not $normalizedBackupRoot) {
         return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
             -Outcome 'SafeSkip' -Detail 'The -BackupRoot path could not be normalised.'))
+    }
+
+    # The sibling Logs directory under the same data root has always been walked for this; the
+    # backup root never was, and it is not an ancestor of Logs, so a weaker owner, a weaker DACL or
+    # a reparse component HERE was invisible while log trust still passed. A backup a standard user
+    # can replace, empty or redirect is not a backup, and the walk runs before anything is read,
+    # reclaimed, exported, marked or committed underneath it. When the root does not exist yet the
+    # walk verifies the nearest existing ancestor instead - the directory the root is about to be
+    # created in and inherit from, which is the thing that has to be trustworthy.
+    $rootTrust = Test-WacStatePathIsTrusted -Path $normalizedBackupRoot
+    if (-not $rootTrust.IsTrusted) {
+        return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
+            -Outcome 'SecurityRefusal' -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
+            -Detail ('The driver backup root is not machine-trusted, so nothing was exported or deleted. {0}' -f [string]$rootTrust.Reason)))
+    }
+
+    # REPORTED, not refused. Measured on a stock Windows 11: C:\ProgramData carries an inherited
+    # BUILTIN\Users:(CI)(WD,AD,WEA,WA), so a standard user can create NEW content under the data
+    # root on every default machine. Refusing on that would refuse this step forever on a healthy
+    # install, which is not a finding. Creating a new name is also not replacing an existing one -
+    # that is the grant the walk above does refuse - and every export is content-addressed, hashed
+    # and re-verified against its own manifest before a package is removed.
+    if (@($rootTrust.Writers).Count -gt 0) {
+        Write-WacLog -Level WARNING -Component $component -Message 'Non-administrative principals can create content in the driver backup root.' -Data @{
+            root = $normalizedBackupRoot; writers = (@($rootTrust.Writers) -join ', ')
+        }
     }
 
     try {
@@ -430,78 +464,102 @@ function Invoke-WacDriverPackagePrune {
             continue
         }
 
-        if ($script:PnpUtilSuccessCode -contains $delete.ExitCode) {
-            $rebootPending = $script:PnpUtilRebootCode -contains $delete.ExitCode
+        # THE POSTCONDITION, and it runs for EVERY attempt that started. An exit code is what the
+        # TOOL believes; only the store can say what a mutating process actually left behind, and
+        # 259 and an undocumented non-zero are exactly as unproven as a reported success. The one
+        # code class that skips it is reboot-required: there the removal completes at the next
+        # restart, so the package is legitimately still enumerable and Present would be a false
+        # alarm that failed every such run.
+        $rebootPending = $script:PnpUtilRebootCode -contains $delete.ExitCode
+        $reportedSuccess = $script:PnpUtilSuccessCode -contains $delete.ExitCode
 
-            # THE POSTCONDITION. The exit code is what the TOOL believes; this asks the STORE, which
-            # is the only evidence that survives a tool reporting success and doing nothing. It is
-            # deliberately skipped for a reboot-required code: there the removal completes at the
-            # next restart, so the package is legitimately still enumerable and 'Present' would be a
-            # false alarm.
-            if (-not $rebootPending) {
-                $confirm = Test-WacDriverPackageRemoved -PnpUtil $pnputil -DriverName $candidate.DriverName `
-                    -TimeoutMs (Get-WacStepTimeoutMs -RequestedMs $script:PnpUtilTimeoutMs) -Component $component
+        $state = 'Removed'
+        $confirmReason = ''
+        if (-not $rebootPending) {
+            $confirm = Test-WacDriverPackageRemoved -PnpUtil $pnputil -DriverName $candidate.DriverName `
+                -TimeoutMs (Get-WacStepTimeoutMs -RequestedMs $script:PnpUtilTimeoutMs) -Component $component
+            $state = [string]$confirm.State
+            $confirmReason = [string]$confirm.Reason
+        }
 
-                if ($confirm.State -ceq 'Present') {
-                    # pnputil claimed success and the package is provably still installed. Nothing
-                    # was removed, so the export is a copy of a live package and is removed with its
-                    # marker - keeping it protected would refuse this package on every later run,
-                    # which is the permanent-refusal trap this design has already fallen into once.
-                    $failed++
-                    $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
-                    [void](Remove-WacDriverBackupDirectory -Path $backup.Directory)
-                    Write-WacLog -Level ERROR -Component $component -Message 'pnputil reported success but the package is still in the driver store; nothing was removed.' -Data @{
-                        driver = $candidate.DriverName; exitCode = $delete.ExitCode; reason = $confirm.Reason
-                    }
-                    continue
-                }
-
-                if ($confirm.State -cne 'Removed') {
-                    # Whether it went cannot be established. The marker STAYS and the export is kept:
-                    # it may be the only copy left of something that is already gone.
-                    $incomplete++
-                    $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
-                    Write-WacLog -Level WARNING -Component $component -Message 'The package removal could not be confirmed against the driver store.' -Data @{
-                        driver = $candidate.DriverName; backup = $backup.Directory; reason = $confirm.Reason
-                    }
-                    continue
-                }
+        if ($state -cne 'Removed' -and $state -cne 'Present') {
+            # Whether it went cannot be established. The marker STAYS and the export is kept: it may
+            # be the only copy left of something that is already gone.
+            $incomplete++
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
+            Write-WacLog -Level WARNING -Component $component -Message 'The package removal could not be confirmed against the driver store.' -Data @{
+                driver = $candidate.DriverName; backup = $backup.Directory; exitCode = $delete.ExitCode; reason = $confirmReason
             }
+            continue
+        }
 
-            # The stamp is what makes this directory a backup rather than a copy, and it is written
-            # atomically. Only once it is durable does the count advance and the marker come off; a
-            # commit that failed leaves a removed package behind a protected export, which is a
-            # failed run and not a deletion anyone may call successful.
-            if (-not (Complete-WacDriverBackup -Path $backup.Directory -Manifest $backup.Manifest)) {
+        if ($state -ceq 'Present') {
+            # The package is provably still installed, so this export is a copy of a live package
+            # and not the only copy of anything. Whatever is done with it, it is done only now that
+            # the store has been asked - and the marker never outlives a proven non-deletion,
+            # because a permanently protected directory refuses this package on every later run.
+            if ($reportedSuccess) {
                 $failed++
                 $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
-                Write-WacLog -Level ERROR -Component $component -Message 'The package was removed but its backup could not be committed; the export is protected and needs manual recovery.' -Data @{
-                    driver = $candidate.DriverName; backup = $backup.Directory
+                [void](Remove-WacDriverBackupDirectory -Path $backup.Directory)
+                Write-WacLog -Level ERROR -Component $component -Message 'pnputil reported success but the package is still in the driver store; nothing was removed.' -Data @{
+                    driver = $candidate.DriverName; exitCode = $delete.ExitCode; reason = $confirmReason
                 }
                 continue
             }
 
-            $deleted++
-            if ($script:PnpUtilRebootCode -contains $delete.ExitCode) { $rebootRequired = $true }
-            Write-WacLog -Level INFO -Component $component -Message 'Removed a superseded driver package.' -Data @{
-                driver = $candidate.DriverName; original = $candidate.OriginalName; version = [string]$candidate.Version
-                supersededBy = $candidate.SupersededByName; exitCode = $delete.ExitCode
-                backup = $backup.Directory; backupFiles = $backup.FileCount
+            if ($script:PnpUtilBenignCode -contains $delete.ExitCode) {
+                # ERROR_NO_MORE_ITEMS, and the store agrees nothing went. The attempt left no
+                # ambiguity behind, so the marker comes off and the export stays exactly as
+                # reclaimable as it was.
+                [void](Clear-WacDriverBackupDeletePending -Path $backup.Directory)
+                $skipped++
+                continue
+            }
+
+            # pnputil refuses a package that is still in use. That is the protection working, and
+            # the store has now confirmed it, so the export costs space and collides with every
+            # later run for nothing.
+            [void](Remove-WacDriverBackupDirectory -Path $backup.Directory)
+            Write-WacLog -Level INFO -Component $component -Message 'pnputil declined to remove a package, and the store confirms it is still installed.' -Data @{
+                driver = $candidate.DriverName; exitCode = $delete.ExitCode
+            }
+            $skipped++
+            continue
+        }
+
+        # The package is gone - proved against the store, or pending the restart a reboot-required
+        # code promises. The stamp is what makes this directory a backup rather than a copy, and it
+        # is written atomically. Only once it is durable does the count advance and the marker come
+        # off; a commit that failed leaves a removed package behind a protected export, which is a
+        # failed run and not a deletion anyone may call successful.
+        if (-not (Complete-WacDriverBackup -Path $backup.Directory -Manifest $backup.Manifest)) {
+            $failed++
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
+            Write-WacLog -Level ERROR -Component $component -Message 'The package was removed but its backup could not be committed; the export is protected and needs manual recovery.' -Data @{
+                driver = $candidate.DriverName; backup = $backup.Directory
+            }
+            continue
+        }
+
+        $deleted++
+        if ($rebootPending) { $rebootRequired = $true }
+
+        if (-not $reportedSuccess) {
+            # The store says the package is gone and the tool said something outside its documented
+            # success set. Nothing is lost - the removal is real and its backup is committed - but a
+            # tool that mutates the store while contradicting its own exit code is not a clean run,
+            # and an exit code is never again allowed to be the thing that decides that.
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
+            Write-WacLog -Level ERROR -Component $component -Message 'The package was removed even though pnputil reported no documented success; the run is not clean.' -Data @{
+                driver = $candidate.DriverName; exitCode = $delete.ExitCode; backup = $backup.Directory
             }
         }
-        elseif ($script:PnpUtilBenignCode -contains $delete.ExitCode) {
-            # ERROR_NO_MORE_ITEMS: pnputil removed nothing, so the attempt left no ambiguity behind
-            # and the marker comes off again. The export stays exactly as reclaimable as it was.
-            [void](Clear-WacDriverBackupDeletePending -Path $backup.Directory)
-            $skipped++
-        }
-        else {
-            # pnputil refuses a package that is still in use. That is the protection working - and
-            # because the package stayed, its export is a copy of something, not the only copy of
-            # it. Keeping it would cost the space and collide with every later run.
-            [void](Remove-WacDriverBackupDirectory -Path $backup.Directory)
-            Write-WacLog -Level INFO -Component $component -Message 'pnputil declined to remove a package.' -Data @{ driver = $candidate.DriverName; exitCode = $delete.ExitCode }
-            $skipped++
+
+        Write-WacLog -Level INFO -Component $component -Message 'Removed a superseded driver package.' -Data @{
+            driver = $candidate.DriverName; original = $candidate.OriginalName; version = [string]$candidate.Version
+            supersededBy = $candidate.SupersededByName; exitCode = $delete.ExitCode
+            backup = $backup.Directory; backupFiles = $backup.FileCount
         }
     }
 
