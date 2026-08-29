@@ -656,7 +656,7 @@ Test-Case 'the backup trust rule is Core''s state-path walk, not a second copy l
     # that does not. The gate must delegate to the walk Core owns, and the driver package must not
     # start decoding access rules of its own.
     $package = @('WindowsAutoCleanup.Drivers.psm1', 'WindowsAutoCleanup.DriverInventory.ps1',
-        'WindowsAutoCleanup.DriverBackup.ps1')
+        'WindowsAutoCleanup.DriverBackup.ps1', 'WindowsAutoCleanup.DriverBackupStore.ps1')
     $source = (@($package | ForEach-Object {
         [System.IO.File]::ReadAllText((Join-Path -Path $script:RepoRoot -ChildPath ('src\' + $_)))
     }) -join [Environment]::NewLine)
@@ -676,9 +676,27 @@ Test-Case 'the backup trust rule is Core''s state-path walk, not a second copy l
     # decision, not a formality: a later change may only do so together with the gate that earns it.
     Assert-Equal 3 @($code | Where-Object { $_ -eq 'Test-WacStatePathIsTrusted' }).Count `
         'the backup-root, identity-directory and pending-reconciliation trust gates are not all delegating to Core''s walk'
+
+    # The STRICT rule is the second half of every one of those gates, and it is delegated the same
+    # way: the driver package asks Open-WacDriverBackupDirectory, which asks Core's
+    # Open-WacTrustedDirectory -RequireStrictTrust, which asks Core's Test-WacStrictAclIsAdministrative.
+    # Exactly one place in this package may name the primitive that takes that verdict.
+    Assert-Equal 1 @($code | Where-Object { $_ -eq 'Open-WacTrustedDirectory' }).Count `
+        'the driver package opens trusted directories somewhere other than Open-WacDriverBackupDirectory'
+    Assert-True (@($code | Where-Object { $_ -eq 'Open-WacDriverBackupDirectory' }).Count -ge 4) `
+        'the backup root, the existing identity directory, the created one and the control-file layer do not all take a strict handle verdict'
+
     foreach ($forbidden in @('GetAccessRules', 'GetOwner', 'Get-Acl')) {
         Assert-Equal 0 @($code | Where-Object { $_ -eq $forbidden }).Count `
             ('the driver package is deciding {0} for itself instead of delegating to Core' -f $forbidden)
+    }
+
+    # The three predictable control names are never touched by a pathname write, read or delete
+    # again. WriteAllText and ReadAllText are how all three used to be handled, and each of them
+    # follows a symlink, truncates a planted file and writes through a hard link.
+    foreach ($forbidden in @('WriteAllText', 'ReadAllText')) {
+        Assert-Equal 0 @($code | Where-Object { $_ -eq $forbidden }).Count `
+            ('the driver package still reaches a fixed-name control file by pathname through {0}' -f $forbidden)
     }
 }
 

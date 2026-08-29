@@ -100,6 +100,8 @@ public static class WacNative
     private const uint FILE_ATTRIBUTE_NORMAL_FLAG   = 0x00000080;
     private const uint FILE_DIRECTORY_FILE_OPT      = 0x00000001;
     private const uint FILE_NON_DIRECTORY_FILE_OPT  = 0x00000040;
+    // The same bit as FILE_LIST_DIRECTORY, under the name it carries on a non-directory object.
+    private const uint FILE_READ_DATA_ACCESS        = 0x00000001;
     private const uint FILE_CREATE_DISPOSITION      = 2;
     private const int  SE_FILE_OBJECT               = 1;
     private const int  OWNER_AND_DACL               = 0x00000001 | 0x00000004;
@@ -107,7 +109,13 @@ public static class WacNative
 
     private static readonly IntPtr INVALID_HANDLE = new IntPtr(-1);
 
-    [StructLayout(LayoutKind.Sequential)]
+    // Pack = 4 is load-bearing, not decoration. Every field of the Win32 struct is a DWORD or a
+    // pair of them, so the native layout is 4-byte aligned throughout - but the FILETIMEs are
+    // declared here as long, and under the default packing a long is aligned to 8, which inserts
+    // four bytes of padding after dwFileAttributes and shifts EVERY LATER FIELD. Measured before
+    // this was fixed: NumberOfLinks read back as 2031616 (0x1F0000) for an ordinary one-link file.
+    // It went unnoticed while FileAttributes, at offset 0, was the only field anyone read.
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct BY_HANDLE_FILE_INFORMATION
     {
         public uint FileAttributes;
@@ -385,6 +393,81 @@ public static class WacNative
     public static int CreateBoundFile(IntPtr parent, string name, out IntPtr handle)
     {
         return CreateRelative(parent, name, false, out handle);
+    }
+
+    // Opens ONE EXISTING child file under a directory handle, for reading only, and reports what
+    // the object on the other end of that name actually turned out to be.
+    //
+    // Three properties, all load-bearing, because the caller is about to read - or to decide the
+    // fate of - a file whose NAME is predictable and whose content it did not necessarily write:
+    //   * BOUND. The name is resolved against a directory object the caller holds open, so nothing
+    //     that happens to any ancestor's name can move where the open lands.
+    //   * NO-FOLLOW. FILE_OPEN_REPARSE_POINT binds to the link itself, and 'attributes' then carries
+    //     FILE_ATTRIBUTE_REPARSE_POINT so the caller can refuse instead of reading somewhere else.
+    //   * LINK-COUNTED. 'links' is BY_HANDLE_FILE_INFORMATION.NumberOfLinks. A hard link is a second
+    //     directory entry for the SAME file, so it carries no reparse attribute and resolves to a
+    //     perfectly ordinary path - a reparse check misses it completely. A count above 1 means the
+    //     bytes behind this name are also reachable under another name that this tool never chose.
+    //
+    // FILE_NON_DIRECTORY_FILE makes a directory planted at the name an open failure rather than a
+    // surprise. Returns an NTSTATUS: 0 with the handle set, otherwise the failure with
+    // handle = IntPtr.Zero. The caller owns the handle.
+    public static int OpenBoundLeafForRead(
+        IntPtr parent, string name, out IntPtr handle, out uint attributes, out uint links)
+    {
+        handle = IntPtr.Zero;
+        attributes = 0;
+        links = 0;
+
+        if (string.IsNullOrEmpty(name)) { return unchecked((int)0xC000003B); }
+        if (name.IndexOf('\\') >= 0 || name.IndexOf('/') >= 0) { return unchecked((int)0xC000003B); }
+
+        IntPtr namePtr = Marshal.StringToHGlobalUni(name);
+        IntPtr unicodePtr = IntPtr.Zero;
+        IntPtr opened = IntPtr.Zero;
+        try
+        {
+            UNICODE_STRING unicode = new UNICODE_STRING();
+            unicode.Length = (ushort)(name.Length * 2);
+            unicode.MaximumLength = (ushort)(name.Length * 2);
+            unicode.Buffer = namePtr;
+
+            unicodePtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+            Marshal.StructureToPtr(unicode, unicodePtr, false);
+
+            OBJECT_ATTRIBUTES objectAttributes = new OBJECT_ATTRIBUTES();
+            objectAttributes.Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));
+            objectAttributes.RootDirectory = parent;
+            objectAttributes.ObjectName = unicodePtr;
+            objectAttributes.Attributes = OBJ_CASE_INSENSITIVE;
+
+            IO_STATUS_BLOCK iosb;
+            int status = NtOpenFile(
+                out opened, FILE_READ_DATA_ACCESS | FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
+                ref objectAttributes, out iosb, FILE_SHARE_READ_ONLY,
+                FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE_OPT | FILE_OPEN_REPARSE_POINT_OPT);
+            if (status != 0) { opened = IntPtr.Zero; return status; }
+
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(new SafeFileHandle(opened, false), out information))
+            {
+                // STATUS_UNSUCCESSFUL. An object that will not describe itself is unverifiable, and
+                // the handle is dropped here so no caller can read through it anyway.
+                return unchecked((int)0xC0000001);
+            }
+
+            attributes = information.FileAttributes;
+            links = information.NumberOfLinks;
+            handle = opened;
+            opened = IntPtr.Zero;
+            return 0;
+        }
+        finally
+        {
+            if (opened != IntPtr.Zero) { CloseHandle(opened); }
+            if (unicodePtr != IntPtr.Zero) { Marshal.FreeHGlobal(unicodePtr); }
+            Marshal.FreeHGlobal(namePtr);
+        }
     }
 
     private static int CreateRelative(IntPtr parent, string name, bool directory, out IntPtr handle)

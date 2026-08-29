@@ -89,9 +89,12 @@ $script:RecordingInvoker = {
     if ($canned.ContainsKey('TimedOut')) { $timedOut = [bool]$canned['TimedOut'] }
     if ($canned.ContainsKey('Out')) { $standardOutput = [string]$canned['Out'] }
 
-    # Exit 0 only: 3010 and 1641 mean the removal finishes at the next restart, so the package is
-    # legitimately still listed until then - which is exactly why the step skips its postcondition
-    # for those codes.
+    # Exit 0 only, and the reason is about the STORE this stub models rather than about the step.
+    # 3010 and 1641 mean the removal finishes at the next restart, so the package really is still
+    # listed until then - a fixture that removed it immediately would model a machine that does not
+    # exist. The step no longer skips its postcondition for those codes; it runs the check for every
+    # started attempt and reads a reboot-required Present differently, keeping the export rather
+    # than reclaiming it. DriverPostcondition.Tests crosses 1641 and 3010 with all three answers.
     if ($key -eq '/delete-driver' -and -not $timedOut -and $exitCode -eq 0 -and $argv.Count -ge 2) {
         if (-not $canned.ContainsKey('LeaveInStore') -or -not [bool]$canned['LeaveInStore']) {
             [void]$script:StubDeleted.Add([string]$argv[1])
