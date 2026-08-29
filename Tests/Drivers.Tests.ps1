@@ -569,7 +569,7 @@ Test-Case 'no uncertain enumeration ever reaches a deletion' {
     }
 }
 
-Test-Case 'pnputil exit 259 is benign and exit 3010 is success plus RebootRequired' {
+Test-Case 'pnputil exit 259 is benign and exit 3010 surfaces a reboot without counting a removal' {
     $sandbox = New-TestSandbox -Prefix 'dr-exitcode'
     try {
         $xml = New-PnpUtilDriverXml -Row (New-SupersededPair)
@@ -586,12 +586,17 @@ Test-Case 'pnputil exit 259 is benign and exit 3010 is success plus RebootRequir
 
         Invoke-WithStubbedTool -Body {
             $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+            # The shared fixture takes a package out of its modelled store on exit 0 only, so this
+            # is 3010 with the package still listed - and that is the whole point. The code asks
+            # for a restart; it does not say the store has already lost anything, so the removal is
+            # pending rather than done and nothing may be counted for it yet. The full 3010/1641
+            # cross against Removed, Present and Unknown lives in DriverPostcondition.Tests.ps1.
             $script:StubResult['/delete-driver'] = @{ ExitCode = 3010 }
             $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot (Join-Path -Path $sandbox -ChildPath 'b3010')
 
-            Assert-Equal 'Succeeded' $result.Outcome $result.Detail
+            Assert-Equal 'Incomplete' $result.Outcome $result.Detail
+            Assert-True ($result.Detail -match 'deleted=0') ('a removal nobody observed was counted: {0}' -f $result.Detail)
             Assert-True $result.RebootRequired 'a reboot-required deletion did not surface a reboot'
-            Assert-False $result.Failed
         }
     }
     finally {

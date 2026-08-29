@@ -139,6 +139,15 @@ Test-Case 'A name that cannot be canonicalised without changing which object it 
             ('a name whose identity changes under normalisation was canonicalised: ' + $ambiguous)
     }
 
+    # EVERY segment, not only the last. Guarding the final component alone let an intermediate
+    # one through: 'C:\root\dir.\victim.txt' canonicalised to 'C:\root\dir\victim.txt', so the
+    # delete landed in the wrong DIRECTORY and destroyed a file that was never enumerated.
+    foreach ($intermediate in @('C:\root\dir.\victim.txt', 'C:\a.\b.\c.txt', 'C:\dir\sub.\',
+                                'C:\root\trailing \leaf.txt', '\\?\C:\root\dir.\victim.txt')) {
+        Assert-Equal $null (Get-WacNormalizedPath -Path $intermediate) `
+            ('an ambiguous INTERMEDIATE segment was canonicalised: ' + $intermediate)
+    }
+
     # The control. A guard that also refuses these would be worse than the defect it closes.
     Assert-Equal 'C:\dir\note.txt' (Get-WacNormalizedPath -Path 'C:\dir\note.txt')
     Assert-Equal 'C:\dir'          (Get-WacNormalizedPath -Path 'C:\dir\')
@@ -147,6 +156,41 @@ Test-Case 'A name that cannot be canonicalised without changing which object it 
     Assert-Equal 'C:'              (Get-WacNormalizedPath -Path 'C:\')
     Assert-Equal 'C:\dir\sub'      (Get-WacNormalizedPath -Path 'C:\dir\sub')
     Assert-Equal 'C:\a.b.c'        (Get-WacNormalizedPath -Path 'C:\a.b.c')
+    Assert-Equal 'C:\has space inside\x' (Get-WacNormalizedPath -Path 'C:\has space inside\x')
+}
+
+Test-Case 'A name is never trimmed into a different name, and the two hosts do not have to agree' {
+    <#
+        U+00A0 NO-BREAK SPACE is a legal filename character that .NET counts as whitespace, so the
+        whole-string .Trim() this function used to perform renamed 'victim<U+00A0>' to 'victim' and
+        the delete destroyed that neighbour. Trimming a filesystem identity is never safe.
+
+        The two hosts genuinely disagree about this character and the assertion says so rather than
+        papering over it: measured, GetFullPath PRESERVES a trailing U+00A0 on PowerShell 7.6.5
+        (.NET 10) and STRIPS it on Windows PowerShell 5.1 (.NET Framework). So on 7 the name round
+        trips and is allowed - the correct object is reachable - while on 5.1 canonicalisation would
+        alias it and the guard refuses.
+
+        What must be identical on both, and is what this really asserts, is the SAFETY property:
+        the name is never silently converted into its ordinary-looking neighbour. Pinning one
+        outcome for both hosts would have meant asserting something false on one of them.
+    #>
+    $nbsp = [char]0x00A0
+    $ambiguous = 'C:\root\victim' + $nbsp
+    $normalized = Get-WacNormalizedPath -Path $ambiguous
+
+    if ($null -ne $normalized) {
+        Assert-True ($normalized.EndsWith($nbsp)) `
+            'the name was allowed through with its trailing U+00A0 silently removed, which renames it'
+        Assert-Equal 'C:\root\victim' ($normalized.TrimEnd($nbsp)) 'the allowed name is not the one that was asked for'
+    }
+
+    # Whatever this host decided, it must never be the neighbour's path.
+    Assert-True ($normalized -cne 'C:\root\victim') 'an ambiguous name canonicalised onto its ordinary neighbour'
+
+    # An interior U+00A0 is an ordinary character and must survive on both hosts.
+    $interior = 'C:\root\lead' + $nbsp + 'mid\leaf.txt'
+    Assert-Equal $interior (Get-WacNormalizedPath -Path $interior) 'an interior U+00A0 was treated as trimmable whitespace'
 }
 
 Complete-TestRun

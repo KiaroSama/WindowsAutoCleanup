@@ -34,6 +34,14 @@ Import-Module -Name (Join-Path -Path $script:SrcRoot -ChildPath 'WindowsAutoClea
 #     candidate root did not yet exist cannot have been reached after the root was created. It also
 #     answers in whichever SHAPE the plan names, including two shapes that are not answers at all.
 #
+#   * The owner/DACL verdict taken from the log directory's OWN HANDLE follows the same plan flag.
+#     It is the second of the two answers a redirected %ProgramData% under TEMP cannot give
+#     honestly: that directory is genuinely user-writable, so the real rule says "untrusted" there
+#     (measured) and every scenario would fail to open a log for a reason unrelated to the case
+#     under test. Only the DESCRIPTOR answer is stood in. The reparse test and the collision-failing
+#     create are the kernel's answers, not this shim's, which is why the junction case below still
+#     exercises the real guard.
+#
 #   * The degraded-mode sink is redirected into the sandbox. Write-WacFallbackLine tries the
 #     machine's Application event log first and a test may not write there; Set-WacLogFallbackWriter
 #     is the seam that exists for exactly this, and it reports 'Injected', so a line is PROVEN to
@@ -69,6 +77,16 @@ Set-WacLogFallbackWriter -Writer {
     param($line)
     [System.IO.File]::AppendAllText(([string]$env:WAC_TEST_PLAN + '.fallback'),
         ($line + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+Set-WacDirectoryTrustJudge -ScriptBlock {
+    param($sddl)
+    $null = $sddl
+    return [PSCustomObject]@{
+        IsTrusted = [bool](Get-WacTestPlan).stateTrusted
+        Owner = $null
+        Reason = 'test shim: handle descriptor verdict'
+    }
 }
 '@
 
@@ -431,6 +449,50 @@ Test-Case 'A refused state directory that already exists is left byte for byte a
             'the refused directory was never the one the trust question was asked about'
     }
     finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A log directory planted as a link is refused by the run, and its target is untouched' {
+    # Root 1 of audit brief 8, end to end. The pathname preflight ANSWERS TRUSTED here, so the only
+    # thing between the run and the attacker's target is the guard that verifies the object actually
+    # opened. Reverted to Test-Path plus New-Item -Force, Test-Path calls the junction a container
+    # and the whole SYSTEM audit log lands inside the link's target - measured, and this case sees
+    # it. The plant is a junction because a plain directory's owner depends on whether the suite is
+    # elevated, and this must assert the same thing in a developer shell and on a hosted runner.
+    $rig = New-RunRig -Prefix 'rig-planted-link'
+    try {
+        $outside = Join-Path -Path $rig.Sandbox -ChildPath 'outside'
+        [void][System.IO.Directory]::CreateDirectory($outside)
+        [System.IO.File]::WriteAllText((Join-Path -Path $outside -ChildPath 'sentinel.txt'), 'untouched', $script:Utf8NoBom)
+
+        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $rig.LogDirectory))
+        New-Item -ItemType Junction -Path $rig.LogDirectory -Target $outside -ErrorAction Stop | Out-Null
+
+        $before = Get-DirectoryFingerprint -Path $outside
+        Assert-True ($before.Contains('untouched')) 'the fixture never wrote the sentinel it is about to protect'
+
+        $result = Invoke-RunRig -Rig $rig -Plan @{ stateTrusted = $true; targets = @() }
+
+        Assert-True $result.Exited ('the run did not finish inside its bound. stderr: ' + $result.ErrorText)
+        Assert-Equal $before (Get-DirectoryFingerprint -Path $outside) `
+            'the link target was created under or written to'
+
+        # 7, not Run.ps1's generic "no log anywhere" exit 1: the refusal was a SECURITY one and has
+        # to reach the field the verdict is derived from, or a deliberate refusal reads to an
+        # operator as a malfunction. Measured before that was wired up: it exited 1.
+        Assert-Equal 7 $result.ExitCode `
+        ('a refused state directory did not exit SecurityRefusal. stderr: ' + $result.ErrorText)
+
+        $fallback = Get-RigFallbackText -Rig $rig
+        Assert-True ($fallback -match 'reparse point') `
+        ('the refusal never named what it refused: ' + $fallback)
+        Assert-True ($fallback -cmatch '(^|\s)exitCode=7($|\s)') ('fallback: ' + $fallback)
+    }
+    finally {
+        # Removed AS A LINK: a recursive delete would take the target's contents with it, and
+        # Remove-Item throws a spurious NullReferenceException on some junctions under 5.1.
+        try { [System.IO.Directory]::Delete($rig.LogDirectory, $false) } catch { $null = $_ }
         Remove-RunRig -Rig $rig
     }
 }

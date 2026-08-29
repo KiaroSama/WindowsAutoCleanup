@@ -32,40 +32,53 @@ $script:StateTrust          = $null
 # Logging
 # ---------------------------------------------------------------------------------------------
 
-function Get-WacDataRoot {
-    <#
-    .SYNOPSIS
-        Machine-wide state/log root. Never inside a directory this tool cleans.
-    #>
-    if ($env:ProgramData) { return (Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup') }
-    return (Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup')
-}
-
-function Get-WacDeploymentRoot {
-    <#
-    .SYNOPSIS
-        Canonical machine-wide install location for the runtime the scheduled task executes.
-    #>
-    if ($env:ProgramFiles) { return (Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup') }
-    return (Join-Path -Path $env:SystemRoot -ChildPath 'WindowsAutoCleanup')
-}
-
 function New-WacLogFile {
     <#
     .SYNOPSIS
-        Creates a new log file with create-new semantics, trying each candidate root in order.
+        Creates a new log file inside a directory that has been proved through its own handle,
+        trying each candidate root in order. Returns the opened StreamWriter, or $null.
     .DESCRIPTION
-        New-Item -Force truncates an existing file, so two runs starting in the same second used to
-        share one log and the first one's content was lost. CreateNew fails instead, and the suffix
-        loop makes the name collision-proof. Returns the opened StreamWriter, or $null.
+        Both halves of this used to be a pathname round trip, and both were wrong.
+
+        The DIRECTORY was reached with Test-Path followed by New-Item -Force. New-Item -Force does
+        not create-or-fail, it creates-or-ADOPTS: a directory that appeared between the test and the
+        create was taken over silently, and the object actually written to was never verified.
+        Since Initialize-WacRun's preflight can only verify the nearest EXISTING ancestor when the
+        candidate root does not exist yet, and %ProgramData% lets a local standard user create names
+        by default, that user could introduce the predictable candidate directory in the window and
+        the SYSTEM audit log would be written into a directory they own. Open-WacTrustedDirectory
+        replaces it: collision-failing creation anchored to a proved parent handle, then the owner,
+        DACL, reparse state, volume and resolved identity of the object actually opened.
+
+        The FILE was created by pathname with FileMode::CreateNew. CreateNew was already right about
+        collisions - New-Item -Force truncated, so two runs starting in the same second shared one
+        log and the first one's content was lost - but a pathname create is still a second, separate
+        resolution of the directory's name. It is now created RELATIVE to the directory handle, so
+        the file lands inside the object that was verified or it is not created at all.
+
+        The pin lives exactly as long as the window it closes: the handle is opened before the
+        verification and released once the log file exists. Holding it for the whole run would buy
+        nothing the open log-file handle does not already give, and would leave a raw handle for
+        every caller to remember to release.
 
         Root names WHICH candidate the file landed in. The caller has already reached one trust
         verdict per candidate root and has to attach the verdict for the one actually used;
         re-deriving that from the path would be a second answer to a question already answered.
+    .PARAMETER RequireMachineTrust
+        Demand an administrative owner and DACL, and a local fixed volume, for the directory the
+        log is created in. Pass it only when the run makes a machine-trust claim: an unelevated run
+        logs inside the invoking user's own profile, which the user owns by construction.
+    .PARAMETER Refusal
+        Optional. Every candidate that was skipped is appended here as a Path/Reason pair. Nothing
+        can be logged yet at this point in a run, so the caller has to carry the reasons to whatever
+        sink it ends up with - and, when the run made a machine-trust claim, into the verdict its
+        exit code is derived from.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$BaseName,
-        [Parameter(Mandatory = $true)][string[]]$CandidateRoot
+        [Parameter(Mandatory = $true)][string[]]$CandidateRoot,
+        [switch]$RequireMachineTrust,
+        [AllowNull()][System.Collections.Generic.List[object]]$Refusal
     )
 
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd_HH-mm-ss')
@@ -73,37 +86,65 @@ function New-WacLogFile {
     foreach ($root in $CandidateRoot) {
         if ([string]::IsNullOrWhiteSpace($root)) { continue }
 
+        # A candidate that THREW and a candidate that was refused mean the same thing here - this
+        # one cannot be used - and the one thing neither may do is stop the remaining candidates
+        # being tried. The predecessor had exactly this shape (catch { continue }) around New-Item.
+        $directory = $null
         try {
-            if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-                New-Item -Path $root -ItemType Directory -Force -ErrorAction Stop | Out-Null
-            }
+            $directory = Open-WacTrustedDirectory -Path $root -RequireMachineTrust:$RequireMachineTrust
         }
         catch {
+            $directory = [PSCustomObject]@{
+                Path = $root; IsTrusted = $false; Handle = [IntPtr]::Zero
+                Reason = ('The directory could not be prepared: {0}' -f $_.Exception.Message)
+            }
+        }
+
+        if (-not $directory.IsTrusted) {
+            if ($null -ne $Refusal) {
+                [void]$Refusal.Add([PSCustomObject]@{ Path = $root; Reason = [string]$directory.Reason })
+            }
             continue
         }
 
-        for ($attempt = 0; $attempt -lt 50; $attempt++) {
-            $suffix = if ($attempt -eq 0) { '' } else { '_{0:00}' -f $attempt }
-            $name = '{0}_{1}_UTC{2}.log' -f $BaseName, $stamp, $suffix
-            $path = Join-Path -Path $root -ChildPath $name
+        try {
+            for ($attempt = 0; $attempt -lt 50; $attempt++) {
+                $suffix = if ($attempt -eq 0) { '' } else { '_{0:00}' -f $attempt }
+                $name = '{0}_{1}_UTC{2}.log' -f $BaseName, $stamp, $suffix
 
-            try {
-                $stream = New-Object System.IO.FileStream(
-                    $path,
-                    [System.IO.FileMode]::CreateNew,
-                    [System.IO.FileAccess]::Write,
-                    [System.IO.FileShare]::Read)
-                $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+                $file = New-WacBoundFile -DirectoryHandle $directory.Handle -Name $name
+                if ($file.Kind -eq 'Collision') { continue }
+                if ($file.Kind -ne 'Created') {
+                    # An EMPTY collection is falsy in PowerShell, so the test has to be explicit:
+                    # 'if ($Refusal)' silently discarded every reason until the first one was added.
+                    if ($null -ne $Refusal) {
+                        [void]$Refusal.Add([PSCustomObject]@{
+                                Path = $root
+                                Reason = ('The log file could not be created (NTSTATUS 0x{0:X8}).' -f $file.NtStatus)
+                            })
+                    }
+                    break
+                }
+
+                $writer = New-Object System.IO.StreamWriter($file.Stream, (New-Object System.Text.UTF8Encoding($false)))
                 $writer.AutoFlush = $true
-                return [PSCustomObject]@{ Path = $path; Writer = $writer; Root = $root }
+                return [PSCustomObject]@{
+                    Path = (Join-Path -Path $directory.Path -ChildPath $name)
+                    Writer = $writer
+                    Root = $root
+                }
             }
-            catch {
-                # A CreateNew collision surfaces as IOException, but a constructor exception reaches
-                # us wrapped, so classify explicitly rather than relying on a typed catch: getting
-                # this wrong makes a same-second collision abandon the whole candidate root.
-                if ((Get-WacIoFailureKind -ErrorRecord $_) -eq 'Busy') { continue }
-                break
+        }
+        catch {
+            if ($null -ne $Refusal) {
+                [void]$Refusal.Add([PSCustomObject]@{
+                        Path = $root
+                        Reason = ('The log file could not be opened: {0}' -f $_.Exception.Message)
+                    })
             }
+        }
+        finally {
+            Close-WacTrustedDirectory -Handle $directory.Handle
         }
     }
 
@@ -249,7 +290,10 @@ function Get-WacStateTrust {
 
         A non-$null verdict with IsTrusted false can only be seen through Initialize-WacRun
         returning $false: a trusted root is the precondition for opening the log, not a fact
-        discovered afterwards.
+        discovered afterwards. It has TWO sources, and they are deliberately indistinguishable
+        here - the pathname preflight refusing the ancestor chain, and the handle check refusing
+        the directory actually created or opened. The caller's question is only "was this run's
+        state directory refused on security grounds", never which of the two guards said so.
     #>
     return $script:StateTrust
 }
@@ -416,25 +460,32 @@ function Initialize-WacRun {
     # the verdict $null - NOT EVALUATED - which is the answer Get-WacStateTrust documents and which
     # the run-level gate already treats as benign, so a benign unelevated run still exits 0.
     #
-    # RESIDUAL WINDOW, stated rather than papered over. The check is by pathname and the create
-    # that follows is by pathname, so the two are not bound to one handle: managed code cannot open
-    # a leaf relative to a directory handle, and the native surface this module has offers no such
-    # primitive. What closes the gap for the modeled adversary - a local standard user who can write
-    # into these paths - is WHAT the check proves: Test-WacStatePathIsTrusted refuses unless the
-    # leaf and every ancestor up to the volume root are owned by an administrative principal, are
-    # free of reparse points, and grant no non-administrator Delete, DeleteSubdirectoriesAndFiles,
-    # ChangePermissions, TakeOwnership or GENERIC_ALL. Renaming the root aside and dropping a
-    # junction in its place needs exactly one of those rights, so a standard user cannot perform the
-    # swap the window would need. An administrator can - and an administrator needs no race.
-    # A user who can only CREATE names in the leaf cannot redirect the open either: CreateNew fails
-    # on a name that already exists, whatever that name happens to point at.
+    # WHAT THIS CHECK IS FOR, now that it is no longer the only guard. It answers the question the
+    # handle-bound half CANNOT: whether the whole ANCESTOR CHAIN up to the volume root is owned by
+    # an administrative principal, free of reparse points, and grants no non-administrator Delete,
+    # DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership or GENERIC_ALL. Renaming the
+    # root aside and dropping a junction in its place needs exactly one of those rights, so proving
+    # they are absent is what makes the pathname the log is created under stable in the first place.
+    # Open-WacTrustedDirectory deliberately inspects nothing above the directory it opens.
+    #
+    # The window this comment used to describe - check by pathname, then create by pathname - is
+    # CLOSED. It stated that managed code could not open a leaf relative to a directory handle and
+    # that the native surface offered no such primitive; the second half was a decision, not a fact,
+    # and it has been reversed. The creation is now collision-failing and anchored to a proved
+    # parent handle, and the object obtained is verified through that handle before use.
+    #
     # Kept whole for the protected-root registration below. Narrowing $CandidateRoot to the trusted
     # ones is right for CREATING the log and wrong for deciding what cleanup must never delete: a
     # root this run refuses to write into is still a root it must not sweep.
     $allCandidateRoot = @($CandidateRoot)
 
+    # Whether this run makes a machine-trust claim at all. It decides two things that must not
+    # drift apart: whether the ancestor preflight below runs, and whether the directory the log is
+    # created in has to prove an administrative owner and DACL through its own handle.
+    $machineClaim = ($moduleChoseRoot -and (Test-WacIsAdministrator))
+
     $verdictByRoot = $null
-    if ($moduleChoseRoot -and (Test-WacIsAdministrator)) {
+    if ($machineClaim) {
         $verdictByRoot = @{}
         $trustedRoot = New-Object 'System.Collections.Generic.List[string]'
         $refusal = New-Object 'System.Collections.Generic.List[string]'
@@ -469,12 +520,40 @@ function Initialize-WacRun {
         $CandidateRoot = @($trustedRoot.ToArray())
     }
 
-    $created = New-WacLogFile -BaseName $BaseName -CandidateRoot $CandidateRoot
+    # THE SECOND HALF OF THE PREFLIGHT, and the half that used to be missing. The check above is by
+    # pathname and can only verify the nearest EXISTING ancestor when the candidate root does not
+    # exist yet, so on its own it leaves a window in which the predictable candidate directory can
+    # be created by anyone allowed to create names in that ancestor - which, on the default
+    # %ProgramData% descriptor, is every local standard user. New-WacLogFile now closes that window
+    # rather than documenting it: the directory is created collision-failing or opened, and the
+    # object actually obtained is verified through its own handle before a byte is written to it.
+    $refusal = New-Object 'System.Collections.Generic.List[object]'
+    $created = New-WacLogFile -BaseName $BaseName -CandidateRoot $CandidateRoot `
+        -RequireMachineTrust:$machineClaim -Refusal $refusal
     if (-not $created) {
         $script:LogPath = $null
         $script:LogWriter = $null
 
         $reason = ('No log file could be created under any of: {0}' -f ($CandidateRoot -join '; '))
+        if ($refusal.Count -gt 0) {
+            $reason = ('{0} | {1}' -f $reason,
+                ((@($refusal | ForEach-Object { '{0}: {1}' -f $_.Path, $_.Reason })) -join ' | '))
+
+            # A run that made a machine-trust claim and had its state directory refused BY THE
+            # HANDLE CHECK is refusing for a security reason, and must say so in the one field the
+            # exit code is derived from. Without this the same refusal reached Run.ps1's generic
+            # "no log anywhere" gate and reported exit 1, which reads as a malfunction rather than
+            # as the deliberate refusal it is. The verdict shape is the one Get-WacStateRootVerdict
+            # produces, because Run.ps1 and Get-OperationSafetyVerdict both read it.
+            if ($machineClaim) {
+                $script:StateTrust = [PSCustomObject]@{
+                    Path = [string]$refusal[0].Path
+                    IsTrusted = $false
+                    Reason = [string]$refusal[0].Reason
+                    Checked = @(); Failures = @(); Writers = @()
+                }
+            }
+        }
         Set-WacLogDegraded -Reason $reason
         $script:LogFallbackKind = Write-WacFallbackLine -Line (
             '[{0} UTC] [CRITICAL] [Log] {1}' -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'), $reason)

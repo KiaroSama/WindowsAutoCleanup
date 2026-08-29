@@ -21,6 +21,25 @@
 $script:PnpUtilPath = Join-Path -Path (Join-Path -Path $env:SystemRoot -ChildPath 'System32') -ChildPath 'pnputil.exe'
 $script:ManifestName = 'wac-driver-backup.json'
 
+# Invoke-WacDriverPackagePrune creates its backup root through Open-WacTrustedDirectory with
+# -RequireMachineTrust, which reads the owner and DACL from the directory's OWN handle rather than
+# through any stub - deliberately, because a trust decision that a test can fake proves nothing.
+# Every suite here drives a prune against a sandbox under %TEMP%, which is owned by whoever ran the
+# suite, so the real rule refuses it and every one of those cases would fail for a reason unrelated
+# to what it asserts. This is the seam the primitive documents for exactly that, installed once
+# here rather than copied into three suites where it would drift.
+#
+# It does not soften the cases that matter. The collision-failing create and the reparse refusal
+# are judged by the kernel and never reach this scriptblock, and the case asserting that a non-empty
+# Writers list is refused reaches its verdict from Test-WacStatePathIsTrusted before this is
+# consulted at all. What is NOT covered here, and is stated rather than implied: the real
+# owner/DACL rule on the real backup root is exercised only by Trust.Tests, never from a sandbox.
+Set-WacDirectoryTrustJudge -ScriptBlock {
+    param($Sddl)
+    $null = $Sddl
+    [PSCustomObject]@{ IsTrusted = $true; Reason = 'sandbox descriptor accepted for the driver suites' }
+}
+
 $script:StubCall = New-Object 'System.Collections.Generic.List[object]'
 $script:StubResult = @{}
 

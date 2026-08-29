@@ -567,8 +567,12 @@ try {
     $componentCleanup = Invoke-WacComponentCleanup -ResetBase:([bool]$ResetWindowsUpdateBase)
     [void]$stepResults.Add($componentCleanup)
     [void]$stepResults.Add((Invoke-WacPnpCleanHandler))
+    # NOT (Get-WacDataRoot)\DriverBackup any more. An export is the only copy of a package about to
+    # be deleted, and %ProgramData% grants BUILTIN\Users the right to create names under every child
+    # it has - a grant no healthy install can shed and this project may not rewrite. The backup root
+    # moved somewhere that grant does not reach; Get-WacDriverBackupRoot carries the measurement.
     [void]$stepResults.Add((Invoke-WacDriverPackagePrune -Enabled:([bool]$PruneSupersededDrivers) `
-        -BackupRoot (Join-Path -Path (Get-WacDataRoot) -ChildPath 'DriverBackup')))
+        -BackupRoot (Get-WacDriverBackupRoot)))
 
     # cleanmgr's own "Update Cleanup" handler duplicates what DISM already did on the supported path.
     # Gate it on whether DISM actually SUCCEEDED, not on the parameter: a DISM that failed or was
