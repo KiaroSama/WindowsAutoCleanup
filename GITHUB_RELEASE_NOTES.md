@@ -133,6 +133,12 @@ before it was fixed.
   `pnputil /delete-driver` is now confirmed against the driver store itself, so exit `259` and any
   undocumented non-zero exit no longer clear the pending marker or reclaim the backup on the tool's
   word alone.
+- **A trailing-dot or trailing-space name deleted its neighbour and called it a success.** Win32
+  path normalisation strips both from the final component, so `note.txt.` canonicalised to
+  `note.txt` and the delete destroyed that instead, recording `FilesDeleted=1`. The handle-bound
+  identity proof could not catch it: the expected path is produced by the same normalisation, so
+  both sides of the comparison were corrupted identically and matched. Such a name is now refused
+  at canonicalisation and recorded as a skip -- it is never cleaned, which is the right way round.
 - **The driver backup root was trusted without being checked.** Driver pruning now refuses with a
   security refusal when its backup root, or an existing identity directory inside it, is not
   machine-trusted -- the same walk the log directory already got.

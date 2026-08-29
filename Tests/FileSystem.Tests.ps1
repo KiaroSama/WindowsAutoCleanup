@@ -673,4 +673,62 @@ Test-Case 'Remove-WacTree aborts cleanly once the run deadline has expired' {
     }
 }
 
+Test-Case 'A trailing-dot leaf never destroys the neighbour it normalises onto' {
+    <#
+        The defect this pins, measured before the fix: asking Remove-WacLeaf to delete 'note.txt.'
+        deleted 'note.txt' and recorded FilesDeleted=1. A wrong object, destroyed by a process
+        running as SYSTEM, reported as a success.
+
+        The handle-bound identity proof did not catch it and could not: expectedFinalPath is
+        produced by Get-WacNormalizedPath, the same function that dropped the dot, so both sides of
+        the comparison were corrupted identically and matched. That is why the guard belongs in
+        normalisation and why this case asserts the SURVIVOR rather than only the counter - a fix
+        that merely stopped counting would leave the neighbour just as dead.
+
+        Both entry kinds are covered because the two took different paths through the delete: the
+        file case reported FilesDeleted, the directory case DirectoriesDeleted.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'fs-trailing-dot'
+    try {
+        # \\?\ is the only way to create these names; Win32 would strip the dot on the way in.
+        $neighbourFile = New-TestFile -Path (Join-Path -Path $sandbox -ChildPath 'note.txt') -Content 'MUST SURVIVE'
+        [System.IO.File]::WriteAllText(('\\?\' + (Join-Path -Path $sandbox -ChildPath 'note.txt.')), 'the intended target')
+
+        $stats = New-WacDeletionStats
+        Remove-WacLeaf -Path (Join-Path -Path $sandbox -ChildPath 'note.txt.') -RootPath $sandbox -Stats $stats
+
+        Assert-Equal 0 ([int]$stats.FilesDeleted) 'a file was deleted for a name that cannot be canonicalised'
+        Assert-True (Test-Path -LiteralPath $neighbourFile) 'the neighbour the dotted name normalises onto was destroyed'
+        Assert-Equal 'MUST SURVIVE' ([System.IO.File]::ReadAllText($neighbourFile)) 'the neighbour was replaced rather than removed'
+        Assert-Equal 0 ([int]$stats.RefusedOutOfRoot) 'an unresolvable name was reported as a containment escape'
+
+        $neighbourDir = New-TestDirectory -Path (Join-Path -Path $sandbox -ChildPath 'sub')
+        $null = [System.IO.Directory]::CreateDirectory('\\?\' + (Join-Path -Path $sandbox -ChildPath 'sub.'))
+
+        $dirStats = New-WacDeletionStats
+        Remove-WacLeaf -Path (Join-Path -Path $sandbox -ChildPath 'sub.') -RootPath $sandbox -Stats $dirStats -IsDirectory
+
+        Assert-Equal 0 ([int]$dirStats.DirectoriesDeleted) 'a directory was deleted for a name that cannot be canonicalised'
+        Assert-True (Test-Path -LiteralPath $neighbourDir) 'the neighbouring directory was destroyed'
+
+        # The control, in the same sandbox: the guard must not have stopped ordinary deletion.
+        $ordinary = New-TestFile -Path (Join-Path -Path $sandbox -ChildPath 'ordinary.txt') -Content 'x'
+        $okStats = New-WacDeletionStats
+        Remove-WacLeaf -Path $ordinary -RootPath $sandbox -Stats $okStats
+        Assert-Equal 1 ([int]$okStats.FilesDeleted) 'the guard stopped an ordinary delete'
+        Assert-False (Test-Path -LiteralPath $ordinary) 'an ordinary file survived its own deletion'
+    }
+    finally {
+        foreach ($odd in @('note.txt.', 'sub.')) {
+            $p = '\\?\' + (Join-Path -Path $sandbox -ChildPath $odd)
+            try {
+                if ([System.IO.Directory]::Exists($p)) { [System.IO.Directory]::Delete($p, $true) }
+                elseif ([System.IO.File]::Exists($p)) { [System.IO.File]::Delete($p) }
+            }
+            catch { $null = $_ }
+        }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun

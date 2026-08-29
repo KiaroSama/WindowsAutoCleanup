@@ -122,4 +122,31 @@ Test-Case 'Get-WacLongPath adds the extended-length prefix only above the thresh
     Assert-Equal $relative (Get-WacLongPath -Path $relative)
 }
 
+Test-Case 'A name that cannot be canonicalised without changing which object it names is refused' {
+    <#
+        Win32 path normalisation strips trailing dots and spaces from the final component, and
+        GetFullPath performs it: 'note.txt.' comes back as 'note.txt', which is a DIFFERENT FILE.
+        Returning that quietly is how Remove-WacLeaf came to delete a neighbour and report success.
+
+        The refusal is asserted here, at the one function every path comparison in the project
+        routes through, so no caller has to remember. The second half matters as much as the
+        first: navigation forms and ordinary names must still canonicalise, or this guard would
+        refuse every path in the product.
+    #>
+    foreach ($ambiguous in @('C:\dir\note.txt.', 'C:\dir\note.txt..', 'C:\dir\trailing ',
+                             'C:\dir\sub.', 'C:\dir\sub.\', 'C:\dir\name. ', '\\?\C:\dir\note.txt.')) {
+        Assert-Equal $null (Get-WacNormalizedPath -Path $ambiguous) `
+            ('a name whose identity changes under normalisation was canonicalised: ' + $ambiguous)
+    }
+
+    # The control. A guard that also refuses these would be worse than the defect it closes.
+    Assert-Equal 'C:\dir\note.txt' (Get-WacNormalizedPath -Path 'C:\dir\note.txt')
+    Assert-Equal 'C:\dir'          (Get-WacNormalizedPath -Path 'C:\dir\')
+    Assert-Equal 'C:\dir'          (Get-WacNormalizedPath -Path 'C:\dir\.')
+    Assert-Equal 'C:'              (Get-WacNormalizedPath -Path 'C:\dir\..')
+    Assert-Equal 'C:'              (Get-WacNormalizedPath -Path 'C:\')
+    Assert-Equal 'C:\dir\sub'      (Get-WacNormalizedPath -Path 'C:\dir\sub')
+    Assert-Equal 'C:\a.b.c'        (Get-WacNormalizedPath -Path 'C:\a.b.c')
+}
+
 Complete-TestRun
