@@ -466,8 +466,16 @@ Test-Case 'A log directory planted as a link is refused by the run, and its targ
         [void][System.IO.Directory]::CreateDirectory($outside)
         [System.IO.File]::WriteAllText((Join-Path -Path $outside -ChildPath 'sentinel.txt'), 'untouched', $script:Utf8NoBom)
 
-        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $rig.LogDirectory))
-        New-Item -ItemType Junction -Path $rig.LogDirectory -Target $outside -ErrorAction Stop | Out-Null
+        # BOTH candidates are planted, not just the first. An elevated run has two, and leaving the
+        # second usable makes this case assert the fallback rather than the refusal - the run then
+        # correctly logs into candidate 2 and exits 0, which is what "A refused state directory is
+        # never created" already covers. The refusal is only the verdict when there is nowhere left
+        # to go, so that is the state this case has to build.
+        $fallbackRoot = Join-Path -Path $rig.WindowsRoot -ChildPath 'Logs\WindowsAutoCleanup'
+        foreach ($planted in @($rig.LogDirectory, $fallbackRoot)) {
+            [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $planted))
+            New-Item -ItemType Junction -Path $planted -Target $outside -ErrorAction Stop | Out-Null
+        }
 
         $before = Get-DirectoryFingerprint -Path $outside
         Assert-True ($before.Contains('untouched')) 'the fixture never wrote the sentinel it is about to protect'
@@ -490,9 +498,11 @@ Test-Case 'A log directory planted as a link is refused by the run, and its targ
         Assert-True ($fallback -cmatch '(^|\s)exitCode=7($|\s)') ('fallback: ' + $fallback)
     }
     finally {
-        # Removed AS A LINK: a recursive delete would take the target's contents with it, and
+        # Removed AS LINKS: a recursive delete would take the target's contents with it, and
         # Remove-Item throws a spurious NullReferenceException on some junctions under 5.1.
-        try { [System.IO.Directory]::Delete($rig.LogDirectory, $false) } catch { $null = $_ }
+        foreach ($planted in @($rig.LogDirectory, (Join-Path -Path $rig.WindowsRoot -ChildPath 'Logs\WindowsAutoCleanup'))) {
+            try { [System.IO.Directory]::Delete($planted, $false) } catch { $null = $_ }
+        }
         Remove-RunRig -Rig $rig
     }
 }

@@ -420,7 +420,7 @@ function Initialize-WacRun {
         if (Test-WacIsAdministrator) {
             $CandidateRoot = @(
                 (Join-Path -Path (Get-WacDataRoot) -ChildPath 'Logs'),
-                (Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup')
+                (Get-WacFallbackDataRoot)
             )
         }
         else {
