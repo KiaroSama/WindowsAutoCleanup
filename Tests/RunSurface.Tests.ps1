@@ -345,6 +345,77 @@ Test-Case 'A scheduled run that is not elevated fails instead of cleaning' {
     }
 }
 
+Test-Case 'The shared pre-flight gate reports the cause of a refusal, not its symptom' {
+    # The gate is dot-sourced rather than lifted, exactly as both entry points load it, so the
+    # function under test is the shipped one. Nothing here has a side effect; it reads two verdicts.
+    #
+    # The ORDER is the assertion. Initialize-WacRun now refuses to create a log at all in a
+    # directory it does not trust, so an untrusted state directory arrives here with BOTH answers
+    # bad: no durable log, and a trust verdict that came back false. A gate that tested the log
+    # first would return 6 and say "no durable audit log" - true, and the symptom of the refusal
+    # rather than the refusal, with the exit code that outranks it silently dropped.
+    . (Join-Path -Path $script:SrcRoot -ChildPath 'WindowsAutoCleanup.EntryGate.ps1')
+
+    $durable = [PSCustomObject]@{ IsDurable = $true; Reason = $null }
+    $broken = [PSCustomObject]@{ IsDurable = $false; Reason = 'a log write failed' }
+    $trusted = [PSCustomObject]@{ IsTrusted = $true; Path = 'C:\ProgramData\WindowsAutoCleanup\Logs'; Reason = 'ok' }
+    $untrusted = [PSCustomObject]@{ IsTrusted = $false; Path = 'C:\ProgramData\WindowsAutoCleanup\Logs'; Reason = 'S-1-1-0 can replace children here' }
+
+    $ok = Get-OperationSafetyVerdict -LogHealth $durable -StateTrust $trusted
+    Assert-True $ok.Ok $ok.Reason
+    Assert-Equal 0 $ok.ExitCode
+
+    # Both bad: the security refusal outranks the incomplete audit trail, which is the same
+    # precedence the run's own outcome table uses.
+    $refused = Get-OperationSafetyVerdict -LogHealth $broken -StateTrust $untrusted
+    Assert-False $refused.Ok
+    Assert-Equal 7 $refused.ExitCode 'a refusal whose log never opened was reported as merely incomplete'
+    Assert-True ($refused.Reason.Contains('not machine-trusted')) $refused.Reason
+
+    # A log that failed for a reason of its own, with the trust question genuinely answered yes, is
+    # still Incomplete - so the reordering above did not turn every log failure into a refusal.
+    $incomplete = Get-OperationSafetyVerdict -LogHealth $broken -StateTrust $trusted
+    Assert-Equal 6 $incomplete.ExitCode $incomplete.Reason
+
+    # NOT EVALUATED is refused too, and it is refused as a security question rather than as a log
+    # one - but only once the log has been ruled out as the thing that is actually known to be wrong.
+    Assert-Equal 7 (Get-OperationSafetyVerdict -LogHealth $durable -StateTrust $null).ExitCode
+    Assert-Equal 6 (Get-OperationSafetyVerdict -LogHealth $broken -StateTrust $null).ExitCode
+    Assert-Equal 6 (Get-OperationSafetyVerdict -LogHealth $null -StateTrust $trusted).ExitCode
+}
+
+Test-Case 'No shipped entry point names its own state root, so none opts out of the trust preflight' {
+    # Initialize-WacRun verifies machine trust for the roots the MODULE chose, and records NOT
+    # EVALUATED for a caller that named its own -CandidateRoot: that location is then the caller's
+    # choice and not a claim the module made. Sound exactly as long as nothing shipped names one -
+    # so this pins it, rather than leaving it to be remembered by whoever edits an entry point next.
+    foreach ($leaf in @('Run.ps1', 'Install-WindowsAutoCleanupTask.ps1', 'Uninstall-WindowsAutoCleanupTask.ps1')) {
+        $path = Join-Path -Path $script:RepoRoot -ChildPath $leaf
+        Assert-True (Test-Path -LiteralPath $path -PathType Leaf) ('a shipped entry point is missing: ' + $path)
+
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+        Assert-Equal 0 (@($errors).Count) ($leaf + ' does not parse')
+
+        $calls = @($ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst]
+                }, $true) | Where-Object { $_.GetCommandName() -eq 'Initialize-WacRun' })
+        Assert-Equal 1 $calls.Count ($leaf + ' no longer initialises the run exactly once')
+
+        # Every named parameter, compared as a PREFIX: PowerShell binds -Candidate to -CandidateRoot
+        # just as happily as the full spelling, so matching the exact name would miss it.
+        foreach ($element in @($calls[0].CommandElements)) {
+            if (-not ($element -is [System.Management.Automation.Language.CommandParameterAst])) { continue }
+            $name = [string]$element.ParameterName
+            if (-not $name) { continue }
+            Assert-False ('CandidateRoot'.StartsWith($name, [System.StringComparison]::OrdinalIgnoreCase)) `
+            ('{0} binds -{1}, which opts the run out of the machine-trust preflight' -f $leaf, $name)
+        }
+    }
+}
+
 Test-Case 'The deprecated -SkipAclHardening switch is still accepted by parameter binding' {
     $sandbox = New-TestSandbox -Prefix 'orch-acl'
     try {

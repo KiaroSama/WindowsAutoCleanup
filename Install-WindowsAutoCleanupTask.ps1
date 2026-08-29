@@ -47,6 +47,9 @@
          audit log is not durable
       7  refused: the machine state directory could not be proven machine-trusted, or something at
          the task path or the deployment path could not be proven ours. Nothing was changed
+      8  the elevated installer outran its budget and could NOT be proven terminated. It may still
+         be running as administrator, still holding the machine-wide lock and still changing this
+         machine. Do not re-run the installer until that process has exited
 #>
 
 # Write-Host is deliberate: the installer is a user-facing console tool and the structured
@@ -81,11 +84,20 @@ $script:InstanceLock = $null
 $script:Relaunched = $false
 $script:Refused = $false
 
+# Nothing is written to the run LOG until Open-InstallerLogGate has established that this run is
+# allowed to write there; see that function. The record itself is built at the bottom of the file,
+# where the parameters it describes are known.
+$script:LogGateOpen = $false
+$script:InvocationRecord = @{}
+
 # The elevated child's own budget, armed by Initialize-WacRun below, and the parent bound derived
 # FROM it. The parent used to wait 20 minutes for a child whose own deadline was 30, and on expiry
 # it returned while that still-mutating elevated child carried on with nobody watching. A wrapper's
 # deadline has to outlast everything the child can legitimately do - operation, rollback and
 # shutdown - or it is not waiting for the child, it is abandoning it.
+#
+# The child READS this budget too, at every phase boundary; see Test-RunBudget. A deadline no
+# operation observes is a number, not a bound, and the parent was outlasting exactly that.
 $script:RunBudgetMinutes = 30
 $script:ChildShutdownMarginMinutes = 10
 $script:ElevationTimeoutMs = ($script:RunBudgetMinutes + $script:ChildShutdownMarginMinutes) * 60000
@@ -107,19 +119,25 @@ function Write-InstallerMessage {
     .DESCRIPTION
         -NoLog exists for the refusal raised when the directory this run's audit log lives in is not
         machine-trusted: explaining that refusal through the very path it just refused would be a
-        write into a location a standard user can replace.
+        write into a location a standard user can replace. -NoConsole is its mirror image, for the
+        one record that is printed before the gate and logged after it.
     #>
     param(
         [Parameter(Mandatory = $true)][ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$Level,
         [Parameter(Mandatory = $true)][string]$Message,
         [hashtable]$Data,
-        [switch]$NoLog
+        [switch]$NoLog,
+        [switch]$NoConsole
     )
 
-    if ($script:LogReady -and -not $NoLog) {
+    # $script:LogGateOpen as well as $script:LogReady: a run that has not yet proven it may write
+    # into its own log directory does not get to write into it, whatever it has to say.
+    if ($script:LogReady -and $script:LogGateOpen -and -not $NoLog) {
         if ($Data) { Write-WacLog -Level $Level -Component 'Installer' -Message $Message -Data $Data }
         else { Write-WacLog -Level $Level -Component 'Installer' -Message $Message }
     }
+
+    if ($NoConsole) { return }
 
     $colour = switch ($Level) {
         'WARNING' { 'Yellow' }
@@ -128,6 +146,60 @@ function Write-InstallerMessage {
         default { 'Gray' }
     }
     Write-Host ('[{0}] {1}' -f $Level, $Message) -ForegroundColor $colour
+}
+
+function Open-InstallerLogGate {
+    <#
+    .SYNOPSIS
+        Lets this run write to its own log file, and puts the invocation record in it. Idempotent.
+    .DESCRIPTION
+        The invocation record used to be written to the run log BEFORE Get-OperationSafetyVerdict
+        had decided whether this run may write there at all, so an elevated run whose machine state
+        directory a standard user can replace or redirect put its very first line through the path
+        the gate was about to refuse. Nothing reaches the file log until this runs.
+
+        It is called from the only two places that have established the right to write: the
+        unelevated branch, whose log lives in the invoking user's own profile and therefore carries
+        no machine-trust claim to refuse, and the elevated branch immediately after the verdict
+        passes. Everything before it - the refusal itself, and a run that lost the machine-wide lock
+        before the trust question was even asked - stays on the console, which writes nothing
+        anywhere.
+    #>
+    if ($script:LogGateOpen) { return }
+    $script:LogGateOpen = $true
+    Write-InstallerMessage -Level INFO -Message 'Installer invoked.' -Data $script:InvocationRecord -NoConsole
+}
+
+function Test-RunBudget {
+    <#
+    .SYNOPSIS
+        $true while this run still has budget for the phase it is about to start.
+    .DESCRIPTION
+        Initialize-WacRun arms the child's own deadline, and nothing in this script used to READ it:
+        the parent's wait therefore outlasted a number no operation ever observed, which is not a
+        budget. A medium-integrity parent generally cannot terminate its own elevated child, so the
+        bound that actually stops the work has to be checked by the child itself, at every phase
+        boundary, before that phase starts.
+
+        The shutdown margin is held back from the deadline by -ShutdownMarginSeconds, so the
+        rollback and the final verdict still have time after this has returned $false. Nothing on
+        the rollback path consults the deadline, which is what makes that safe.
+
+        ponytail: cooperative, so one phase that blocks inside the OS forever is still not
+        interrupted by it. Running the Scheduler calls under Invoke-WacBounded would fix that and
+        would also have to marshal CIM objects across a runspace boundary; the parent's own bound
+        plus an honest CRITICAL is the trade until that is worth paying for.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Phase)
+
+    if (-not (Test-WacDeadlineExpired)) { return $true }
+
+    Write-InstallerMessage -Level ERROR -Message ('The run budget expired before {0}, so this phase was never started.' -f $Phase) -Data @{
+        phase = $Phase
+        budgetMinutes = $script:RunBudgetMinutes
+        shutdownMarginMinutes = $script:ChildShutdownMarginMinutes
+    }
+    return $false
 }
 
 function Wait-InstallerExit {
@@ -201,19 +273,30 @@ function Invoke-InstallerElevation {
 
     if (-not $child.WaitForExit($script:ElevationTimeoutMs)) {
         # Past this point the child has outrun its OWN deadline plus the shutdown margin, so it is
-        # not "still working" - it is wedged. The outcome is reported from proof: Stop-WacProcessTree
-        # returns $true only when the target is known to have exited, and an unelevated parent cannot
-        # terminate an elevated child at all, so the operator is told which of the two happened
-        # instead of the wrapper walking away from a mutating installer in silence.
+        # not "still working" - it is wedged.
+        #
+        # Stop-WacProcessTree returns a VERDICT and only .Proven is evidence. Testing the returned
+        # object itself was the defect: every non-null PSCustomObject is truthy, so the success
+        # branch was taken unconditionally and this wrapper told the operator to re-run the
+        # installer over a live, still-mutating, elevated child. An unelevated parent generally
+        # cannot terminate an elevated child at all, so that outcome gets its own exit code and its
+        # own instruction rather than being folded into the ordinary failure.
         Write-InstallerMessage -Level ERROR -Message 'The elevated installer outran its own budget and the parent deadline.' -Data @{ pid = $child.Id; timeoutMs = $script:ElevationTimeoutMs }
 
-        if (Stop-WacProcessTree -ProcessId $child.Id) {
-            Write-InstallerMessage -Level ERROR -Message 'The elevated installer was terminated and proven gone. The deployment may be mid-install; re-run the installer.'
+        $termination = Stop-WacProcessTree -ProcessId $child.Id
+        if ([bool]$termination.Proven) {
+            Write-InstallerMessage -Level ERROR -Message 'The elevated installer was terminated and proven gone. The deployment may be mid-install; re-run the installer.' -Data @{
+                pid = $child.Id; reason = [string]$termination.Reason
+            }
+            return 1
         }
-        else {
-            Write-InstallerMessage -Level CRITICAL -Message 'The elevated installer could NOT be proven terminated and may still be running as administrator. Do not re-run the installer until it has exited.' -Data @{ pid = $child.Id }
+
+        Write-InstallerMessage -Level CRITICAL -Message 'The elevated installer could NOT be proven terminated. It may still be running as administrator, still holding the machine-wide lock and still changing this machine. Do NOT re-run the installer; wait until that process has exited.' -Data @{
+            pid = $child.Id
+            survivors = (@($termination.Survivor) -join ',')
+            reason = [string]$termination.Reason
         }
-        return 1
+        return 8
     }
 
     $code = 1
@@ -224,6 +307,10 @@ function Invoke-InstallerElevation {
 
 function Invoke-Main {
     if (-not (Test-WacIsAdministrator)) {
+        # This branch's log is the invoking user's OWN profile log, which the user owns by
+        # construction and on which no SYSTEM audit claim rests, so there is no trust question here
+        # to refuse and the record may go straight in.
+        Open-InstallerLogGate
         return (Invoke-InstallerElevation)
     }
 
@@ -247,6 +334,11 @@ function Invoke-Main {
         Write-InstallerMessage -Level ERROR -Message $safety.Reason -NoLog
         return $safety.ExitCode
     }
+
+    # Proven writable, so the record of what this run was asked to do goes into the log now.
+    Open-InstallerLogGate
+
+    if (-not (Test-RunBudget -Phase 'anything on this machine was inspected')) { return 1 }
 
     if (-not (Test-WacSystemDriveSupported)) {
         Write-InstallerMessage -Level ERROR -Message ('WindowsAutoCleanup only supports an online system drive of C:; this machine reports {0}.' -f $env:SystemDrive)
@@ -300,6 +392,7 @@ function Invoke-Main {
 
     # Phase 1: build the whole new tree in the .staging slot. Nothing the currently registered task
     # can reach is touched, so this cannot pull a file out from under a run that is already going.
+    if (-not (Test-RunBudget -Phase 'the runtime was staged')) { return 1 }
     $stage = New-WacDeploymentStage -SourceRoot $script:ScriptRoot
     Write-InstallerMessage -Level INFO -Message 'Runtime staged and hashed.' -Data @{
         staging = $stage.StagingRoot; files = $stage.FileCount; version = $stage.Version
@@ -307,6 +400,10 @@ function Invoke-Main {
 
     # Phase 2: verify the STAGED tree, so an untrusted one never goes live at all. Its ancestors are
     # the deployment root's ancestors, and the PowerShell host chain is walked here too.
+    if (-not (Test-RunBudget -Phase 'the staged tree was walked for trust')) {
+        [void](Remove-WacDeployment -Path $stage.StagingRoot)
+        return 1
+    }
     $trust = Test-WacDeploymentTrusted -DeploymentRoot $stage.StagingRoot
     if (-not $trust.IsTrusted) {
         foreach ($entry in $trust.Untrusted) {
@@ -320,6 +417,10 @@ function Invoke-Main {
 
     # Phase 3: resolve the existing task BEFORE the swap. Doing it the other way round leaves a
     # window in which the OLD task can start against the NEW files.
+    if (-not (Test-RunBudget -Phase 'the existing registration was resolved')) {
+        [void](Remove-WacDeployment -Path $stage.StagingRoot)
+        return 1
+    }
     $conflict = Resolve-ConflictingTask -DeploymentRoot $slots.Root
     if (-not $conflict.Ok) {
         Write-InstallerMessage -Level ERROR -Message $conflict.Reason
@@ -347,12 +448,31 @@ function Invoke-Main {
         -PruneSupersededDrivers:$PruneSupersededDrivers `
         -EnableLegacyDiskCleanup:$EnableLegacyDiskCleanup
 
+    # The last point at which stopping costs nothing but the staged copy. Phase 3 has already
+    # removed the registration this run was going to replace, so whatever it captured goes back
+    # here for the same reason it does on a refused conflict: the machine must not be left short a
+    # task to make room for one that will now never exist.
+    if (-not (Test-RunBudget -Phase 'the staged tree was switched into place')) {
+        [void](Remove-WacDeployment -Path $stage.StagingRoot)
+        foreach ($definition in @($conflict.Captured)) { [void](Restore-CapturedTask -Definition $definition) }
+        return 1
+    }
+
     try {
         [void](Switch-WacDeploymentStage -KeepPrevious)
 
         $live = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
         if ($live.Kind -ne 'Managed' -or $live.Tampered) {
             throw ("What went live does not match the manifest that was staged: {0}" -f $live.Reason)
+        }
+
+        # Test-WacDeadlineExpired directly rather than Test-RunBudget: this one is INSIDE the
+        # rollback try, so the throw is the report and a second ERROR line ahead of it would only
+        # say the same thing twice. Registration and the read-back that proves it are one step -
+        # splitting the check between them would abandon a registration this run could not then
+        # verify, which is strictly worse than not registering at all.
+        if (Test-WacDeadlineExpired) {
+            throw 'The run budget expired after the swap and before the registration, so the task was never registered.'
         }
 
         $definition = New-ScheduledTask `
@@ -421,13 +541,17 @@ function Invoke-Main {
     return 0
 }
 
-$script:LogReady = Initialize-WacRun -BaseName 'Install-WindowsAutoCleanupTask' -BudgetMinutes $script:RunBudgetMinutes
+# -ShutdownMarginSeconds is what makes the budget enforceable rather than decorative: the phase
+# checks in Test-RunBudget stop new work at the deadline, and the margin is the time left over for
+# the rollback and the final verdict that run after they do.
+$script:LogReady = Initialize-WacRun -BaseName 'Install-WindowsAutoCleanupTask' -BudgetMinutes $script:RunBudgetMinutes -ShutdownMarginSeconds ($script:ChildShutdownMarginMinutes * 60)
 if (-not $script:LogReady) {
     Write-Host '[WARNING] No log file could be created; continuing with console output only.' -ForegroundColor Yellow
 }
 
-# Logged before the admin branch so a relaunch that never happens is still explained by the log.
-Write-InstallerMessage -Level INFO -Message 'Installer invoked.' -Data @{
+# Printed before the admin branch so a relaunch that never happens is still explained on screen.
+# The LOG copy is written by Open-InstallerLogGate, once this run has proven it may write it.
+$script:InvocationRecord = @{
     host = ('{0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
     source = $script:ScriptRoot
     elevated = [bool](Test-WacIsAdministrator)
@@ -436,6 +560,7 @@ Write-InstallerMessage -Level INFO -Message 'Installer invoked.' -Data @{
     legacyDiskCleanup = [bool]$EnableLegacyDiskCleanup
     explicitParameters = (@($script:BoundParameter.Keys | Sort-Object) -join ',')
 }
+Write-InstallerMessage -Level INFO -Message 'Installer invoked.' -Data $script:InvocationRecord -NoLog
 
 $exitCode = 1
 try {

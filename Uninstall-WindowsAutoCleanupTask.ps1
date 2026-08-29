@@ -40,6 +40,9 @@
          audit log is not durable
       7  refused: the machine state directory could not be proven machine-trusted, or something at
          the task path or the deployment path could not be proven ours. Nothing was changed
+      8  the elevated uninstaller outran its budget and could NOT be proven terminated. It may still
+         be running as administrator, still holding the machine-wide lock and still changing this
+         machine. Do not re-run the uninstaller until that process has exited
 #>
 
 # Write-Host is deliberate: the uninstaller is a user-facing console tool and the structured
@@ -67,10 +70,18 @@ $script:LogReady = $false
 $script:InstanceLock = $null
 $script:Relaunched = $false
 
+# Nothing is written to the run LOG until Open-UninstallerLogGate has established that this run is
+# allowed to write there; see that function. The record itself is built at the bottom of the file.
+$script:LogGateOpen = $false
+$script:InvocationRecord = @{}
+
 # The elevated child's own budget, and the parent bound derived FROM it. The parent used to wait 10
 # minutes for a child whose own deadline was 30, and on expiry it returned while that still-mutating
 # elevated child carried on unregistering and deleting with nobody watching. A wrapper's deadline
 # has to outlast everything the child it started can legitimately do.
+#
+# The child READS this budget too, at every phase boundary; see Test-RunBudget. A deadline no
+# operation observes is a number, not a bound, and the parent was outlasting exactly that.
 $script:RunBudgetMinutes = 30
 $script:ChildShutdownMarginMinutes = 10
 $script:ElevationTimeoutMs = ($script:RunBudgetMinutes + $script:ChildShutdownMarginMinutes) * 60000
@@ -89,19 +100,25 @@ function Write-UninstallerMessage {
     .DESCRIPTION
         -NoLog exists for the refusal raised when the directory this run's audit log lives in is not
         machine-trusted: explaining that refusal through the very path it just refused would be a
-        write into a location a standard user can replace.
+        write into a location a standard user can replace. -NoConsole is its mirror image, for the
+        one record that is printed before the gate and logged after it.
     #>
     param(
         [Parameter(Mandatory = $true)][ValidateSet('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')][string]$Level,
         [Parameter(Mandatory = $true)][string]$Message,
         [hashtable]$Data,
-        [switch]$NoLog
+        [switch]$NoLog,
+        [switch]$NoConsole
     )
 
-    if ($script:LogReady -and -not $NoLog) {
+    # $script:LogGateOpen as well as $script:LogReady: a run that has not yet proven it may write
+    # into its own log directory does not get to write into it, whatever it has to say.
+    if ($script:LogReady -and $script:LogGateOpen -and -not $NoLog) {
         if ($Data) { Write-WacLog -Level $Level -Component 'Uninstaller' -Message $Message -Data $Data }
         else { Write-WacLog -Level $Level -Component 'Uninstaller' -Message $Message }
     }
+
+    if ($NoConsole) { return }
 
     $colour = switch ($Level) {
         'WARNING' { 'Yellow' }
@@ -110,6 +127,59 @@ function Write-UninstallerMessage {
         default { 'Gray' }
     }
     Write-Host ('[{0}] {1}' -f $Level, $Message) -ForegroundColor $colour
+}
+
+function Open-UninstallerLogGate {
+    <#
+    .SYNOPSIS
+        Lets this run write to its own log file, and puts the invocation record in it. Idempotent.
+    .DESCRIPTION
+        The invocation record used to be written to the run log BEFORE Get-OperationSafetyVerdict
+        had decided whether this run may write there at all, so an elevated run whose machine state
+        directory a standard user can replace or redirect put its very first line through the path
+        the gate was about to refuse. Nothing reaches the file log until this runs.
+
+        It is called from the only two places that have established the right to write: the
+        unelevated branch, whose log lives in the invoking user's own profile and therefore carries
+        no machine-trust claim to refuse, and the elevated branch immediately after the verdict
+        passes. Everything before it - the refusal itself, and a run that lost the machine-wide lock
+        before the trust question was even asked - stays on the console, which writes nothing
+        anywhere.
+    #>
+    if ($script:LogGateOpen) { return }
+    $script:LogGateOpen = $true
+    Write-UninstallerMessage -Level INFO -Message 'Uninstaller invoked.' -Data $script:InvocationRecord -NoConsole
+}
+
+function Test-RunBudget {
+    <#
+    .SYNOPSIS
+        $true while this run still has budget for the phase it is about to start.
+    .DESCRIPTION
+        Initialize-WacRun arms the child's own deadline, and nothing in this script used to READ it:
+        the parent's wait therefore outlasted a number no operation ever observed, which is not a
+        budget. A medium-integrity parent generally cannot terminate its own elevated child, so the
+        bound that actually stops the work has to be checked by the child itself, at every phase
+        boundary, before that phase starts.
+
+        The shutdown margin is held back from the deadline by -ShutdownMarginSeconds, so the final
+        verdict still has time after this has returned $false.
+
+        ponytail: cooperative, so one phase that blocks inside the OS forever is still not
+        interrupted by it. Running the Scheduler calls under Invoke-WacBounded would fix that and
+        would also have to marshal CIM objects across a runspace boundary; the parent's own bound
+        plus an honest CRITICAL is the trade until that is worth paying for.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Phase)
+
+    if (-not (Test-WacDeadlineExpired)) { return $true }
+
+    Write-UninstallerMessage -Level ERROR -Message ('The run budget expired before {0}, so this phase was never started.' -f $Phase) -Data @{
+        phase = $Phase
+        budgetMinutes = $script:RunBudgetMinutes
+        shutdownMarginMinutes = $script:ChildShutdownMarginMinutes
+    }
+    return $false
 }
 
 function Wait-UninstallerExit {
@@ -174,18 +244,30 @@ function Invoke-UninstallerElevation {
 
     if (-not $child.WaitForExit($script:ElevationTimeoutMs)) {
         # Past this point the child has outrun its OWN deadline plus the shutdown margin, so it is
-        # not still working - it is wedged. Stop-WacProcessTree returns $true only when the target is
-        # PROVEN gone, and an unelevated parent cannot terminate an elevated child at all, so the
-        # operator is told which of the two happened rather than the wrapper walking away in silence.
+        # not still working - it is wedged.
+        #
+        # Stop-WacProcessTree returns a VERDICT and only .Proven is evidence. Testing the returned
+        # object itself was the defect: every non-null PSCustomObject is truthy, so the success
+        # branch was taken unconditionally and this wrapper told the operator to re-run the
+        # uninstaller over a live, still-mutating, elevated child. An unelevated parent generally
+        # cannot terminate an elevated child at all, so that outcome gets its own exit code and its
+        # own instruction rather than being folded into the ordinary failure.
         Write-UninstallerMessage -Level ERROR -Message 'The elevated uninstaller outran its own budget and the parent deadline.' -Data @{ pid = $child.Id; timeoutMs = $script:ElevationTimeoutMs }
 
-        if (Stop-WacProcessTree -ProcessId $child.Id) {
-            Write-UninstallerMessage -Level ERROR -Message 'The elevated uninstaller was terminated and proven gone. The task or the deployment may be half-removed; re-run the uninstaller.'
+        $termination = Stop-WacProcessTree -ProcessId $child.Id
+        if ([bool]$termination.Proven) {
+            Write-UninstallerMessage -Level ERROR -Message 'The elevated uninstaller was terminated and proven gone. The task or the deployment may be half-removed; re-run the uninstaller.' -Data @{
+                pid = $child.Id; reason = [string]$termination.Reason
+            }
+            return 1
         }
-        else {
-            Write-UninstallerMessage -Level CRITICAL -Message 'The elevated uninstaller could NOT be proven terminated and may still be running as administrator. Do not re-run the uninstaller until it has exited.' -Data @{ pid = $child.Id }
+
+        Write-UninstallerMessage -Level CRITICAL -Message 'The elevated uninstaller could NOT be proven terminated. It may still be running as administrator, still holding the machine-wide lock and still changing this machine. Do NOT re-run the uninstaller; wait until that process has exited.' -Data @{
+            pid = $child.Id
+            survivors = (@($termination.Survivor) -join ',')
+            reason = [string]$termination.Reason
         }
-        return 1
+        return 8
     }
 
     $code = 1
@@ -331,6 +413,10 @@ function Remove-RetainedLog {
 
 function Invoke-Main {
     if (-not (Test-WacIsAdministrator)) {
+        # This branch's log is the invoking user's OWN profile log, which the user owns by
+        # construction and on which no SYSTEM audit claim rests, so there is no trust question here
+        # to refuse and the record may go straight in.
+        Open-UninstallerLogGate
         return (Invoke-UninstallerElevation)
     }
 
@@ -354,6 +440,11 @@ function Invoke-Main {
         return $safety.ExitCode
     }
 
+    # Proven writable, so the record of what this run was asked to do goes into the log now.
+    Open-UninstallerLogGate
+
+    if (-not (Test-RunBudget -Phase 'anything on this machine was inspected')) { return 1 }
+
     $slots = Get-WacDeploymentSlotPath
     if (-not $slots) {
         Write-UninstallerMessage -Level ERROR -Message 'The deployment root cannot be resolved on this machine.'
@@ -375,13 +466,19 @@ function Invoke-Main {
 
     Import-Module -Name 'ScheduledTasks' -ErrorAction Stop
 
+    if (-not (Test-RunBudget -Phase 'the registered task was unregistered')) { return 1 }
     $tasks = Remove-InstalledTask -DeploymentRoot $slots.Root
 
     # The files go LAST, and only when nothing can still reach them (ledger B2-3). A failed or
     # refused task removal leaves a registration pointing at Run.ps1; deleting the tree then turns a
     # recoverable state into a scheduled task that fails every night with a missing file.
     $deployment = [PSCustomObject]@{ Clean = $true; Refused = $false; Reason = $null }
-    if (-not $tasks.Clean) {
+    if (-not (Test-RunBudget -Phase 'the deployment files were deleted')) {
+        Write-UninstallerMessage -Level ERROR -Message 'The deployment files were KEPT because the run budget expired before they could be deleted. Nothing was half-deleted; re-run the uninstaller.' -Data @{ root = $slots.Root }
+        $deployment.Clean = $false
+        $deployment.Reason = 'The run budget expired before the deployment could be deleted.'
+    }
+    elseif (-not $tasks.Clean) {
         Write-UninstallerMessage -Level ERROR -Message 'The deployment files were KEPT because a WindowsAutoCleanup task could not be removed and would still reference them.' -Data @{ root = $slots.Root }
         $deployment.Clean = $false
         $deployment.Reason = 'A task that references the deployment is still registered.'
@@ -399,7 +496,9 @@ function Invoke-Main {
         Write-UninstallerMessage -Level WARNING -Message '-KeepLogs overrides -RemoveLogs; the log files were kept.'
     }
     elseif ($RemoveLogs) {
-        Remove-RetainedLog
+        # A deletion is work, and no new work starts after the deadline. The shutdown margin is for
+        # the verdict below and for the finally, not for one more pass over the log directory.
+        if (Test-RunBudget -Phase 'the stored log files were deleted') { Remove-RetainedLog }
     }
     else {
         Write-UninstallerMessage -Level INFO -Message 'Log files were kept. Pass -RemoveLogs to delete them.' -Data @{ directory = (Join-Path -Path (Get-WacDataRoot) -ChildPath 'Logs') }
@@ -429,18 +528,23 @@ function Invoke-Main {
     return 0
 }
 
-$script:LogReady = Initialize-WacRun -BaseName 'Uninstall-WindowsAutoCleanupTask' -BudgetMinutes $script:RunBudgetMinutes
+# -ShutdownMarginSeconds is what makes the budget enforceable rather than decorative: the phase
+# checks in Test-RunBudget stop new work at the deadline, and the margin is the time left over for
+# the final verdict that runs after they do.
+$script:LogReady = Initialize-WacRun -BaseName 'Uninstall-WindowsAutoCleanupTask' -BudgetMinutes $script:RunBudgetMinutes -ShutdownMarginSeconds ($script:ChildShutdownMarginMinutes * 60)
 if (-not $script:LogReady) {
     Write-Host '[WARNING] No log file could be created; continuing with console output only.' -ForegroundColor Yellow
 }
 
-# Logged before the admin branch so a relaunch that never happens is still explained by the log.
-Write-UninstallerMessage -Level INFO -Message 'Uninstaller invoked.' -Data @{
+# Printed before the admin branch so a relaunch that never happens is still explained on screen.
+# The LOG copy is written by Open-UninstallerLogGate, once this run has proven it may write it.
+$script:InvocationRecord = @{
     host = ('{0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
     source = $script:ScriptRoot
     elevated = [bool](Test-WacIsAdministrator)
     explicitParameters = (@($script:BoundParameter.Keys | Sort-Object) -join ',')
 }
+Write-UninstallerMessage -Level INFO -Message 'Uninstaller invoked.' -Data $script:InvocationRecord -NoLog
 
 $exitCode = 1
 try {

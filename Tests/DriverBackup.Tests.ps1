@@ -26,6 +26,24 @@ $script:DriversModule = Get-Module -Name 'WindowsAutoCleanup.Drivers'
 
 . (Join-Path -Path $PSScriptRoot -ChildPath '_DriverFixtures.ps1')
 
+# The step now walks its backup root for machine trust before it exports anything, and every case in
+# this suite drives a root inside a TEMP sandbox - which is genuinely user-writable and therefore
+# genuinely untrusted, on this developer machine and on an elevated runner alike. Answering that one
+# walk yes keeps each case about the behaviour it names. The walk itself, and the refusals it
+# produces, are measured against real injected roots in DriverBackup.Tests.ps1.
+$script:RealStatePathTrust = Get-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted'
+Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted' -Body {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path,
+        [ValidateRange(1, 128)][int]$MaxDepth = 64
+    )
+    $null = $MaxDepth
+    return [PSCustomObject]@{
+        Path = $Path; IsTrusted = $true; Reason = 'sandbox trust forced for this suite'
+        Checked = @($Path); Failures = @(); Writers = @()
+    }
+}
+
 # The pending-deletion marker and the commit that clears it are internal to the module on purpose -
 # nothing outside the pruning step may stamp a backup - so these reach them through the module's own
 # session state rather than through the exported surface.
@@ -422,6 +440,240 @@ Test-Case 'a package removed but not committed fails the run, and the next run r
     }
     finally {
         Remove-TestSandbox -Path $sandbox
+    }
+}
+
+
+# ---------------------------------------------------------------------------------------------
+# Backup-root trust: the walk the sibling Logs directory has always had
+# ---------------------------------------------------------------------------------------------
+
+function Invoke-WithRealPathTrust {
+    <#
+    .SYNOPSIS
+        Runs a body with the REAL machine-trust walk restored inside the module, then puts the
+        suite's stub back.
+    .DESCRIPTION
+        Every other case here forces that walk to yes, because a TEMP sandbox is genuinely
+        user-writable and would otherwise refuse before the behaviour under test was reached. These
+        cases are about the walk itself, so they get the real one - and every root they hand it is
+        injected to be untrusted for a reason that holds on a developer shell and on an elevated
+        runner alike.
+    #>
+    param([Parameter(Mandatory = $true)][scriptblock]$Body)
+
+    $stub = Get-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted'
+    Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted' -Body $script:RealStatePathTrust
+    try { & $Body }
+    finally { Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted' -Body $stub }
+}
+
+function Grant-TestEveryoneWrite {
+    <#
+    .SYNOPSIS
+        Adds an explicit Allow(Everyone, Modify) ACE so a sandbox path is untrusted on ANY runner.
+    .DESCRIPTION
+        A sandbox under TEMP is already user-writable on a developer machine, but on an elevated
+        runner its owner is an administrator and its writers may all be administrative, which the
+        walk correctly accepts. Everyone (S-1-1-0) is on the module's never-administrative list and
+        Modify carries DELETE and DELETE_CHILD, which is exactly the grant that lets a standard user
+        rename the whole directory aside. Only ever called on a path this suite created.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')),
+        [System.Security.AccessControl.FileSystemRights]::Modify,
+        [System.Security.AccessControl.AccessControlType]::Allow)))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Get-TestUnusedDriveRoot {
+    <#
+    .SYNOPSIS
+        A rooted path on a drive letter this machine has no volume for, or '' when there is none.
+    #>
+    $used = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpperInvariant() })
+    foreach ($letter in @([char[]](78..90))) {
+        if ($used -notcontains ([string]$letter)) { return ('{0}:\WindowsAutoCleanup\DriverBackup' -f $letter) }
+    }
+    return ''
+}
+
+Test-Case 'a backup root a standard user can replace is refused before anything is enumerated' {
+    # DEFECT 1, backup half. %ProgramData%\WindowsAutoCleanup\Logs has always been walked for this;
+    # its SIBLING DriverBackup never was, and a sibling is not an ancestor - so a weaker owner or
+    # DACL here was invisible while log trust still passed. A backup a standard user can rename
+    # aside is not a backup, and finding that out after the package is deleted is too late.
+    $sandbox = New-TestSandbox -Prefix 'dr-roottrust'
+    try {
+        $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+        [void][System.IO.Directory]::CreateDirectory($backupRoot)
+        Grant-TestEveryoneWrite -Path $backupRoot
+
+        Invoke-WithStubbedTool -Body {
+            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = (New-PnpUtilDriverXml -Row (New-SupersededPair)) }
+
+            Invoke-WithRealPathTrust -Body {
+                $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+                Assert-Equal 'SecurityRefusal' $result.Outcome $result.Detail
+                Assert-True ($result.Detail -match 'not machine-trusted') $result.Detail
+                Assert-True ($result.Detail -match 'S-1-1-0') ('the refusal never named the principal: {0}' -f $result.Detail)
+                # Before ANYTHING: not one process ran, so nothing was enumerated, exported, marked
+                # or deleted under a root that cannot be trusted to hold the backup.
+                Assert-Equal 0 $script:StubCall.Count ('a process ran under an untrusted backup root: {0}' -f $result.Detail)
+            }
+        }
+
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $backupRoot -Force).Count 'the refused run still wrote into the untrusted root'
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a reparse point in the backup root chain is refused' {
+    # A junction anywhere in the chain redirects the whole backup elsewhere, so the directory a
+    # restore would read is not the directory this run proved anything about.
+    $sandbox = New-TestSandbox -Prefix 'dr-rootlink'
+    $link = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+    try {
+        $real = Join-Path -Path $sandbox -ChildPath 'elsewhere'
+        [void][System.IO.Directory]::CreateDirectory($real)
+
+        # mklink /J needs no elevation, so this runs identically on a developer shell and on CI.
+        $cmd = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cmd.exe'
+        [void](Invoke-WacProcess -FilePath $cmd -TimeoutMs 30000 -ArgumentList @('/c', 'mklink', '/J', $link, $real))
+        if (-not (Test-Path -LiteralPath $link)) { Set-TestSkipped -Reason 'this filesystem refused to create a junction' }
+
+        Invoke-WithStubbedTool -Body {
+            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = (New-PnpUtilDriverXml -Row (New-SupersededPair)) }
+
+            Invoke-WithRealPathTrust -Body {
+                $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $link
+
+                Assert-Equal 'SecurityRefusal' $result.Outcome $result.Detail
+                Assert-True ($result.Detail -match 'reparse point') $result.Detail
+                Assert-Equal 0 $script:StubCall.Count 'a process ran under a redirected backup root'
+            }
+        }
+
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $real -Force).Count 'the refused run wrote through the junction into its target'
+    }
+    finally {
+        if (Test-Path -LiteralPath $link) { try { [System.IO.Directory]::Delete($link, $false) } catch { $null = $_ } }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a backup root whose volume cannot be inspected is refused, not assumed local' {
+    # The fixed-local-volume half of the same rule. An unanswerable trust question is not a yes, and
+    # a backup on a removable or absent volume is not recoverable evidence of anything.
+    $absent = Get-TestUnusedDriveRoot
+    if (-not $absent) { Set-TestSkipped -Reason 'every drive letter from N to Z is in use on this machine' }
+
+    Invoke-WithStubbedTool -Body {
+        $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = (New-PnpUtilDriverXml -Row (New-SupersededPair)) }
+
+        Invoke-WithRealPathTrust -Body {
+            $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $absent
+
+            Assert-Equal 'SecurityRefusal' $result.Outcome $result.Detail
+            Assert-True ($result.Detail -match 'not machine-trusted') $result.Detail
+            Assert-Equal 0 $script:StubCall.Count 'a process ran under a backup root on an uninspectable volume'
+        }
+    }
+
+    Assert-False (Test-Path -LiteralPath $absent) 'the refused run created the backup root anyway'
+}
+
+Test-Case 'an untrusted identity directory is refused before its manifest decides anything' {
+    # The root passing is not the whole answer: an ACE that is inherit-only on the root grants
+    # nothing THERE and everything on the children created under it, so each existing identity
+    # directory is asked in its own right - and asked BEFORE its manifest is read, because the very
+    # next thing this function does is believe that manifest.
+    #
+    # Both shapes go through the same directory: one where the manifest would say "reclaim me" and
+    # one where it would say "refuse me". Without the check the first is silently emptied and
+    # re-exported into, which is the destructive half.
+    $sandbox = New-TestSandbox -Prefix 'dr-identitytrust'
+    try {
+        $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+        [void][System.IO.Directory]::CreateDirectory($backupRoot)
+
+        $driver = @(Get-ParsedDriver -Row @((New-PnpUtilRow -DriverName 'oem1.inf' -DeviceStatus @())))[0]
+        $identity = Get-WacDriverBackupIdentity -Driver $driver
+        $directory = Join-Path -Path $backupRoot -ChildPath $identity.Name
+        [void][System.IO.Directory]::CreateDirectory($directory)
+        Grant-TestEveryoneWrite -Path $directory
+
+        # Residue by every rule the guard knows: no marker and no manifest at all. This is the shape
+        # the module RECLAIMS, so the trust refusal is the only thing standing between a directory a
+        # standard user controls and a recursive delete driven by what it contains.
+        Set-Content -LiteralPath (Join-Path -Path $directory -ChildPath 'planted.txt') -Value 'planted' -Encoding ASCII -NoNewline
+
+        Invoke-WithStubbedTool -Body {
+            Invoke-WithRealPathTrust -Body {
+                $result = Export-WacDriverBackup -PnpUtil $script:PnpUtilPath -Driver $driver -BackupRoot $backupRoot
+
+                Assert-Equal 'SecurityRefusal' $result.Outcome $result.Reason
+                Assert-True ($result.Reason -match 'not machine-trusted') $result.Reason
+                Assert-Equal 0 @(Get-ExportCall).Count 'a package was exported into a directory a standard user controls'
+            }
+        }
+
+        Assert-True (Test-Path -LiteralPath (Join-Path -Path $directory -ChildPath 'planted.txt')) `
+            'an untrusted directory was reclaimed on the say-so of what it contained'
+
+        # Same directory, now carrying a manifest that records a completed deletion of this very
+        # package - the shape that refuses for COLLISION. The refusal has to name trust, or the
+        # trust question was never asked and the manifest was read first after all.
+        $manifest = New-WacDriverBackupManifest -Driver $driver -Identity $identity -File @()
+        $manifest.DeletedUtc = '2026-01-01T00:00:00Z'
+        Set-Content -LiteralPath (Join-Path -Path $directory -ChildPath $script:ManifestName) `
+            -Value ($manifest | ConvertTo-Json -Depth 6) -Encoding ASCII
+
+        Invoke-WithStubbedTool -Body {
+            Invoke-WithRealPathTrust -Body {
+                $result = Export-WacDriverBackup -PnpUtil $script:PnpUtilPath -Driver $driver -BackupRoot $backupRoot
+
+                Assert-Equal 'SecurityRefusal' $result.Outcome $result.Reason
+                Assert-True ($result.Reason -match 'not machine-trusted') `
+                    ('the manifest decided before the trust question was asked: {0}' -f $result.Reason)
+                Assert-False ($result.Reason -match 'records the deletion') $result.Reason
+            }
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'the backup trust rule is Core''s state-path walk, not a second copy living in the driver package' {
+    # Ledger B2-3 applied here: two copies of a security rule is one copy that gets fixed and one
+    # that does not. The gate must delegate to the walk Core owns, and the driver package must not
+    # start decoding access rules of its own.
+    $package = @('WindowsAutoCleanup.Drivers.psm1', 'WindowsAutoCleanup.DriverInventory.ps1',
+        'WindowsAutoCleanup.DriverBackup.ps1')
+    $source = (@($package | ForEach-Object {
+        [System.IO.File]::ReadAllText((Join-Path -Path $script:RepoRoot -ChildPath ('src\' + $_)))
+    }) -join [Environment]::NewLine)
+
+    $tokens = $null
+    $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+    Assert-Equal 0 @($errors).Count 'the driver package no longer parses'
+    $code = @(@($tokens) | Where-Object { $_.Kind -ne 'Comment' } | ForEach-Object { $_.Text })
+
+    # Two call sites, and both of them are load-bearing: the persistent root, and each existing
+    # identity directory inside it.
+    Assert-Equal 2 @($code | Where-Object { $_ -eq 'Test-WacStatePathIsTrusted' }).Count `
+        'the backup-root and identity-directory trust gates are not both delegating to Core''s walk'
+    foreach ($forbidden in @('GetAccessRules', 'GetOwner', 'Get-Acl')) {
+        Assert-Equal 0 @($code | Where-Object { $_ -eq $forbidden }).Count `
+            ('the driver package is deciding {0} for itself instead of delegating to Core' -f $forbidden)
     }
 }
 

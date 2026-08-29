@@ -28,6 +28,12 @@ function Reset-WacTestLog {
         The degraded flag is sticky by design, so a case that breaks logging on purpose would
         otherwise route every LATER case's lines to a fallback that is no longer injected.
     #>
+    # Close the log the CASE opened, before anything else. Initialize-WacRun below does not
+    # close a log that is already open - it just replaces the writer - so without this the old
+    # FileStream stays live on the case's own sandbox, Remove-TestSandbox cannot delete the
+    # locked .log, and it fails silently. Measured: 12 leaked sandbox directories in %TEMP%.
+    Close-WacLog
+
     Set-WacLogWriter -Writer $null
     Set-WacLogFallbackWriter -Writer $null
 
@@ -315,6 +321,29 @@ Test-Case 'A bootstrap log that cannot be read is a lost audit log, not a silent
     }
     finally {
         if ($lock) { try { $lock.Dispose() } catch { $null = $_ } }
+        Reset-WacTestLog
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A caller that names its own log root gets NOT EVALUATED, never a machine-trust verdict' {
+    # $null is the whole vocabulary for "this question was never asked", and both readers of it -
+    # Get-WacRunLevelOutcome and Get-OperationSafetyVerdict - depend on that meaning.
+    #
+    # It is asserted here rather than assumed because the answer used to depend on the PRIVILEGE of
+    # whoever ran the suite: the old code recorded a real verdict for any root whenever the process
+    # was elevated, so an elevated host - which every hosted CI runner is - got a verdict for a
+    # sandbox under TEMP that no caller had claimed anything about. Now the claim follows the roots
+    # the module chose, so this holds at either privilege level and on both hosts.
+    $sandbox = New-TestSandbox -Prefix 'trustnull'
+    try {
+        Assert-True (Initialize-WacRun -BaseName 'trustnull' -CandidateRoot @($sandbox) -BudgetMinutes 5) `
+            'the run log was not created'
+        Assert-True (Get-WacLogHealth).IsDurable 'the control failed: a healthy log is not durable'
+        Assert-Equal $null (Get-WacStateTrust) `
+            'a caller-named log root produced a machine-trust verdict nobody had claimed'
+    }
+    finally {
         Reset-WacTestLog
         Remove-TestSandbox -Path $sandbox
     }

@@ -71,7 +71,19 @@ function New-RollbackSandbox {
         '    if ($index -ge $steps.Count) { $index = $steps.Count - 1 }',
         '    return $steps[$index]',
         '}',
-        'function Initialize-WacRun { param([string]$BaseName, [string[]]$CandidateRoot, [string]$LogLevel, [int]$BudgetMinutes, [string]$BootstrapLogPath) return $true }',
+        'function Initialize-WacRun { param([string]$BaseName, [string[]]$CandidateRoot, [string]$LogLevel, [int]$BudgetMinutes, [string]$BootstrapLogPath, [int]$ShutdownMarginSeconds) Add-Journal (''Initialize-WacRun|budget='' + $BudgetMinutes + ''|margin='' + $ShutdownMarginSeconds); return $true }',
+        # The child budget, driven by the SEQUENCE of checks rather than by a clock: WAC_RB_BUDGET is
+        # the zero-based index of the first check that finds the deadline gone, so a scenario can put
+        # the expiry exactly where it wants it and every run is deterministic. -1 never expires.
+        # Each check journals itself, so a check that was silently removed shows up as a shifted plan.
+        'function Test-WacDeadlineExpired {',
+        '    $index = Get-JournalCount -Name ''deadline-check''',
+        '    Add-Journal ''deadline-check''',
+        '    $from = -1',
+        '    if ($env:WAC_RB_BUDGET) { $from = [int]$env:WAC_RB_BUDGET }',
+        '    if ($from -lt 0) { return $false }',
+        '    return ($index -ge $from)',
+        '}',
         'function Write-WacLog { param($Level, $Component, $Message, $Data) }',
         'function Close-WacLog { }',
         'function Get-WacLogPath { return (Join-Path -Path $env:WAC_RB_ROOT -ChildPath ''run.log'') }',
@@ -83,7 +95,7 @@ function New-RollbackSandbox {
         'function Get-WacCanonicalPowerShellHost { return ''C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'' }',
         'function Enter-WacSingleInstance { param([string]$Name) return ([PSCustomObject]@{ Name = $Name }) }',
         'function Exit-WacSingleInstance { param($Mutex) }',
-        'function Stop-WacProcessTree { param([int]$ProcessId, [int]$TimeoutMs = 10000) return $false }',
+        'function Stop-WacProcessTree { param([int]$ProcessId, [int]$TimeoutMs = 10000) return ([PSCustomObject]@{ Root = $ProcessId; Proven = $false; Bound = @(); Survivor = @($ProcessId); TaskkillExit = $null; Reason = ''stub'' }) }',
         'function Get-WacNormalizedPath { param($Path) if ([string]::IsNullOrWhiteSpace($Path)) { return $null } return ([System.IO.Path]::GetFullPath($Path).TrimEnd(''\'')) }',
         'function Test-WacIsWithinRoot { param($ChildPath, $RootPath) return $false }',
         'function ConvertTo-WacCommandLine { param($ArgumentList) return (@($ArgumentList) -join '' '') }',
@@ -190,6 +202,8 @@ function Invoke-RollbackScenario {
         [string]$Remove = 'Verified',
         [ValidateSet('yes', 'no')][string]$Capture = 'yes',
         [ValidateSet('ok', 'throw')][string]$Register = 'ok',
+        # Zero-based index of the first budget check that finds the deadline gone; -1 never expires.
+        [ValidateRange(-1, 32)][int]$Budget = -1,
         [ValidateRange(10, 300)][int]$TimeoutSeconds = 90
     )
 
@@ -231,6 +245,7 @@ function Invoke-RollbackScenario {
     $psi.EnvironmentVariables['WAC_RB_REMOVE'] = $Remove
     $psi.EnvironmentVariables['WAC_RB_CAPTURE'] = $Capture
     $psi.EnvironmentVariables['WAC_RB_REGISTER'] = $Register
+    $psi.EnvironmentVariables['WAC_RB_BUDGET'] = ([string]$Budget)
     $psi.EnvironmentVariables['WAC_RB_XML'] = $script:CapturedXml
 
     $child = [System.Diagnostics.Process]::Start($psi)
@@ -433,6 +448,62 @@ Test-Case 'A conflict phase that removed a task before it refused puts that task
             ('a refused conflict phase still swapped the tree into place: ' + ($run.Journal -join ' / '))
         Assert-True (Test-JournalHas -Run $run -Pattern '^Remove-WacDeployment\|.*\.staging$') `
             ('the staged tree was left behind: ' + ($run.Journal -join ' / '))
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A budget that runs out before the staging phase leaves the machine untouched' {
+    # The advertised child budget used to be armed by Initialize-WacRun and then read by nothing:
+    # the parent waited 40 minutes for a 30-minute deadline no operation ever observed. The first
+    # check sits before anything is inspected, the second before the tree is copied.
+    $sandbox = New-TestSandbox -Prefix 'rb-budget-early'
+    try {
+        New-RollbackSandbox -Sandbox $sandbox
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Found' -Budget 1
+
+        Assert-False $run.TimedOut 'the installer never finished inside its bound'
+        Assert-Equal 1 $run.ExitCode $run.Console
+        Assert-True ($run.Console -match 'run budget expired before the runtime was staged') $run.Console
+
+        # The margin is what makes the deadline enforceable: without it the budget the phases stop
+        # at is the same instant the rollback would have to start from.
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Initialize-WacRun\|budget=30\|margin=600$') `
+            ('the child budget was armed without a shutdown margin: ' + ($run.Journal -join ' / '))
+
+        foreach ($forbidden in @('^New-WacDeploymentStage$', '^Switch-WacDeploymentStage$', '^Register-ScheduledTask')) {
+            Assert-False (Test-JournalHas -Run $run -Pattern $forbidden) `
+                ('an expired budget still reached ' + $forbidden + ': ' + ($run.Journal -join ' / '))
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A budget that runs out after the swap rolls the tree and the task back instead of registering' {
+    # The late-mutation case at the phase level: the new tree IS live by the time the budget goes,
+    # so stopping is not enough - the swap has to be undone and the registration this upgrade
+    # removed to make room has to go back. Index 5 is the check inside the rollback try.
+    $sandbox = New-TestSandbox -Prefix 'rb-budget-late'
+    try {
+        New-RollbackSandbox -Sandbox $sandbox
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Absent,Found' -Budget 5
+
+        Assert-False $run.TimedOut 'the installer never finished inside its bound'
+        Assert-Equal 1 $run.ExitCode $run.Console
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Switch-WacDeploymentStage$') `
+            ('the budget expired before the swap, so this case proves nothing about undoing one: ' + ($run.Journal -join ' / '))
+        Assert-False (Test-JournalHas -Run $run -Pattern '^Register-ScheduledTask\|task$') `
+            ('the task was registered with no budget left to read it back: ' + ($run.Journal -join ' / '))
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Restore-WacDeploymentPrevious$') `
+            ('the live tree was left swapped after the budget expired: ' + ($run.Journal -join ' / '))
+        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + $script:CapturedXml))) `
+            ('the task the upgrade removed was not put back: ' + ($run.Journal -join ' / '))
+        Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacDeploymentPrevious$') `
+            ('the rollback point was discarded on a run that did not commit: ' + ($run.Journal -join ' / '))
+        Assert-True ($run.Console -match 'budget expired after the swap') $run.Console
     }
     finally {
         Remove-TestSandbox -Path $sandbox

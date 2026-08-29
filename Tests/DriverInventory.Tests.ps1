@@ -176,6 +176,46 @@ Test-Case 'a row missing any required field is dropped, not guessed at' {
     Assert-Equal 1 $blank.DroppedRow
 }
 
+Test-Case 'a row too incomplete to prune is still counted in the published-name inventory' {
+    # The two lists answer two different questions and only one of them may drop a row. Driver is
+    # what a DELETION reads, so a row missing a decision field is dropped from it. PublishedName is
+    # what a "has this package gone?" question reads, and dropping a row from THAT turns a package
+    # that is sitting in the store into an absence - which reads as a removal.
+    $parsed = ConvertFrom-WacPnpUtilDriverXml -Text (New-PnpUtilDriverXml -Row @(
+        (New-PnpUtilRow -DriverName 'oem1.inf' -Omit @('SignerName')),
+        (New-PnpUtilRow -DriverName 'oem2.inf')
+    ))
+
+    Assert-True $parsed.IsValid $parsed.Reason
+    Assert-Equal 1 (@($parsed.Driver)).Count 'an unusable row reached the pruning list'
+    Assert-Equal 1 $parsed.DroppedRow 'the dropped row was not counted'
+
+    $published = @($parsed.PublishedName)
+    Assert-Equal 2 $published.Count ('a dropped row vanished from the name inventory: {0}' -f ($published -join ', '))
+    Assert-True ($published -ccontains 'oem1.inf') 'the package the parse could not fully read is missing from the name inventory'
+    Assert-True ($published -ccontains 'oem2.inf') ($published -join ', ')
+
+    # And the completeness flag stays TRUE: a row that named itself is not a gap in the listing,
+    # however little else it carried. Clearing it here would make every dropped row answer Unknown.
+    Assert-True $parsed.NameInventoryComplete 'a droppable detail field made the whole name inventory untrustworthy'
+}
+
+Test-Case 'an element that publishes no name at all is what makes the name inventory untrustworthy' {
+    # The one shape that really is a gap: an element the enumeration listed and this parse cannot
+    # name. Nothing can then say whether a given package is in that listing, so absence from it is
+    # not evidence of anything.
+    foreach ($shape in @('', '   ')) {
+        $parsed = ConvertFrom-WacPnpUtilDriverXml -Text (New-PnpUtilDriverXml -Row @(
+            (New-PnpUtilRow -DriverName $shape), (New-PnpUtilRow -DriverName 'oem2.inf')
+        ))
+
+        Assert-True $parsed.IsValid $parsed.Reason
+        Assert-False $parsed.NameInventoryComplete ('a nameless element left the inventory trustworthy (name={0})' -f $shape)
+        Assert-Equal 1 (@($parsed.PublishedName)).Count ('a nameless element was given a name (name={0})' -f $shape)
+        Assert-Equal 'oem2.inf' @($parsed.PublishedName)[0]
+    }
+}
+
 Test-Case 'the driver version is read from the trailing token, never from the ambiguous date' {
     Assert-Equal ([version]'1.0.0.0') (Get-WacDriverVersionPart -Text '03/04/2024 1.0.0.0')
     Assert-Equal ([version]'2.0.0.0') (Get-WacDriverVersionPart -Text '12/07/2020 2.0.0.0')

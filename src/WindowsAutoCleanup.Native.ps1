@@ -73,6 +73,39 @@ public static class WacNative
         SafeFileHandle FileHandle, out IO_STATUS_BLOCK IoStatusBlock,
         ref FILE_DISPOSITION_INFORMATION FileInformation, int Length, int FileInformationClass);
 
+    // Opening a leaf RELATIVE to a directory handle is the only way to stop an ancestor swap from
+    // redirecting the open, and managed code cannot express it: every .NET open takes a path string,
+    // which the kernel resolves from the volume root every time.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OBJECT_ATTRIBUTES
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [DllImport("ntdll.dll", ExactSpelling = true)]
+    private static extern int NtOpenFile(
+        out IntPtr FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes,
+        out IO_STATUS_BLOCK IoStatusBlock, uint ShareAccess, uint OpenOptions);
+
+    private const uint OBJ_CASE_INSENSITIVE           = 0x00000040;
+    private const uint SYNCHRONIZE_ACCESS             = 0x00100000;
+    private const uint FILE_OPEN_REPARSE_POINT_OPT    = 0x00200000;
+    private const uint FILE_SYNCHRONOUS_IO_NONALERT   = 0x00000020;
+    private const uint FILE_OPEN_FOR_BACKUP_INTENT    = 0x00004000;
+
     // Outcomes of DeleteBoundLeaf. Deliberately coarse: the caller maps them onto the counters it
     // already has, and the Win32 / NTSTATUS values carry the detail.
     public const int DELETE_OK                 = 0;
@@ -181,8 +214,17 @@ public static class WacNative
     // for the check is the same handle the disposition is set on, so the delete lands on the object
     // that was verified, or it does not land at all.
     //
-    // openReparsePoint deletes the LINK itself and skips the identity check, because resolving the
-    // link is exactly what must not happen when the link is the thing being removed.
+    // A REPARSE LEAF IS NOT EXEMPT FROM CONTAINMENT, and an earlier version of this function got
+    // that wrong. FILE_FLAG_OPEN_REPARSE_POINT stops the FINAL component being followed; every
+    // INTERMEDIATE component is still resolved. Skipping the identity proof for links therefore let
+    // an ancestor swapped to a junction redirect the open to a link OUTSIDE the allow-list, and that
+    // link was then unlinked - the exact escape the threat model forbids.
+    //
+    // The fix is structural rather than another check. The parent is opened and proved first, and
+    // the leaf is then opened RELATIVE TO THAT HANDLE with NtOpenFile: the kernel resolves the leaf
+    // name against a directory object we hold open, not against a path it walks from the volume root,
+    // so no later swap of any ancestor can reach it. The link case keeps FILE_OPEN_REPARSE_POINT, so
+    // the LINK is what gets removed and its target is still never followed.
     //
     // FILE_DISPOSITION_INFORMATION only MARKS the object; the unlink happens when the last handle
     // closes, which is why the using block is load-bearing rather than tidy.
@@ -192,54 +234,155 @@ public static class WacNative
         win32Error = 0;
         ntStatus = 0;
 
-        uint flags = FILE_FLAG_BACKUP_SEMANTICS;
-        if (openReparsePoint) { flags |= FILE_FLAG_OPEN_REPARSE_POINT; }
+        string parent = null;
+        string leaf = null;
+        if (!SplitLeaf(expectedFinalPath, out parent, out leaf)) { return DELETE_IDENTITY_MISMATCH; }
 
-        using (SafeFileHandle handle = CreateFileW(
-            path, DELETE_ACCESS | FILE_READ_ATTRIBUTES, FILE_SHARE_READ_WRITE_DELETE, IntPtr.Zero,
-            OPEN_EXISTING, flags, IntPtr.Zero))
+        // The anchor. Opened WITHOUT the reparse flag on purpose: a directory that is itself a link
+        // must resolve, so that its proved final path is the real directory the leaf lives in.
+        //
+        // The OPEN takes the extended-length form and the COMPARISON does not. Deriving the parent
+        // from expectedFinalPath drops the \\?\ prefix the caller had applied, and without it a
+        // parent past MAX_PATH cannot be opened at all - measured, it silently deleted nothing.
+        using (SafeFileHandle parentHandle = CreateFileW(
+            ExtendedPath(parent), FILE_READ_ATTRIBUTES, FILE_SHARE_READ_WRITE_DELETE, IntPtr.Zero,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero))
         {
-            if (handle.IsInvalid)
+            if (parentHandle.IsInvalid)
             {
                 win32Error = Marshal.GetLastWin32Error();
                 return DELETE_OPEN_FAILED;
             }
 
-            if (!openReparsePoint)
+            // Proving the PARENT proves the whole ancestor chain at this instant, and the relative
+            // open below then pins it, so a swap after this point cannot move the target.
+            string actualParent = FinalPathOf(parentHandle);
+            if (actualParent == null) { win32Error = Marshal.GetLastWin32Error(); return DELETE_IDENTITY_MISMATCH; }
+            if (!string.Equals(actualParent, parent, StringComparison.OrdinalIgnoreCase))
             {
-                StringBuilder buffer = new StringBuilder(1024);
-                uint length = GetFinalPathNameByHandleW(
-                    handle, buffer, (uint)buffer.Capacity, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-                if (length != 0 && length >= buffer.Capacity)
-                {
-                    buffer = new StringBuilder((int)length + 1);
-                    length = GetFinalPathNameByHandleW(
-                        handle, buffer, (uint)buffer.Capacity, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-                }
-                if (length == 0)
-                {
-                    win32Error = Marshal.GetLastWin32Error();
-                    return DELETE_IDENTITY_MISMATCH;
-                }
-
-                string actual = buffer.ToString();
-                if (actual.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) { actual = actual.Substring(4); }
-                if (!string.Equals(actual.TrimEnd('\\'), expectedFinalPath, StringComparison.OrdinalIgnoreCase))
-                {
-                    return DELETE_IDENTITY_MISMATCH;
-                }
+                return DELETE_IDENTITY_MISMATCH;
             }
 
+            IntPtr rawLeaf;
+            int status = OpenRelative(parentHandle, leaf, openReparsePoint, out rawLeaf);
+            if (status != 0) { ntStatus = status; return DELETE_OPEN_FAILED; }
+
+            using (SafeFileHandle leafHandle = new SafeFileHandle(rawLeaf, true))
+            {
+                // Defence in depth for a NON-link: the anchored open already makes redirection
+                // impossible, and this still refuses if the leaf is not the object we expected.
+                if (!openReparsePoint)
+                {
+                    string actual = FinalPathOf(leafHandle);
+                    if (actual == null) { win32Error = Marshal.GetLastWin32Error(); return DELETE_IDENTITY_MISMATCH; }
+                    if (!string.Equals(actual, expectedFinalPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return DELETE_IDENTITY_MISMATCH;
+                    }
+                }
+
+                IO_STATUS_BLOCK iosb;
+                FILE_DISPOSITION_INFORMATION disposition = new FILE_DISPOSITION_INFORMATION();
+                disposition.DeleteFile = true;
+
+                ntStatus = NtSetInformationFile(
+                    leafHandle, out iosb, ref disposition,
+                    Marshal.SizeOf(typeof(FILE_DISPOSITION_INFORMATION)), FileDispositionInformation);
+
+                if (ntStatus != 0) { return DELETE_DISPOSITION_FAILED; }
+                return DELETE_OK;
+            }
+        }
+    }
+
+    // Splits a full path into its directory and its last component. Refuses anything without both,
+    // because a leaf with no parent cannot be anchored and must not fall back to an unbound open.
+    private static bool SplitLeaf(string full, out string parent, out string leaf)
+    {
+        parent = null;
+        leaf = null;
+        if (string.IsNullOrEmpty(full)) { return false; }
+
+        string trimmed = full.TrimEnd('\\');
+        int cut = trimmed.LastIndexOf('\\');
+        if (cut <= 0 || cut == trimmed.Length - 1) { return false; }
+
+        parent = trimmed.Substring(0, cut);
+        leaf = trimmed.Substring(cut + 1);
+        // A volume root keeps its trailing separator, otherwise "C:" names the current directory.
+        if (parent.Length == 2 && parent[1] == ':') { parent = parent + "\\"; }
+        return leaf.Length > 0;
+    }
+
+    // The extended-length form of an already-normalised absolute path. Only ever used for an OPEN;
+    // every comparison stays on the plain form, because GetFinalPathNameByHandleW's answer has the
+    // prefix stripped before it is compared.
+    private static string ExtendedPath(string full)
+    {
+        if (string.IsNullOrEmpty(full)) { return full; }
+        if (full.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) { return full; }
+        // A UNC path takes the \\?\UNC\ form; anything else takes the plain prefix.
+        if (full.StartsWith(@"\\", StringComparison.Ordinal)) { return @"\\?\UNC\" + full.Substring(2); }
+        return @"\\?\" + full;
+    }
+
+    // The handle's own final path, with the extended-length prefix and any trailing separator
+    // removed so it compares against a normalised path. Null when the object cannot answer.
+    private static string FinalPathOf(SafeFileHandle handle)
+    {
+        StringBuilder buffer = new StringBuilder(1024);
+        uint length = GetFinalPathNameByHandleW(
+            handle, buffer, (uint)buffer.Capacity, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (length != 0 && length >= buffer.Capacity)
+        {
+            buffer = new StringBuilder((int)length + 1);
+            length = GetFinalPathNameByHandleW(
+                handle, buffer, (uint)buffer.Capacity, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        }
+        if (length == 0) { return null; }
+
+        string actual = buffer.ToString();
+        if (actual.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)) { actual = actual.Substring(4); }
+        return actual.TrimEnd('\\');
+    }
+
+    // Opens one name relative to a directory handle. The name must be a single component: anything
+    // with a separator in it would be resolved by the kernel and defeat the anchoring.
+    private static int OpenRelative(SafeFileHandle parent, string name, bool noFollow, out IntPtr handle)
+    {
+        handle = IntPtr.Zero;
+        if (name.IndexOf('\\') >= 0 || name.IndexOf('/') >= 0) { return unchecked((int)0xC000003B); }
+
+        IntPtr namePtr = Marshal.StringToHGlobalUni(name);
+        IntPtr unicodePtr = IntPtr.Zero;
+        try
+        {
+            UNICODE_STRING unicode = new UNICODE_STRING();
+            unicode.Length = (ushort)(name.Length * 2);
+            unicode.MaximumLength = (ushort)(name.Length * 2);
+            unicode.Buffer = namePtr;
+
+            unicodePtr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+            Marshal.StructureToPtr(unicode, unicodePtr, false);
+
+            OBJECT_ATTRIBUTES attributes = new OBJECT_ATTRIBUTES();
+            attributes.Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));
+            attributes.RootDirectory = parent.DangerousGetHandle();
+            attributes.ObjectName = unicodePtr;
+            attributes.Attributes = OBJ_CASE_INSENSITIVE;
+
+            uint options = FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT;
+            if (noFollow) { options |= FILE_OPEN_REPARSE_POINT_OPT; }
+
             IO_STATUS_BLOCK iosb;
-            FILE_DISPOSITION_INFORMATION disposition = new FILE_DISPOSITION_INFORMATION();
-            disposition.DeleteFile = true;
-
-            ntStatus = NtSetInformationFile(
-                handle, out iosb, ref disposition,
-                Marshal.SizeOf(typeof(FILE_DISPOSITION_INFORMATION)), FileDispositionInformation);
-
-            if (ntStatus != 0) { return DELETE_DISPOSITION_FAILED; }
-            return DELETE_OK;
+            return NtOpenFile(
+                out handle, DELETE_ACCESS | FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
+                ref attributes, out iosb, FILE_SHARE_READ_WRITE_DELETE, options);
+        }
+        finally
+        {
+            if (unicodePtr != IntPtr.Zero) { Marshal.FreeHGlobal(unicodePtr); }
+            Marshal.FreeHGlobal(namePtr);
         }
     }
 }

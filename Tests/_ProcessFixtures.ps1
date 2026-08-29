@@ -87,6 +87,12 @@ function Reset-WacTestLog {
         The degraded flag is sticky by design, so a case that breaks logging on purpose would
         otherwise route every LATER case's lines to a fallback that is no longer injected.
     #>
+    # Close the log the CASE opened, before anything else. Initialize-WacRun below does not
+    # close a log that is already open - it just replaces the writer - so without this the old
+    # FileStream stays live on the case's own sandbox, Remove-TestSandbox cannot delete the
+    # locked .log, and it fails silently. Measured: 12 leaked sandbox directories in %TEMP%.
+    Close-WacLog
+
     Set-WacLogWriter -Writer $null
     Set-WacLogFallbackWriter -Writer $null
 

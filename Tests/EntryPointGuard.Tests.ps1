@@ -32,21 +32,8 @@ Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAut
 
 $script:EntryPoint = @('Install-WindowsAutoCleanupTask.ps1', 'Uninstall-WindowsAutoCleanupTask.ps1')
 
-# Reached only when the gate has already let the run through, and each is the LAST thing its entry
-# point does before it stops for an unrelated reason. Seeing one is how a benign run proves the gate
-# passed without anything real being staged, registered or deleted.
-$script:GatePassedMarker = @{
-    'Install-WindowsAutoCleanupTask.ps1' = 'Test-WacSystemDriveSupported'
-    'Uninstall-WindowsAutoCleanupTask.ps1' = 'Get-WacDeploymentSlotPath'
-}
-
-# Nothing in this list may be reached by any run in this suite, refused or not: no run here is ever
-# allowed to change the machine. Log retention is deliberately NOT in it - pruning old logs on a
-# trusted state directory is correct - and is asserted separately for a REFUSED run, where the
-# directory being pruned may be the very one the run just refused.
-$script:MutatingCall = @(
-    'New-WacDeploymentStage', 'Switch-WacDeploymentStage', 'Remove-WacDeployment',
-    'Remove-WacDeploymentPrevious', 'Restore-WacDeploymentPrevious', 'Remove-WacInstalledTask')
+# The stub sandbox and the stand-ins that drive it; see there for what each stub replaces.
+. (Join-Path -Path $PSScriptRoot -ChildPath '_StubEntryPoint.ps1')
 
 function Get-EntryPointAst {
     param([Parameter(Mandatory = $true)][string]$Name)
@@ -204,6 +191,21 @@ Test-Case 'Neither UAC wrapper can give up while its elevated child is still all
         $text = [System.IO.File]::ReadAllText((Join-Path -Path $script:RepoRoot -ChildPath $name))
         Assert-True ($text -match 'Initialize-WacRun[^\r\n]*-BudgetMinutes \$script:RunBudgetMinutes') `
             ('{0} arms the child with a budget unrelated to the bound the parent waits' -f $name)
+        Assert-True ($text -match 'Initialize-WacRun[^\r\n]*-ShutdownMarginSeconds \(\$script:ChildShutdownMarginMinutes \* 60\)') `
+            ('{0} arms the child budget without holding back the shutdown margin the rollback runs in' -f $name)
+
+        # And the budget has to be CONSUMED, before the phases it bounds. A deadline that is armed
+        # and then read by nothing is the defect this replaced, not a fix for it.
+        $budgetMain = Get-EntryPointMain -Ast $ast
+        $checks = @(Get-CallOffset -Ast $budgetMain -Name 'Test-RunBudget')
+        Assert-True ($checks.Count -ge 2) ('{0} reads its own run budget only {1} time(s)' -f $name, $checks.Count)
+        foreach ($command in @('New-WacDeploymentStage', 'Switch-WacDeploymentStage', 'Register-ScheduledTask',
+                'Remove-InstalledTask', 'Remove-InstalledDeployment')) {
+            foreach ($offset in @(Get-CallOffset -Ast $budgetMain -Name $command)) {
+                Assert-True ($checks[0] -lt $offset) `
+                    ('{0} reaches {1} without ever checking its budget first' -f $name, $command)
+            }
+        }
 
         # And on expiry the child is terminated and the outcome PROVEN, never silently left running.
         $expiry = @($ast.FindAll({
@@ -221,284 +223,6 @@ Test-Case 'Neither UAC wrapper can give up while its elevated child is still all
 # ---------------------------------------------------------------------------------------------
 # Behaviour: the real scripts, elevated branch, stub modules, nothing destructive reached
 # ---------------------------------------------------------------------------------------------
-
-function New-StubDeployment {
-    <#
-    .SYNOPSIS
-        A sandbox holding the REAL entry points and the REAL shared gate over stub modules.
-    .DESCRIPTION
-        The scripts are copied byte for byte: the code under test is the shipped code, only its
-        dependencies are replaced. Every stub records its own name, and the ones that would change
-        the machine also throw, so a flow that reaches one fails loudly instead of quietly.
-    #>
-    param([Parameter(Mandatory = $true)][string]$Sandbox)
-
-    $src = Join-Path -Path $Sandbox -ChildPath 'src'
-    [void][System.IO.Directory]::CreateDirectory($src)
-    [void][System.IO.Directory]::CreateDirectory((Join-Path -Path $Sandbox -ChildPath 'state'))
-
-    foreach ($name in $script:EntryPoint) {
-        Copy-Item -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath $name) `
-            -Destination (Join-Path -Path $Sandbox -ChildPath $name) -Force
-    }
-    foreach ($part in @('WindowsAutoCleanup.EntryGate.ps1', 'WindowsAutoCleanup.InstallerTask.ps1')) {
-        Copy-Item -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath ('src\' + $part)) `
-            -Destination (Join-Path -Path $src -ChildPath $part) -Force
-    }
-
-    $core = @(
-        'Set-StrictMode -Version 2.0',
-        'function Add-StubCall { param([string]$Name) [System.IO.File]::AppendAllText($env:WAC_STUB_CALLS, $Name + [Environment]::NewLine) }',
-        'function Initialize-WacRun { param([string]$BaseName, [string[]]$CandidateRoot, [string]$LogLevel, [int]$BudgetMinutes, [string]$BootstrapLogPath) Add-StubCall ''Initialize-WacRun''; return $true }',
-        'function Write-WacLog { param($Level, $Component, $Message, $Data) }',
-        'function Close-WacLog { Add-StubCall ''Close-WacLog'' }',
-        'function Get-WacLogPath { return (Join-Path -Path $env:WAC_STUB_STATE -ChildPath ''run.log'') }',
-        'function Get-WacLogDirectory { return $env:WAC_STUB_STATE }',
-        'function Get-WacDataRoot { return $env:WAC_STUB_STATE }',
-        'function Remove-WacOldLog { param($LogDirectory, $Pattern, $KeepCount) Add-StubCall ''Remove-WacOldLog'' }',
-        'function Test-WacIsAdministrator { return $true }',
-        'function Test-WacSystemDriveSupported { Add-StubCall ''Test-WacSystemDriveSupported''; return $false }',
-        'function Get-WacCanonicalPowerShellHost { Add-StubCall ''Get-WacCanonicalPowerShellHost''; return $null }',
-        'function Enter-WacSingleInstance { param([string]$Name) Add-StubCall ''Enter-WacSingleInstance''; return ([PSCustomObject]@{ Name = $Name }) }',
-        'function Exit-WacSingleInstance { param($Mutex) Add-StubCall ''Exit-WacSingleInstance'' }',
-        'function Stop-WacProcessTree { param([int]$ProcessId, [int]$TimeoutMs = 10000) Add-StubCall ''Stop-WacProcessTree''; return $false }',
-        'function Get-WacNormalizedPath { param($Path) if ([string]::IsNullOrWhiteSpace($Path)) { return $null } return ([System.IO.Path]::GetFullPath($Path).TrimEnd(''\'')) }',
-        'function Test-WacIsWithinRoot { param($ChildPath, $RootPath) return $false }',
-        'function ConvertTo-WacCommandLine { param($ArgumentList) return (@($ArgumentList) -join '' '') }',
-        'function Get-WacRelaunchArgument { param($ScriptPath, $BooleanSwitch, $PresentSwitch, $NamedValue, $HostSwitch) return @($ScriptPath) }',
-        'function Get-WacLogHealth {',
-        '    return [PSCustomObject]@{',
-        '        Path = (Get-WacLogPath)',
-        '        IsDurable = ($env:WAC_STUB_LOG_DURABLE -eq ''True'')',
-        '        Degraded = ($env:WAC_STUB_LOG_DURABLE -ne ''True'')',
-        '        FallbackKind = ''None''',
-        '        FailedWrites = 0',
-        '        Reason = ''stubbed log health''',
-        '    }',
-        '}',
-        'function Get-WacStateTrust {',
-        '    if ($env:WAC_STUB_STATE_MODE -eq ''null'') { return $null }',
-        '    return [PSCustomObject]@{',
-        '        Path = $env:WAC_STUB_STATE_PATH',
-        '        IsTrusted = ($env:WAC_STUB_STATE_MODE -eq ''trusted'')',
-        '        Reason = $env:WAC_STUB_STATE_REASON',
-        '        Checked = @()',
-        '        Failures = @()',
-        '        Writers = @()',
-        '    }',
-        '}',
-        'Export-ModuleMember -Function *-*'
-    )
-    [System.IO.File]::WriteAllLines((Join-Path -Path $src -ChildPath 'WindowsAutoCleanup.Core.psm1'),
-        [string[]]$core, (New-Object System.Text.UTF8Encoding($false)))
-
-    $deploy = New-Object 'System.Collections.Generic.List[string]'
-    [void]$deploy.Add('Set-StrictMode -Version 2.0')
-    [void]$deploy.Add('Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath ''WindowsAutoCleanup.Core.psm1'') -DisableNameChecking -ErrorAction Stop')
-    [void]$deploy.Add('function Get-WacOperationLockName { return ''Local\WacStubLock'' }')
-    [void]$deploy.Add('function Get-WacTaskName { return ''WindowsAutoCleanup'' }')
-    [void]$deploy.Add('function Get-WacTaskFolder { return ''\WindowsAutoCleanup\'' }')
-    [void]$deploy.Add('function Get-WacTaskDescription { return ''stub'' }')
-    [void]$deploy.Add('function Get-WacTaskActionArgument { param($RunScript, $ResetWindowsUpdateBase, $PruneSupersededDrivers, $EnableLegacyDiskCleanup) return ''stub'' }')
-    [void]$deploy.Add('function Get-WacInstallerRelaunchArgument { param($ScriptPath, $DailyRunTime, $ResetWindowsUpdateBase, $PruneSupersededDrivers, $EnableLegacyDiskCleanup, $NoPause) return @($ScriptPath) }')
-    [void]$deploy.Add('function Get-WacDeploymentSlotPath { param([string]$DeploymentRoot) Add-StubCall ''Get-WacDeploymentSlotPath''; return $null }')
-    [void]$deploy.Add('function Test-WacTaskReferencesRoot { param($Task, $DeploymentRoot) return $false }')
-    [void]$deploy.Add('function Test-WacTaskIsOurs { param($Task, $DeploymentRoot, $AllowLegacyMigration) return ([PSCustomObject]@{ IsOurs = $false; Reason = ''stub'' }) }')
-
-    # Reached only by a run that got past the gate, so every one of these is a test failure by the
-    # time it is called: it records itself and then makes the run fail where it happened.
-    foreach ($tripwire in @('Get-WacDeploymentOwnership', 'Test-WacDeploymentTrusted', 'Get-WacInstalledTask',
-        'New-WacDeploymentStage', 'Switch-WacDeploymentStage', 'Remove-WacDeployment',
-        'Remove-WacDeploymentPrevious', 'Restore-WacDeploymentPrevious', 'Remove-WacInstalledTask')) {
-        [void]$deploy.Add(('function {0} {{ param($A, $B, $C, $D) Add-StubCall ''{0}''; throw ''{0} was reached, which this run was never allowed to do.'' }}' -f $tripwire))
-    }
-    [void]$deploy.Add('Export-ModuleMember -Function *-*')
-
-    [System.IO.File]::WriteAllLines((Join-Path -Path $src -ChildPath 'WindowsAutoCleanup.Deploy.psm1'),
-        [string[]]$deploy.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
-}
-
-function Invoke-StubbedEntryPoint {
-    <#
-    .SYNOPSIS
-        Runs one real entry point over the stub modules in a bounded child, and reports what it did.
-    .OUTPUTS
-        ExitCode, Called (the stub calls it made, in order), Console, TimedOut.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Sandbox,
-        [Parameter(Mandatory = $true)][string]$ScriptName,
-        [Parameter(Mandatory = $true)][ValidateSet('trusted', 'untrusted', 'null')][string]$StateMode,
-        [string]$StatePath = '',
-        [string]$StateReason = '',
-        [bool]$LogDurable = $true,
-        [ValidateRange(10, 300)][int]$TimeoutSeconds = 90
-    )
-
-    $callFile = Join-Path -Path $Sandbox -ChildPath 'calls.txt'
-    $outFile = Join-Path -Path $Sandbox -ChildPath 'console.txt'
-    $resultFile = Join-Path -Path $Sandbox -ChildPath 'exit.txt'
-    foreach ($stale in @($callFile, $outFile, $resultFile)) {
-        if (Test-Path -LiteralPath $stale -PathType Leaf) { [System.IO.File]::Delete($stale) }
-    }
-    [System.IO.File]::WriteAllText($callFile, '')
-
-    $wrapper = Join-Path -Path $Sandbox -ChildPath 'wrapper.ps1'
-    $entry = Join-Path -Path $Sandbox -ChildPath $ScriptName
-    $lines = @(
-        '$code = 90',
-        'try {',
-        ('    & ''{0}'' -NoPause *> ''{1}''' -f $entry, $outFile),
-        '    if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }',
-        '}',
-        'catch {',
-        '    $code = 91',
-        ('    [System.IO.File]::AppendAllText(''{0}'', ($_ | Out-String))' -f $outFile),
-        '}',
-        ('[System.IO.File]::WriteAllText(''{0}'', "EXIT=$code")' -f $resultFile),
-        'exit $code'
-    )
-    [System.IO.File]::WriteAllLines($wrapper, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-
-    $hostName = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = (Join-Path -Path $PSHOME -ChildPath $hostName)
-    $psi.Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $wrapper)
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.WorkingDirectory = $script:RepoRoot
-    $psi.EnvironmentVariables['WAC_STUB_CALLS'] = $callFile
-    $psi.EnvironmentVariables['WAC_STUB_STATE'] = (Join-Path -Path $Sandbox -ChildPath 'state')
-    $psi.EnvironmentVariables['WAC_STUB_STATE_MODE'] = $StateMode
-    $psi.EnvironmentVariables['WAC_STUB_STATE_PATH'] = $StatePath
-    $psi.EnvironmentVariables['WAC_STUB_STATE_REASON'] = $StateReason
-    $psi.EnvironmentVariables['WAC_STUB_LOG_DURABLE'] = ([string]$LogDurable)
-
-    $child = [System.Diagnostics.Process]::Start($psi)
-    $exited = $false
-    try {
-        $exited = $child.WaitForExit([int]($TimeoutSeconds * 1000))
-        if (-not $exited) {
-            [void](Stop-WacProcessTree -ProcessId $child.Id)
-            [void]$child.WaitForExit(10000)
-        }
-    }
-    finally {
-        try { $child.Dispose() } catch { $null = $_ }
-    }
-
-    $exitCode = $null
-    if (Test-Path -LiteralPath $resultFile -PathType Leaf) {
-        $exitCode = [int](([System.IO.File]::ReadAllText($resultFile)).Trim().Substring(5))
-    }
-
-    $console = ''
-    if (Test-Path -LiteralPath $outFile -PathType Leaf) { $console = [System.IO.File]::ReadAllText($outFile) }
-
-    return [PSCustomObject]@{
-        ExitCode = $exitCode
-        Called = @(@([System.IO.File]::ReadAllLines($callFile)) | Where-Object { $_.Trim() })
-        Console = $console
-        TimedOut = (-not $exited)
-    }
-}
-
-function Assert-NothingMutated {
-    <#
-    .SYNOPSIS
-        Proves a run changed nothing. With -Refused, also proves it stopped AT the gate and never
-        wrote through the path it refused.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]$Run,
-        [Parameter(Mandatory = $true)][string]$Label,
-        [string]$ScriptName,
-        [switch]$Refused
-    )
-
-    Assert-False $Run.TimedOut ('{0}: the entry point never finished inside its bound' -f $Label)
-    foreach ($call in $script:MutatingCall) {
-        Assert-False ($Run.Called -contains $call) ('{0}: {1} was called; the calls were: {2}' -f $Label, $call, ($Run.Called -join ', '))
-    }
-
-    if (-not $Refused) { return }
-
-    Assert-True ($Run.Called -contains 'Enter-WacSingleInstance') `
-        ('{0}: the lock was never taken, so the refusal was not made under it' -f $Label)
-    Assert-False ($Run.Called -contains $script:GatePassedMarker[$ScriptName]) `
-        ('{0}: the run continued past the gate; calls: {1}' -f $Label, ($Run.Called -join ', '))
-    Assert-False ($Run.Called -contains 'Remove-WacOldLog') `
-        ('{0}: the refused run still pruned files inside the directory it refused' -f $Label)
-}
-
-function New-TestUntrustedStatePath {
-    <#
-    .SYNOPSIS
-        Four state paths that are untrusted for four different real reasons, plus the verdict Core
-        actually returns for each.
-    .DESCRIPTION
-        The verdicts are computed here, by the shipped rule, against directories this suite crafts -
-        so what the entry points are fed is a real refusal rather than an invented one. Everyone
-        (S-1-1-0) is on Core's never-administrative list, which is what makes the writable cases
-        untrusted even on an elevated runner where the sandbox owner is BUILTIN\Administrators.
-    #>
-    param([Parameter(Mandatory = $true)][string]$Sandbox)
-
-    $cases = New-Object 'System.Collections.Generic.List[object]'
-
-    $writable = Join-Path -Path $Sandbox -ChildPath 'writable'
-    [void][System.IO.Directory]::CreateDirectory($writable)
-    Add-TestEveryoneAce -Path $writable
-    [void]$cases.Add([PSCustomObject]@{ Name = 'user-writable'; Path = $writable })
-
-    $parent = Join-Path -Path $Sandbox -ChildPath 'inherited'
-    [void][System.IO.Directory]::CreateDirectory($parent)
-    Add-TestEveryoneAce -Path $parent -Inheritable
-    $inherited = Join-Path -Path $parent -ChildPath 'Logs'
-    [void][System.IO.Directory]::CreateDirectory($inherited)
-    [void]$cases.Add([PSCustomObject]@{ Name = 'inherited-unsafe'; Path = $inherited })
-
-    $target = Join-Path -Path $Sandbox -ChildPath 'linktarget'
-    [void][System.IO.Directory]::CreateDirectory($target)
-    $link = Join-Path -Path $Sandbox -ChildPath 'link'
-    New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop | Out-Null
-    [void]$cases.Add([PSCustomObject]@{ Name = 'reparse'; Path = (Join-Path -Path $link -ChildPath 'Logs') })
-
-    # A drive letter nothing is mounted on: the volume cannot be inspected, so the trust question
-    # cannot be answered at all, which is the inaccessible case and must refuse exactly like a
-    # writable one.
-    $free = @([char[]](90..80) | Where-Object { -not (Test-Path -LiteralPath ('{0}:\' -f $_)) })
-    Assert-True ($free.Count -gt 0) 'every drive letter from P: to Z: is in use, so the inaccessible case cannot be built'
-    [void]$cases.Add([PSCustomObject]@{ Name = 'inaccessible'; Path = ('{0}:\WindowsAutoCleanup\Logs' -f $free[0]) })
-
-    return @($cases.ToArray())
-}
-
-function Add-TestEveryoneAce {
-    <#
-    .SYNOPSIS
-        Grants Everyone Modify on a path the test itself created, so it is untrusted on ANY runner.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [switch]$Inheritable
-    )
-
-    $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
-    if ($Inheritable) {
-        $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    }
-
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-        (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')),
-        [System.Security.AccessControl.FileSystemRights]::Modify,
-        $inheritance,
-        [System.Security.AccessControl.PropagationFlags]::None,
-        [System.Security.AccessControl.AccessControlType]::Allow)))
-    Set-Acl -LiteralPath $Path -AclObject $acl
-}
 
 Test-Case 'An untrusted state path refuses both entry points before anything is staged, registered or deleted' {
     $sandbox = New-TestSandbox -Prefix 'gate-untrusted'
@@ -582,9 +306,114 @@ Test-Case 'A benign, trusted machine is let through - and is still benign the se
                 Assert-False ($run.Console -match 'Refused before any change') `
                     ('{0} {1} pass: a benign steady state produced a security refusal' -f $name, $pass)
 
+                # The other half of the refusal rule: a run the gate LET THROUGH does write its
+                # invocation record, so moving that write behind the gate did not simply delete it.
+                Assert-True (@($run.LogWrites | Where-Object { $_ -match ' invoked\.$' }).Count -eq 1) `
+                    ('{0} {1} pass: the invocation record did not reach the log exactly once: {2}' -f `
+                        $name, $pass, (@($run.LogWrites) -join ' / '))
+
                 if ($pass -eq 'first') { $first = $run.ExitCode }
                 else { Assert-Equal $first $run.ExitCode ('{0}: the second run over the same state answered differently' -f $name) }
             }
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A run whose budget is already gone stops before it inspects or changes anything' {
+    # The advertised child budget was armed by Initialize-WacRun and then read by nothing, so the
+    # parent's wait outlasted a deadline no operation observed. The first check sits immediately
+    # after the gate; the deeper phase checks are exercised in InstallerRollback.Tests.ps1.
+    $sandbox = New-TestSandbox -Prefix 'gate-budget'
+    try {
+        New-StubDeployment -Sandbox $sandbox
+
+        $trusted = Test-WacStatePathIsTrusted -Path (Join-Path -Path $env:SystemRoot -ChildPath 'System32')
+        Assert-True $trusted.IsTrusted ('%SystemRoot%\System32 is not machine-trusted on this host: ' + [string]$trusted.Reason)
+
+        foreach ($name in $script:EntryPoint) {
+            $run = Invoke-StubbedEntryPoint -Sandbox $sandbox -ScriptName $name -StateMode 'trusted' `
+                -StatePath ([string]$trusted.Path) -StateReason ([string]$trusted.Reason) -Budget 'expired'
+
+            Assert-Equal 1 $run.ExitCode ('{0}: {1}' -f $name, $run.Console)
+            Assert-NothingMutated -Run $run -Label ('{0} expired budget' -f $name)
+            Assert-False ($run.Called -contains $script:GatePassedMarker[$name]) `
+                ('{0}: an expired budget did not stop the run; calls: {1}' -f $name, ($run.Called -join ', '))
+            Assert-True ($run.Console -match 'run budget expired') $run.Console
+
+            # It crossed the gate, so it IS entitled to its log - and the expiry is recorded in it.
+            Assert-True (@($run.LogWrites | Where-Object { $_ -match 'run budget expired' }).Count -gt 0) `
+                ('{0}: the budget refusal never reached the log: {1}' -f $name, (@($run.LogWrites) -join ' / '))
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'Neither wrapper reports an unproven termination as proof, and neither tells the operator to re-run' {
+    # Stop-WacProcessTree returns a VERDICT. Both wrappers used it as a Boolean - and every non-null
+    # PSCustomObject is truthy - so the success branch ran unconditionally and the CRITICAL branch
+    # beneath it was unreachable: an operator whose elevated child was still mutating the machine
+    # was told it was proven gone and invited to start a second one over it.
+    $sandbox = New-TestSandbox -Prefix 'gate-expiry'
+    try {
+        New-StubDeployment -Sandbox $sandbox
+        $stubHost = Join-Path -Path $PSHOME -ChildPath 'stub-host.exe'
+
+        foreach ($name in $script:EntryPoint) {
+            $lockName = 'Local\WacStubLock_' + [guid]::NewGuid().ToString('N')
+            $child = Start-StubElevatedChild -Sandbox $sandbox -LockName $lockName
+            try {
+                Assert-True (Wait-ForStubFile -Path $child.Started) `
+                    ('{0}: the stand-in child never took the operation lock' -f $name)
+
+                $run = Invoke-StubbedEntryPoint -Sandbox $sandbox -ScriptName $name -StateMode 'trusted' `
+                    -Admin $false -HostPath $stubHost -LockName $lockName `
+                    -ChildPid $child.Process.Id -Termination 'unproven'
+
+                Assert-False $run.TimedOut ('{0}: the wrapper never finished inside its bound' -f $name)
+                Assert-True ($run.Called -contains 'Stop-WacProcessTree') `
+                    ('{0}: the wrapper never tried to terminate the child; calls: {1}' -f $name, ($run.Called -join ', '))
+                Assert-Equal 8 $run.ExitCode ('{0}: an unproven termination did not get its own exit code: {1}' -f $name, $run.Console)
+                Assert-True ($run.Console -match 'could NOT be proven terminated') $run.Console
+                Assert-False ($run.Console -match 'proven gone') `
+                    ('{0}: an unproven termination was reported as proof: {1}' -f $name, $run.Console)
+                # The success text ends "...; re-run the installer." and this path must never carry
+                # it. The negative form the CRITICAL line DOES carry is asserted right after, so
+                # this cannot be satisfied by a wrapper that simply stopped saying anything.
+                Assert-False ($run.Console -match ';\s*re-run the ') `
+                    ('{0}: the operator was told to re-run over a live child: {1}' -f $name, $run.Console)
+                Assert-True ($run.Console -match 'Do NOT re-run the ') `
+                    ('{0}: the operator was not told to leave the live child alone: {1}' -f $name, $run.Console)
+
+                # And the report was accurate: the child really is still there, still holding the
+                # machine-wide lock that a second run would have to take.
+                $contended = Enter-WacSingleInstance -Name $lockName
+                if ($contended) { Exit-WacSingleInstance -Mutex $contended }
+                Assert-False $contended `
+                    ('{0}: the stand-in child had already released the operation lock, so this proves nothing' -f $name)
+
+                [System.IO.File]::WriteAllText($child.Release, 'go')
+                Assert-True ($child.Process.WaitForExit(30000)) ('{0}: the stand-in child never finished' -f $name)
+                Assert-True (Test-Path -LiteralPath $child.Mutation -PathType Leaf) `
+                    ('{0}: the child never performed its late mutation, so the wrapper had nothing to be wrong about' -f $name)
+            }
+            finally {
+                try { if (-not $child.Process.HasExited) { [void](Stop-WacProcessTree -ProcessId $child.Process.Id) } } catch { $null = $_ }
+                try { $child.Process.Dispose() } catch { $null = $_ }
+            }
+
+            # The success branch is still REACHABLE, or the assertions above would also pass on a
+            # wrapper that had simply stopped reporting a proven kill at all.
+            $proven = Invoke-StubbedEntryPoint -Sandbox $sandbox -ScriptName $name -StateMode 'trusted' `
+                -Admin $false -HostPath $stubHost -ChildPid 0 -Termination 'proven'
+
+            Assert-Equal 1 $proven.ExitCode ('{0} proven: {1}' -f $name, $proven.Console)
+            Assert-True ($proven.Console -match 'terminated and proven gone') $proven.Console
+            Assert-False ($proven.Console -match 'could NOT be proven terminated') $proven.Console
         }
     }
     finally {

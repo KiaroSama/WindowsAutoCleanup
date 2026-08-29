@@ -139,10 +139,16 @@ $script:CleanupMarginSeconds = 30
 # are written here, before any module exists. The file is only ever touched when something is wrong;
 # Initialize-WacRun folds whatever landed in it into the run log, and it is deleted again once that
 # log is known to be durable, so one run leaves ONE audit artifact.
+#
+# The name carries a per-run GUID as well as the pid. %TEMP% for the SYSTEM task is C:\Windows\Temp,
+# which grants BUILTIN\Users write by default, so a PREDICTABLE name is one a standard user can
+# create first - as a link - and have this appended to, read back into the run log and deleted, all
+# as SYSTEM. A name nobody can predict cannot be pre-created. This is the earliest write the process
+# makes, before any module and therefore before any verification exists to lean on.
 # ------------------------------------------------------------------------------------------------
 
 $script:BootstrapLogPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) `
-    -ChildPath ('WindowsAutoCleanup-bootstrap-{0}.log' -f $PID)
+    -ChildPath ('WindowsAutoCleanup-bootstrap-{0}-{1}.log' -f $PID, [guid]::NewGuid().ToString('N'))
 
 function Write-WacBootstrapLine {
     <#
@@ -172,7 +178,9 @@ function Remove-WacBootstrapLog {
         Deletes the bootstrap log once the run log has adopted its content and is durable.
     .DESCRIPTION
         Only then: while the run log is degraded the bootstrap file may be the only surviving record
-        of why, and deleting it would destroy the evidence it exists to preserve.
+        of why, and deleting it would destroy the evidence it exists to preserve. Durable is also
+        what makes this delete safe to make early: the run log it hands the content to lives in a
+        directory Initialize-WacRun verified before creating anything in it.
     #>
     if (-not (Test-Path -LiteralPath $script:BootstrapLogPath -PathType Leaf)) { return }
     if (-not (Get-WacLogHealth).IsDurable) { return }
@@ -424,11 +432,31 @@ try {
         -BootstrapLogPath $script:BootstrapLogPath -StartUtc $script:StartUtc `
         -ShutdownMarginSeconds $script:CleanupMarginSeconds
     if (-not $logInitialised) {
+        # Nothing was created, opened or written in any candidate state directory - Initialize-WacRun
+        # verifies each one BEFORE it touches it, and returns false rather than logging through a
+        # path it is about to refuse. So there is no log to write the verdict into, and Write-WacLog
+        # routes a degraded run's lines to the verified fallback (Event Log, then console) instead.
+        $stateTrust = Get-WacStateTrust
+        if ($null -ne $stateTrust -and -not $stateTrust.IsTrusted) {
+            Write-WacLog -Level CRITICAL -Component 'Run' -Message 'No machine-trusted state directory was found; nothing was created in any of them and nothing on this machine was mutated.' -Data @{
+                path = [string]$stateTrust.Path; reason = [string]$stateTrust.Reason
+            }
+            exit (Write-WacRunVerdict -Outcome 'SecurityRefusal')
+        }
+
         Write-Error ('No log file could be created in any candidate location; refusing to run silently. Any pre-import failure is in {0}.' -f $script:BootstrapLogPath)
         exit 1
     }
 
     # The run log has adopted whatever the bootstrap file held, so the run is back to one artifact.
+    #
+    # It stays HERE, ahead of the run-level gate, and that is a decision rather than an oversight.
+    # It is a delete, but not one that can travel through a refused path: it removes a per-run file
+    # in %TEMP%, and only once Get-WacLogHealth says the content is safe in a log whose directory
+    # Initialize-WacRun verified BEFORE creating it - a sink separately proven, which is what this
+    # delete is conditioned on. Moving it past the gate would also make it dead: every path that
+    # WRITES a bootstrap line exits before the gate (exit 1 for a module that would not load, exit 3
+    # for a lock that could not be created), so a later call could only ever find nothing to remove.
     Remove-WacBootstrapLog
 
     if ($script:ImportFailure.Count -gt 0) {
