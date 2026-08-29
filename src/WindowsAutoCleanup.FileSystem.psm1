@@ -196,9 +196,10 @@ function Remove-WacLeaf {
         File.Delete pair rather than Remove-Item, which throws a spurious NullReferenceException on
         some junctions under Windows PowerShell 5.1.
 
-        The delete is issued BY PATHNAME and the identity check below is a separate resolution of
-        that same name, so this is a narrow window, not a closed one. See the module header for the
-        measured size and for why no handle-bound alternative exists on the supported surface.
+        The delete is handle-bound: DeleteBoundLeaf opens the parent, proves the parent's identity
+        on that handle, opens the leaf RELATIVE to it, and sets the disposition on the leaf handle.
+        There is no second resolution of the name for an attacker to win. This paragraph used to
+        describe the predecessor - verify, then delete by pathname - and outlived it.
     #>
     [CmdletBinding()]
     param(
@@ -228,8 +229,12 @@ function Remove-WacLeaf {
     # resolution for an attacker to win, which is what the predecessor - verify, close, delete by
     # pathname - still left open however small the window became.
     #
-    # A reparse point is exempt from the identity proof because resolving it is exactly what must
-    # not happen when the link itself is the thing being removed.
+    # A reparse point is NO LONGER exempt from the identity proof, and the exemption was a hole.
+    # Skipping it looked right - resolving a link is exactly what must not happen when the link is
+    # the thing being removed - but FILE_FLAG_OPEN_REPARSE_POINT only stops the FINAL component
+    # being followed. Every intermediate still resolves, so a swapped ancestor redirected the open
+    # to a different link entirely and it was unlinked. The parent is proved first and the leaf is
+    # opened relative to that handle, which keeps the link unresolved AND the ancestry proved.
     $longPath = Get-WacLongPath -Path $normalized
     $expected = $normalized
 

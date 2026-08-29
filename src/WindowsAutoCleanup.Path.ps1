@@ -38,6 +38,31 @@ function Get-WacNormalizedPath {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
 
+    # A name whose final component ends in a dot or a space cannot be canonicalised without
+    # changing WHICH OBJECT it names, so it is refused here rather than resolved into a different
+    # file. Win32 path normalisation strips both during preprocessing, and GetFullPath below
+    # performs it: measured on PowerShell 7.6.5/.NET 10, 'note.txt.' comes back as 'note.txt'.
+    # That is not a cosmetic difference. Before this guard, asking Remove-WacLeaf to delete
+    # 'note.txt.' deleted 'note.txt' and recorded FilesDeleted=1 - a wrong object, destroyed by a
+    # SYSTEM process, reported as success. The handle-bound identity proof could not catch it
+    # because expectedFinalPath was normalised through this same function, so both sides of the
+    # comparison were corrupted identically and matched.
+    #
+    # Refusing costs a real thing: such an entry is never cleaned, and it survives every run. That
+    # is the same trade already taken for locked files, and it is the right way round - the
+    # alternative is deleting a neighbour that was never enumerated. Only \\?\ opens reach these
+    # names, and every comparison in this project is done on the canonical form this function
+    # returns, so there is nowhere safe to carry the literal name to.
+    #
+    # '.' and '..' are navigation rather than names; GetFullPath resolves them correctly and they
+    # are left alone. A trailing separator is also normal and is handled further down.
+    $finalComponent = $Path.TrimEnd([char[]]@('\', '/'))
+    $separator = $finalComponent.LastIndexOfAny([char[]]@('\', '/'))
+    if ($separator -ge 0) { $finalComponent = $finalComponent.Substring($separator + 1) }
+    if ($finalComponent -ne '.' -and $finalComponent -ne '..' -and $finalComponent -match '[. ]$') {
+        return $null
+    }
+
     $candidate = $Path.Trim()
 
     if ($candidate.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) {
