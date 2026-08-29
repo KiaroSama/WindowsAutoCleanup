@@ -163,6 +163,17 @@ function Invoke-SandboxedEntryPoint {
         # audit log into. These entry-point cases run de-elevated, so redirect LOCALAPPDATA too and
         # assert there.
         ('$env:LOCALAPPDATA = {0}' -f (ConvertTo-WrapperLiteral -Value $localAppData)),
+        # WacNative is compiled HERE, while %SystemRoot% is still real, and the redirect follows.
+        # Measured on both hosts: Windows PowerShell 5.1 compiles Add-Type by shelling out to
+        # csc.exe and the strong-name provider under the REAL %SystemRoot%, so compiling after the
+        # redirect fails with "Error signing assembly -- Provider DLL failed to initialize
+        # correctly" and the run then produces NO log at all - which is what these three cases were
+        # failing on, on 5.1 only. PowerShell 7 compiles in-process with Roslyn and never noticed.
+        # The type is process-wide and Initialize-WacNative is idempotent, so the entry point's own
+        # later call is a no-op. Nothing about the behaviour under test is stubbed by this: it only
+        # moves WHEN the compile happens, and production never redirects %SystemRoot%.
+        ('. {0}' -f (ConvertTo-WrapperLiteral -Value (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Native.ps1'))),
+        'if (-not (Initialize-WacNative)) { throw ''the native surface would not compile before the redirect'' }',
         ('$env:SystemRoot = {0}' -f (ConvertTo-WrapperLiteral -Value $systemRoot)),
         # The token this child actually got. Everything asserted about an unelevated run is worth
         # nothing if the de-elevation quietly stopped working, so the child reports the token it

@@ -221,4 +221,34 @@ Test-Case 'The ancestor trust rule refuses every descriptor that cannot prove ad
     Assert-Equal 'S-1-5-32-544' ([string]$ok.Owner)
 }
 
+Test-Case 'The handle descriptor rule reaches the ancestor rule''s answer, and fails closed without one' {
+    <#
+        Open-WacTrustedDirectory reads the owner and DACL from the OPEN DIRECTORY'S OWN HANDLE and
+        gets SDDL back, which is what makes the verdict a statement about the object rather than
+        about a name. This is the function that turns that string into an answer, and the answer has
+        to be the ancestor rule's - one rule, not a second copy of it that drifts.
+
+        The rest is the shape of "no answer". Every one of these is a refusal: an unanswered
+        security question is not a yes, and the caller is about to write a SYSTEM audit log there.
+    #>
+    $good = Test-WacTrustedDirectoryDescriptor -Sddl 'O:BAG:BAD:(A;;FA;;;BA)(A;;FA;;;SY)(A;;0x4;;;AU)'
+    Assert-True $good.IsTrusted ('an administrative-only descriptor was refused: ' + $good.Reason)
+
+    $userOwned = Test-WacTrustedDirectoryDescriptor -Sddl 'O:AUG:BAD:(A;;FA;;;BA)'
+    Assert-False $userOwned.IsTrusted 'a directory owned by Authenticated Users was accepted'
+    Assert-True ($userOwned.Reason -match 'Owner') ('reason: ' + $userOwned.Reason)
+
+    $replaceable = Test-WacTrustedDirectoryDescriptor -Sddl 'O:BAG:BAD:(A;;FA;;;BA)(A;;0x10040;;;AU)'
+    Assert-False $replaceable.IsTrusted 'a directory Authenticated Users can empty was accepted'
+
+    foreach ($unusable in @('', '   ', 'not a security descriptor at all', 'O:BAG:BAD:(A;;FA;;;')) {
+        $verdict = Test-WacTrustedDirectoryDescriptor -Sddl $unusable
+        Assert-False $verdict.IsTrusted ('an unusable descriptor was accepted: [' + $unusable + ']')
+        Assert-True ([bool]$verdict.Reason) ('an unusable descriptor was refused without saying why: [' + $unusable + ']')
+    }
+
+    $absent = Test-WacTrustedDirectoryDescriptor -Sddl $null
+    Assert-False $absent.IsTrusted 'a directory that exposed no descriptor at all was accepted'
+}
+
 Complete-TestRun

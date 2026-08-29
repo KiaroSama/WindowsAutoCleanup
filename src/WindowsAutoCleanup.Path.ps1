@@ -22,6 +22,55 @@ $script:PendingDeleteWarned = $false
 # Paths
 # ---------------------------------------------------------------------------------------------
 
+function Test-WacPathSegmentsPreserveIdentity {
+    <#
+    .SYNOPSIS
+        True when canonicalising the path would still name the same object, segment by segment.
+    .DESCRIPTION
+        Internal to normalisation. Win32 preprocessing strips trailing dots and spaces from a path
+        component, so a name that carries one canonicalises onto a DIFFERENT, ordinary-looking
+        neighbour. The two hosts do not even agree on which characters: measured, a trailing
+        U+00A0 survives GetFullPath on PowerShell 7.6.5 (.NET 10) and is stripped by it on Windows
+        PowerShell 5.1 (.NET Framework). Asking each segment directly is what makes the answer the
+        same on both, instead of encoding a character list that is wrong on one of them.
+
+        Each segment is canonicalised ALONE, against a synthetic root, so the question asked is only
+        "does this name survive preprocessing" and not "where does the whole path lead".
+
+        Truncation is the danger and it has a signature: the canonical form is a strict PREFIX of
+        the segment, i.e. characters were dropped off the end. A wholly different spelling is the
+        other legitimate transformation - GetFullPath expands an 8.3 short name, measured
+        'PROGRA~1' -> 'Program Files' - and that names the SAME object under another real name,
+        which this project deliberately relies on so both sides of a comparison agree. Rejecting on
+        inequality alone would refuse every short-name path.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrEmpty($Path)) { return $false }
+
+    # Drop an extended-length prefix and a drive qualifier so only real name segments are asked
+    # about; neither is a filename and both would confuse the synthetic-root question below.
+    $body = $Path
+    if ($body.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) { $body = $body.Substring(4) }
+    if ($body -match '^[A-Za-z]:') { $body = $body.Substring(2) }
+
+    foreach ($segment in $body.Split([char[]]@('\', '/'))) {
+        # An empty segment is a separator run or a trailing separator, and '.'/'..' are navigation.
+        if ($segment -eq '' -or $segment -eq '.' -or $segment -eq '..') { continue }
+
+        try { $canonical = [System.IO.Path]::GetFullPath('C:\' + $segment) }
+        catch { return $false }
+
+        if ($canonical.Length -lt 3) { return $false }
+        $resolved = $canonical.Substring(3)
+
+        if ($resolved -ceq $segment) { continue }
+        if ($segment.StartsWith($resolved, [System.StringComparison]::Ordinal)) { return $false }
+    }
+
+    return $true
+}
+
 function Get-WacNormalizedPath {
     <#
     .SYNOPSIS
@@ -56,14 +105,20 @@ function Get-WacNormalizedPath {
     #
     # '.' and '..' are navigation rather than names; GetFullPath resolves them correctly and they
     # are left alone. A trailing separator is also normal and is handled further down.
-    $finalComponent = $Path.TrimEnd([char[]]@('\', '/'))
-    $separator = $finalComponent.LastIndexOfAny([char[]]@('\', '/'))
-    if ($separator -ge 0) { $finalComponent = $finalComponent.Substring($separator + 1) }
-    if ($finalComponent -ne '.' -and $finalComponent -ne '..' -and $finalComponent -match '[. ]$') {
-        return $null
-    }
+    #
+    # EVERY segment is checked, not only the last. An earlier version guarded the final component
+    # alone and two aliases walked straight through it, both measured to destroy the neighbour and
+    # report FilesDeleted=1:
+    #   * an intermediate segment - 'C:\root\dir.\victim.txt' canonicalised to
+    #     'C:\root\dir\victim.txt', so the delete went into the wrong DIRECTORY;
+    #   * a trailing U+00A0 NO-BREAK SPACE, a legal filename character that the whole-string
+    #     .Trim() below used to remove, renaming 'victim<U+00A0>' to 'victim'.
+    #
+    # The whole-string .Trim() is gone with it. Trimming a filesystem identity is never safe: what
+    # .NET calls whitespace includes characters Windows will happily store in a name.
+    if (-not (Test-WacPathSegmentsPreserveIdentity -Path $Path)) { return $null }
 
-    $candidate = $Path.Trim()
+    $candidate = $Path
 
     if ($candidate.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) {
         if ($candidate -match '^\\\\\?\\([A-Za-z]:\\.*)$') { $candidate = $Matches[1] }

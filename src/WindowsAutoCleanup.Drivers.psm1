@@ -221,6 +221,156 @@ function Invoke-WacPnpCleanHandler {
         -Outcome $outcome -Attempted $true -DurationMs ([int]$run.DurationMs) -Detail $detail))
 }
 
+function Resolve-WacDriverBackupPending {
+    <#
+    .SYNOPSIS
+        Settles the deletion attempts an earlier run recorded but could not prove, against the store
+        as it is NOW. Returns the counts it contributed and the directories it has spoken for.
+    .DESCRIPTION
+        A pending marker means pnputil was asked to remove a package and nobody established what
+        happened. Reboot-required is the ordinary way to get there: 3010 and 1641 say the removal
+        finishes at the next restart, so the run that saw them cannot observe it at all.
+
+        WHY IT RUNS HERE - in the prune step, after the store has been enumerated and before the
+        candidate list is used. The two ways a restart can end up are on opposite sides of the
+        per-candidate loop, so neither of them can be handled inside it:
+
+          the package went   - it is no longer enumerated, so it is no longer a candidate and
+                               nothing in that loop would ever reach its directory again. Its marker
+                               and its unstamped manifest would outlive the deletion they record for
+                               the life of the machine, and a recovery tool would read the only copy
+                               of a removed package as an export that never finished.
+          the package stayed - it IS a candidate again, and Export-WacDriverBackup refuses a
+                               directory carrying an unresolved attempt. Left to the loop, a known
+                               pending state would become a SecurityRefusal on every later run.
+
+        So the directories are settled first, and the ones still unresolved are withheld from the
+        loop by name. Nothing here re-exports or re-deletes anything: only a store postcondition of
+        Removed may commit, clear and count one, and Present or Unknown keep the export, keep the
+        marker and report Incomplete.
+
+        It asks Test-WacDriverPackageRemoved rather than re-reading the enumeration this step
+        already has, so the Removed/Present/Unknown rule lives in exactly one place. That costs one
+        extra enumeration per pending directory, which is zero on every healthy run: a marker only
+        exists while a deletion attempt is unresolved.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$PnpUtil,
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [string]$Component = 'DriverPrune'
+    )
+
+    $result = [PSCustomObject]@{
+        Count = 0; Deleted = 0; Incomplete = 0; Refused = 0; Failed = 0; Outcome = 'Succeeded'; Held = @()
+    }
+    $held = New-Object 'System.Collections.Generic.List[string]'
+
+    $child = @()
+    try {
+        $info = New-Object System.IO.DirectoryInfo((Get-WacLongPath -Path $BackupRoot))
+        $child = @($info.EnumerateDirectories() | ForEach-Object { [string]$_.Name })
+    }
+    catch {
+        # A root that cannot be listed has not been shown to hold nothing, and an unresolved
+        # deletion it hides is exactly the state that must not be forgotten.
+        $result.Incomplete = 1
+        $result.Outcome = 'Incomplete'
+        Write-WacLog -Level WARNING -Component $Component -Message 'The driver backup root could not be listed, so an earlier unresolved deletion cannot be ruled out.' -Data @{
+            root = $BackupRoot; kind = (Get-WacIoFailureKind -ErrorRecord $_)
+        }
+        return $result
+    }
+
+    foreach ($name in $child) {
+        $path = Join-Path -Path $BackupRoot -ChildPath $name
+        if (-not (Test-WacDriverBackupDeletePending -Path $path)) { continue }
+
+        $result.Count++
+        [void]$held.Add($name)
+
+        # Asked in its own right and BEFORE its manifest is read, for the reason Export-WacDriverBackup
+        # gives: a directory a standard user can rewrite must not be allowed to name the package
+        # this run then confirms and commits.
+        $trust = Test-WacStatePathIsTrusted -Path $path
+        if (-not $trust.IsTrusted) {
+            $result.Refused++
+            $result.Outcome = Get-WacHigherOutcome -Current $result.Outcome -Candidate 'SecurityRefusal'
+            Write-WacLog -Level ERROR -Component $Component -Message 'An unresolved deletion attempt sits in a directory that is not machine-trusted; it was left untouched.' -Data @{
+                directory = $path; reason = [string]$trust.Reason
+            }
+            continue
+        }
+
+        $manifest = $null
+        try {
+            $manifest = [System.IO.File]::ReadAllText((Get-WacLongPath -Path (Join-Path -Path $path -ChildPath $script:BackupManifestName))) |
+                ConvertFrom-Json -ErrorAction Stop
+        }
+        catch { $manifest = $null }
+
+        $driverName = ''
+        if ($null -ne $manifest -and (@($manifest.PSObject.Properties.Name) -ccontains 'DriverName')) {
+            $driverName = [string]$manifest.DriverName
+        }
+
+        if ([string]::IsNullOrWhiteSpace($driverName)) {
+            # An attempt that cannot even name its package can be neither settled nor reclaimed by
+            # any rule: it may be the only copy of something that is gone, and nothing on disk says
+            # what. That is the state Test-WacDriverBackupIsResidue already refuses through
+            # Export-WacDriverBackup, and it keeps refusing here rather than being downgraded to a
+            # merely incomplete run just because this function looked at the directory first.
+            $result.Refused++
+            $result.Outcome = Get-WacHigherOutcome -Current $result.Outcome -Candidate 'SecurityRefusal'
+            Write-WacLog -Level ERROR -Component $Component -Message 'An unresolved deletion attempt carries no readable package name, so it cannot be settled automatically.' -Data @{ directory = $path }
+            continue
+        }
+
+        $confirm = Test-WacDriverPackageRemoved -PnpUtil $PnpUtil -DriverName $driverName `
+            -TimeoutMs (Get-WacStepTimeoutMs -RequestedMs $script:PnpUtilTimeoutMs) -Component $Component
+
+        if ([string]$confirm.State -cne 'Removed') {
+            # Present means the restart has not happened or did not remove it; Unknown means the
+            # store could not be read. Both keep the export and the marker, and both are Incomplete:
+            # the attempt is still unresolved and only a later Removed may ever settle it.
+            $result.Incomplete++
+            $result.Outcome = Get-WacHigherOutcome -Current $result.Outcome -Candidate 'Incomplete'
+            Write-WacLog -Level WARNING -Component $Component -Message 'An earlier deletion attempt is still unresolved against the driver store.' -Data @{
+                driver = $driverName; directory = $path; state = [string]$confirm.State; reason = [string]$confirm.Reason
+            }
+            continue
+        }
+
+        # Read back off disk, so the two hosts must be normalised before it is written again:
+        # ConvertFrom-Json leaves an ISO-8601 string alone on Windows PowerShell 5.1 and parses it
+        # into a [datetime] on PowerShell 7, and Complete-WacDriverBackup serialises the object it
+        # is handed. Without this the commit would rewrite CreatedUtc in a different form on one
+        # host - the same trap Complete-WacDriverBackup avoids by never re-reading its own file.
+        foreach ($stampName in @('CreatedUtc', 'DeletedUtc')) {
+            if (@($manifest.PSObject.Properties.Name) -cnotcontains $stampName) { continue }
+            if ($manifest.$stampName -is [datetime]) {
+                $manifest.$stampName = ([datetime]$manifest.$stampName).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            }
+        }
+
+        if (-not (Complete-WacDriverBackup -Path $path -Manifest $manifest)) {
+            $result.Failed++
+            $result.Outcome = Get-WacHigherOutcome -Current $result.Outcome -Candidate 'Failed'
+            Write-WacLog -Level ERROR -Component $Component -Message 'A package proved gone could not have its backup committed; the export is protected and needs manual recovery.' -Data @{
+                driver = $driverName; directory = $path
+            }
+            continue
+        }
+
+        $result.Deleted++
+        Write-WacLog -Level INFO -Component $Component -Message 'An earlier deletion is now proved against the store; its backup was committed.' -Data @{
+            driver = $driverName; directory = $path
+        }
+    }
+
+    $result.Held = @($held.ToArray())
+    return $result
+}
+
 function Invoke-WacDriverPackagePrune {
     <#
     .SYNOPSIS
@@ -242,16 +392,18 @@ function Invoke-WacDriverPackagePrune {
         been read back, so from the moment a removal becomes possible the directory is protected
         from reclamation whatever happens next.
 
-        An exit code never decides what happened to the store. Every attempt that STARTED is
-        followed by a bounded confirming enumeration - a documented success, the benign 259 and an
-        undocumented non-zero alike - and only that answer clears the marker, reclaims the export or
-        advances a count: Removed commits the backup, Present clears or reclaims it now that the
-        non-deletion is proved, and Unknown keeps both the marker and the export and returns
-        Incomplete. Reboot-required codes are the sole exception, because there the package is
-        legitimately still enumerable until the restart. deleted and a clean outcome therefore
-        advance only from a proven store postcondition PLUS a durable commit; a process that never
-        started, a killed one, a result with no readable exit code, a commit that failed and a
-        removal that happened behind an undocumented exit code are all Incomplete or Failed.
+        An exit code never decides what happened to the store. EVERY attempt that STARTED is
+        followed by a bounded confirming enumeration - a documented success, a reboot-required
+        3010/1641, the benign 259 and an undocumented non-zero alike - and only that answer clears
+        the marker, reclaims the export or advances a count: Removed commits the backup, Present
+        clears or reclaims it now that the non-deletion is proved, and Unknown keeps both the marker
+        and the export and returns Incomplete. A reboot-required code that leaves the package listed
+        is the one Present that keeps its export: the restart may still remove it, so the attempt is
+        unresolved rather than refuted, and Resolve-WacDriverBackupPending settles it on a later
+        run. deleted and a clean outcome therefore advance only from a proven store postcondition
+        PLUS a durable commit; a process that never started, a killed one, a result with no readable
+        exit code, a commit that failed and a removal that happened behind an undocumented exit code
+        are all Incomplete or Failed.
 
         /force, /uninstall and /reboot are never passed: they would delete a package in use, rip a
         driver off live devices, or restart the machine.
@@ -308,28 +460,30 @@ function Invoke-WacDriverPackagePrune {
             -Detail ('The driver backup root is not machine-trusted, so nothing was exported or deleted. {0}' -f [string]$rootTrust.Reason)))
     }
 
-    # REPORTED, not refused. Measured on a stock Windows 11: C:\ProgramData carries an inherited
-    # BUILTIN\Users:(CI)(WD,AD,WEA,WA), so a standard user can create NEW content under the data
-    # root on every default machine. Refusing on that would refuse this step forever on a healthy
-    # install, which is not a finding. Creating a new name is also not replacing an existing one -
-    # that is the grant the walk above does refuse - and every export is content-addressed, hashed
-    # and re-verified against its own manifest before a package is removed.
+    # REFUSED now, not reported. An export is the only copy of a package about to be deleted, so a
+    # principal who can create a NAME here can plant wac-driver-backup.json, the pending marker or
+    # the commit file before this step writes them. Warning and continuing was the old behaviour and
+    # it was not a guard. Get-WacDriverBackupRoot is what makes refusing affordable: the default
+    # root moved off %ProgramData%, whose inherited BUILTIN\Users grant no healthy install can shed,
+    # onto %SystemRoot%\Logs, measured to report Writers=[]. A caller naming its own root gets the
+    # same rule rather than an exemption.
     if (@($rootTrust.Writers).Count -gt 0) {
-        Write-WacLog -Level WARNING -Component $component -Message 'Non-administrative principals can create content in the driver backup root.' -Data @{
-            root = $normalizedBackupRoot; writers = (@($rootTrust.Writers) -join ', ')
-        }
+        return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
+            -Outcome 'SecurityRefusal' -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
+            -Detail ('Non-administrative principals can create content in the driver backup root, so an export there cannot be trusted as the only copy of a deleted package. Nothing was exported or deleted. root={0} writers={1}' -f `
+                $normalizedBackupRoot, (@($rootTrust.Writers) -join ', '))))
     }
 
-    try {
-        if (-not (Test-Path -LiteralPath $normalizedBackupRoot -PathType Container)) {
-            [void](New-Item -Path $normalizedBackupRoot -ItemType Directory -Force -ErrorAction Stop)
-        }
-    }
-    catch {
+    # Created through the pinned-handle primitive, never Test-Path then New-Item -Force: -Force
+    # ADOPTS a directory that appeared after the walk above, which is precisely the race. A name
+    # that already exists comes back as a collision and is refused rather than taken over.
+    $backupDirectory = Open-WacTrustedDirectory -Path $normalizedBackupRoot -RequireMachineTrust
+    if (-not $backupDirectory.IsTrusted) {
         return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
-            -Outcome 'SafeSkip' -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
-            -Detail ('The backup directory could not be created ({0}): {1}' -f (Get-WacIoFailureKind -ErrorRecord $_), $_.Exception.Message)))
+            -Outcome 'SecurityRefusal' -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
+            -Detail ('The driver backup root could not be created or proved, so nothing was exported or deleted. {0}' -f [string]$backupDirectory.Reason)))
     }
+    Close-WacTrustedDirectory -Handle $backupDirectory.Handle
 
     $enumTimeoutMs = Get-WacStepTimeoutMs -RequestedMs $script:PnpUtilTimeoutMs
     if ($enumTimeoutMs -le 0) {
@@ -362,33 +516,49 @@ function Invoke-WacDriverPackagePrune {
     }
 
     $enumerated = @($parsed.Driver).Count
+
+    # Before the candidate list is used, because a package whose removal completed at a restart is
+    # no longer in that list at all. See Resolve-WacDriverBackupPending for the whole argument.
+    $pending = Resolve-WacDriverBackupPending -PnpUtil $pnputil -BackupRoot $normalizedBackupRoot -Component $component
+
     $candidates = @(Get-WacSupersededDriver -Driver $parsed.Driver)
-    if ($candidates.Count -eq 0) {
+    if ($candidates.Count -eq 0 -and $pending.Count -eq 0) {
         return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
             -Outcome 'Succeeded' -Attempted $true -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
             -Detail ('{0} driver package(s) enumerated, {1} dropped as incomplete; no package is both superseded and installed on nothing.' -f $enumerated, $parsed.DroppedRow)))
     }
 
-    Write-WacLog -Level INFO -Component $component -Message 'Superseded driver packages found.' -Data @{
-        candidates = $candidates.Count; enumerated = $enumerated; dropped = $parsed.DroppedRow
+    if ($candidates.Count -gt 0) {
+        Write-WacLog -Level INFO -Component $component -Message 'Superseded driver packages found.' -Data @{
+            candidates = $candidates.Count; enumerated = $enumerated; dropped = $parsed.DroppedRow
+        }
     }
 
-    $deleted = 0
+    $deleted = [int]$pending.Deleted
     $skipped = 0
-    $refused = 0
-    $incomplete = 0
-    $failed = 0
+    $refused = [int]$pending.Refused
+    $incomplete = [int]$pending.Incomplete
+    $failed = [int]$pending.Failed
     $rebootRequired = $false
-    $outcome = 'Succeeded'
+    $outcome = [string]$pending.Outcome
 
-    foreach ($candidate in $candidates) {
+    # Indexed rather than foreach so the remaining count is read off the position instead of being
+    # derived by subtracting the counters, which no longer start at zero.
+    for ($index = 0; $index -lt $candidates.Count; $index++) {
+        $candidate = $candidates[$index]
+
         if (Test-WacDeadlineExpired) {
-            $remaining = $candidates.Count - $deleted - $skipped - $refused - $incomplete - $failed
+            $remaining = $candidates.Count - $index
             $incomplete += $remaining
             $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
             Write-WacLog -Level WARNING -Component $component -Message 'The run deadline expired mid-prune.' -Data @{ remaining = $remaining }
             break
         }
+
+        # Spoken for by the reconciliation above: its directory carries an attempt nobody has
+        # settled, so this run neither exports it again nor asks pnputil to remove it again - and it
+        # is not counted twice either, because the reconciliation already reported it.
+        if (@($pending.Held) -contains (Get-WacDriverBackupIdentity -Driver $candidate).Name) { continue }
 
         $backup = Export-WacDriverBackup -PnpUtil $pnputil -Driver $candidate -BackupRoot $normalizedBackupRoot `
             -EnumeratedPackage $enumerated -Component $component
@@ -464,23 +634,26 @@ function Invoke-WacDriverPackagePrune {
             continue
         }
 
-        # THE POSTCONDITION, and it runs for EVERY attempt that started. An exit code is what the
-        # TOOL believes; only the store can say what a mutating process actually left behind, and
-        # 259 and an undocumented non-zero are exactly as unproven as a reported success. The one
-        # code class that skips it is reboot-required: there the removal completes at the next
-        # restart, so the package is legitimately still enumerable and Present would be a false
-        # alarm that failed every such run.
+        # THE POSTCONDITION, and it runs for EVERY attempt that started - with no exceptions left.
+        # An exit code is what the TOOL believes; only the store can say what a mutating process
+        # actually left behind, and 259, an undocumented non-zero and a reboot-required 3010/1641
+        # are exactly as unproven as a reported success. Reboot-required used to skip this on the
+        # argument that the package is legitimately still enumerable until the restart. That is
+        # true, and it is not a reason to assert a removal nobody observed: the same code with the
+        # same store answer is also what a removal that never happens looks like. So the check runs,
+        # and it is the ANSWER that is read differently below - a reboot-required Present keeps its
+        # export instead of reclaiming it, because the restart may still remove the package.
         $rebootPending = $script:PnpUtilRebootCode -contains $delete.ExitCode
         $reportedSuccess = $script:PnpUtilSuccessCode -contains $delete.ExitCode
 
-        $state = 'Removed'
-        $confirmReason = ''
-        if (-not $rebootPending) {
-            $confirm = Test-WacDriverPackageRemoved -PnpUtil $pnputil -DriverName $candidate.DriverName `
-                -TimeoutMs (Get-WacStepTimeoutMs -RequestedMs $script:PnpUtilTimeoutMs) -Component $component
-            $state = [string]$confirm.State
-            $confirmReason = [string]$confirm.Reason
-        }
+        $confirm = Test-WacDriverPackageRemoved -PnpUtil $pnputil -DriverName $candidate.DriverName `
+            -TimeoutMs (Get-WacStepTimeoutMs -RequestedMs $script:PnpUtilTimeoutMs) -Component $component
+        $state = [string]$confirm.State
+        $confirmReason = [string]$confirm.Reason
+
+        # Reported by the tool, not derived from a count: a restart is what resolves this attempt,
+        # so the operator needs to be told about it whether or not the removal could be proved yet.
+        if ($rebootPending) { $rebootRequired = $true }
 
         if ($state -cne 'Removed' -and $state -cne 'Present') {
             # Whether it went cannot be established. The marker STAYS and the export is kept: it may
@@ -494,6 +667,21 @@ function Invoke-WacDriverPackagePrune {
         }
 
         if ($state -ceq 'Present') {
+            if ($rebootPending) {
+                # 3010/1641 and the package still listed. Present here is NOT a refuted removal: the
+                # documented meaning of the code is that the store loses the package at the next
+                # restart, and this run cannot see past that. So nothing is counted, nothing is
+                # reclaimed, and the export and its marker STAY - they are what
+                # Resolve-WacDriverBackupPending settles on the first run after the restart, and
+                # without them a removal that really happened would leave no recoverable copy.
+                $incomplete++
+                $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
+                Write-WacLog -Level WARNING -Component $component -Message 'pnputil asked for a restart and the package is still in the store, so the removal is pending that restart and was not counted.' -Data @{
+                    driver = $candidate.DriverName; exitCode = $delete.ExitCode; backup = $backup.Directory
+                }
+                continue
+            }
+
             # The package is provably still installed, so this export is a copy of a live package
             # and not the only copy of anything. Whatever is done with it, it is done only now that
             # the store has been asked - and the marker never outlives a proven non-deletion,
@@ -528,11 +716,12 @@ function Invoke-WacDriverPackagePrune {
             continue
         }
 
-        # The package is gone - proved against the store, or pending the restart a reboot-required
-        # code promises. The stamp is what makes this directory a backup rather than a copy, and it
-        # is written atomically. Only once it is durable does the count advance and the marker come
-        # off; a commit that failed leaves a removed package behind a protected export, which is a
-        # failed run and not a deletion anyone may call successful.
+        # The package is gone, and the STORE is what says so - the exit code, reboot-required
+        # included, only ever said what the tool believed. The stamp is what makes this directory a
+        # backup rather than a copy, and it is written atomically. Only once it is durable does the
+        # count advance and the marker come off; a commit that failed leaves a removed package
+        # behind a protected export, which is a failed run and not a deletion anyone may call
+        # successful.
         if (-not (Complete-WacDriverBackup -Path $backup.Directory -Manifest $backup.Manifest)) {
             $failed++
             $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed'
@@ -543,7 +732,6 @@ function Invoke-WacDriverPackagePrune {
         }
 
         $deleted++
-        if ($rebootPending) { $rebootRequired = $true }
 
         if (-not $reportedSuccess) {
             # The store says the package is gone and the tool said something outside its documented
@@ -567,8 +755,8 @@ function Invoke-WacDriverPackagePrune {
     return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
         -Outcome $outcome -Attempted $true -RebootRequired $rebootRequired `
         -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
-        -Detail ('candidates={0} deleted={1} skipped={2} refused={3} incomplete={4} failed={5} enumerated={6} backup={7}' -f `
-            $candidates.Count, $deleted, $skipped, $refused, $incomplete, $failed, $enumerated, $normalizedBackupRoot)))
+        -Detail ('candidates={0} deleted={1} skipped={2} refused={3} incomplete={4} failed={5} pending={6} enumerated={7} backup={8}' -f `
+            $candidates.Count, $deleted, $skipped, $refused, $incomplete, $failed, $pending.Count, $enumerated, $normalizedBackupRoot)))
 }
 
 Export-ModuleMember -Function @(

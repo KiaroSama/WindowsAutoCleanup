@@ -667,13 +667,81 @@ Test-Case 'the backup trust rule is Core''s state-path walk, not a second copy l
     Assert-Equal 0 @($errors).Count 'the driver package no longer parses'
     $code = @(@($tokens) | Where-Object { $_.Kind -ne 'Comment' } | ForEach-Object { $_.Text })
 
-    # Two call sites, and both of them are load-bearing: the persistent root, and each existing
-    # identity directory inside it.
-    Assert-Equal 2 @($code | Where-Object { $_ -eq 'Test-WacStatePathIsTrusted' }).Count `
-        'the backup-root and identity-directory trust gates are not both delegating to Core''s walk'
+    # Three call sites, every one of them load-bearing: the persistent root, each existing identity
+    # directory inside it, and - added with the cross-run reconciliation of a pending deletion -
+    # each directory still holding an unresolved marker, asked BEFORE its manifest is read so a
+    # directory a standard user can rewrite cannot name the package that run then commits.
+    #
+    # The count is deliberately exact so a silently removed gate cannot pass. Raising it is a
+    # decision, not a formality: a later change may only do so together with the gate that earns it.
+    Assert-Equal 3 @($code | Where-Object { $_ -eq 'Test-WacStatePathIsTrusted' }).Count `
+        'the backup-root, identity-directory and pending-reconciliation trust gates are not all delegating to Core''s walk'
     foreach ($forbidden in @('GetAccessRules', 'GetOwner', 'Get-Acl')) {
         Assert-Equal 0 @($code | Where-Object { $_ -eq $forbidden }).Count `
             ('the driver package is deciding {0} for itself instead of delegating to Core' -f $forbidden)
+    }
+}
+
+Test-Case 'The backup root is somewhere a standard user cannot create a name, and it is not the data root' {
+    <#
+        The rule the brief asked for is "Writers must be empty", and the only lever this project has
+        for it is WHERE the root is: rewriting an ACL is banned and a test fails the build if
+        Set-Acl, SetOwner, icacls or takeown reappears.
+
+        So the assertion is about the location, and about the two things that make it the right one:
+        it is not under the data root, whose inherited BUILTIN\Users grant no healthy install can
+        shed, and it is not the deployment root's fallback, which the installer swaps out on upgrade
+        and would take the only copy of a deleted package with it.
+    #>
+    $backup = Get-WacDriverBackupRoot
+    $data = Get-WacDataRoot
+    $deployment = Get-WacDeploymentRoot
+
+    Assert-False ($backup.StartsWith($data + '\', [System.StringComparison]::OrdinalIgnoreCase)) `
+        ('the backup root is still under the data root: ' + $backup)
+    Assert-False ($backup -ieq $deployment) 'the backup root is the deployment root'
+    Assert-False ($backup.StartsWith($deployment + '\', [System.StringComparison]::OrdinalIgnoreCase)) `
+        'the backup root sits inside the deployment tree the installer replaces on upgrade'
+    Assert-True ($backup.StartsWith($env:SystemRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) `
+        ('the backup root left the Windows directory entirely: ' + $backup)
+
+    # The legacy location is still NAMED, because an unresolved deletion left there must never
+    # become invisible - but it is only ever reported, and it is not where anything is written now.
+    Assert-False ((Get-WacLegacyDriverBackupRoot) -ieq $backup) 'the legacy root and the new root are the same path'
+}
+
+Test-Case 'A backup root a standard user can create names in is refused, not merely warned about' {
+    <#
+        This shipped as a WARNING and a continue, which is not a guard: a principal who can create a
+        name in the backup root can plant wac-driver-backup.json, the pending marker or the commit
+        file before the step writes them, and the export is then not the only copy of anything.
+
+        The refusal is only affordable because the root moved (see the case above). Asserting it
+        against a directory whose Writers are non-empty is the whole point - on the old root every
+        healthy machine looked like this.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'dr-writers'
+    try {
+        $root = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+        [void][System.IO.Directory]::CreateDirectory($root)
+
+        $result = Invoke-WithStubbedTool -Body {
+            # Trusted in every other respect, but a non-administrator can create names here.
+            Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacStatePathIsTrusted' -Body {
+                param($Path)
+                [PSCustomObject]@{ Path = $Path; IsTrusted = $true; Reason = 'stub'; Writers = @('S-1-5-32-545') }
+            }
+            Invoke-WacDriverPackagePrune -Enabled -BackupRoot $root
+        }
+
+        Assert-Equal 'SecurityRefusal' ([string]$result.Outcome) `
+            'a backup root a standard user can create names in was accepted'
+        Assert-True ($result.Detail -match 'S-1-5-32-545') 'the refusal does not name the principal that caused it'
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue).Count `
+            'the refused root was written into anyway'
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
     }
 }
 

@@ -283,11 +283,21 @@ function Invoke-WacDriverPackagePrune {
     param([switch]$Enabled, [string]$BackupRoot)
     $null = $Enabled
 
-    # No driver is touched here, but the directory IS created, because that is the state a later
-    # run has to stay benign over: the shipped step creates its backup root under the machine-wide
-    # data root before it exports anything, and a directory left behind by run 1 is exactly the
-    # shape of the defect that made run 2 refuse.
-    if ($BackupRoot) { [void][System.IO.Directory]::CreateDirectory($BackupRoot) }
+    # No driver is touched here, but a backup directory IS left behind, because that is the state a
+    # later run has to stay benign over: a directory left by run 1 is exactly the shape of the
+    # defect that made run 2 refuse.
+    #
+    # It is created under the REDIRECTED data root, not under the root the caller passed. The
+    # shipped backup root moved to %SystemRoot%\Logs so that no non-administrator can create a name
+    # beside an export, and this rig deliberately does not redirect %SystemRoot% - Windows
+    # PowerShell 5.1 compiles Add-Type through csc.exe under the real one, and redirecting it breaks
+    # every run in this suite. So the caller's root is a real, administrators-only machine path that
+    # an unelevated suite cannot create and MUST NOT try to: doing so threw an unhandled error and
+    # took the whole run's exit code with it, and on an elevated runner it would have quietly
+    # written into the live machine instead of the sandbox.
+    $null = $BackupRoot
+    $residue = Join-Path -Path (Get-WacDataRoot) -ChildPath 'DriverBackup'
+    try { [void][System.IO.Directory]::CreateDirectory($residue) } catch { $null = $_ }
 
     return (New-WacTestDriverStepResult -Category 'Driver package prune' -Outcome ([string](Get-WacTestPlan).pruneOutcome))
 }

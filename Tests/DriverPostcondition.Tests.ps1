@@ -17,9 +17,11 @@
                                                      marker STAY, because it may be the only copy
                                                      left of something that is already gone
 
-    A reboot-required exit code (3010 / 1641) deliberately SKIPS the check: the removal finishes at
-    the next restart, so the package is legitimately still listed and 'Present' would be a false
-    alarm that failed every such run.
+    A reboot-required exit code (3010 / 1641) is confirmed like every other started attempt, and it
+    is the ANSWER that is read differently. The removal does finish at the next restart, so a
+    package the store still lists is not a refuted deletion - but it is not a proved one either, and
+    it used to be counted as one on the exit code alone. It is now Incomplete with its export and
+    marker kept, and Resolve-WacDriverBackupPending settles it on the first run after the restart.
 
     No real pnputil ever runs. Everything goes through Core's injected process invoker, and the
     fixture models the store rather than replaying one enumeration - a package it really removed
@@ -136,34 +138,6 @@ Test-Case 'a removal that cannot be confirmed is Incomplete, and the only possib
             Assert-Equal 1 $left.Count 'the only possible copy of a maybe-removed package was thrown away'
             Assert-True (Test-Path -LiteralPath (Join-Path -Path $left[0].FullName -ChildPath $script:PendingName)) `
                 'the pending marker came off while the removal was still unproven'
-        }
-    }
-    finally {
-        Remove-TestSandbox -Path $sandbox
-    }
-}
-
-Test-Case 'a reboot-required removal skips the check, because the package is legitimately still listed' {
-    $sandbox = New-TestSandbox -Prefix 'dr-post-reboot'
-    try {
-        $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
-        $xml = New-PnpUtilDriverXml -Row (New-SupersededPair)
-
-        Invoke-WithStubbedTool -Body {
-            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
-            # 3010 is ERROR_SUCCESS_REBOOT_REQUIRED: the removal completes at the next restart, so
-            # the fixture leaves the package listed exactly as a real store would.
-            $script:StubResult['/delete-driver'] = @{ ExitCode = 3010 }
-
-            $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
-
-            Assert-Equal 'Succeeded' $result.Outcome $result.Detail
-            Assert-True ($result.Detail -match 'deleted=1') ('a reboot-pending removal was not counted: {0}' -f $result.Detail)
-            Assert-True $result.RebootRequired 'the run did not report that a reboot is required'
-
-            # Exactly two enumerations would mean the postcondition ran anyway. It must not.
-            $enumerations = @($script:StubCall | Where-Object { @($_.Arguments).Count -gt 0 -and $_.Arguments[0] -eq '/enum-drivers' })
-            Assert-Equal 1 $enumerations.Count 'the postcondition ran for a reboot-pending removal and would have failed it'
         }
     }
     finally {
@@ -463,15 +437,24 @@ Test-Case 'an undocumented non-zero exit with an unreadable confirmation keeps t
         Assert-True (Test-Path -LiteralPath (Join-Path -Path $left[0].FullName -ChildPath $script:PendingName)) `
             'the marker came off although whether the package went is unknown'
 
-        # NOT a benign steady state, and the refusal that follows is the design: an unresolved
-        # deletion attempt has to keep protecting its directory until a human settles it.
+        # NOT a benign steady state: the attempt stays unresolved and the directory stays protected
+        # until a human settles it. It is reported as Incomplete rather than SecurityRefusal because
+        # the reconciliation now owns every directory carrying a marker - it re-asks the store, and
+        # an unresolved deletion is an incomplete run, not a security boundary that failed. The
+        # refusal it used to produce came from Export-WacDriverBackup being handed the candidate,
+        # which is exactly what the reconciliation withholds.
         Invoke-WithStubbedTool -Body {
             $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
             $second = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
 
-            Assert-Equal 'SecurityRefusal' $second.Outcome $second.Detail
+            Assert-Equal 'Incomplete' $second.Outcome $second.Detail
+            Assert-True ($second.Detail -match 'pending=1') $second.Detail
             Assert-Equal 0 @(Get-DeleteCall).Count 'a package was deleted although an earlier attempt on it is unresolved'
+            Assert-Equal 0 @(Get-ExportCall).Count 'a package was exported again although an earlier attempt on it is unresolved'
         }
+
+        Assert-True (Test-Path -LiteralPath (Join-Path -Path $left[0].FullName -ChildPath $script:PendingName)) `
+            'the second run cleared the marker of an attempt that is still unresolved'
     }
     finally {
         Remove-TestSandbox -Path $sandbox
@@ -540,6 +523,206 @@ Test-Case 'a 259 the store agrees with leaves the next run benign over the same 
 
             Assert-Equal 0 @(Get-ChildItem -LiteralPath $backupRoot -Recurse -Filter $script:PendingName -File).Count `
                 ('{0} left a pending marker behind after an attempt the store proved removed nothing' -f $pass)
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# A reboot-required exit code is confirmed like every other started attempt
+# ---------------------------------------------------------------------------------------------
+
+function Get-BackupStamp {
+    <#
+    .SYNOPSIS
+        The DeletedUtc a backup directory records, or '' when it carries none. Normalised, because
+        ConvertFrom-Json leaves an ISO-8601 string alone on 5.1 and returns a [datetime] on 7.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $manifestPath = Join-Path -Path $Path -ChildPath $script:ManifestName
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return '' }
+
+    $manifest = [System.IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
+    if (@($manifest.PSObject.Properties.Name) -cnotcontains 'DeletedUtc') { return '' }
+
+    $stamp = $manifest.DeletedUtc
+    if ($stamp -is [datetime]) { $stamp = ([datetime]$stamp).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    return [string]$stamp
+}
+
+Test-Case 'a reboot-required exit is confirmed against the store in all three of its answers' {
+    # 3010 (ERROR_SUCCESS_REBOOT_REQUIRED) and 1641 (ERROR_SUCCESS_REBOOT_INITIATED) used to skip
+    # the postcondition outright: state was initialised to Removed, the backup was committed and
+    # deleted= advanced on the exit code alone, while the package could still be sitting in the
+    # store. The code says a RESTART is needed. It does not say the store has already lost anything.
+    $case = @(
+        @{ Name = 'the store has already lost it'; Removes = $true; Unreadable = $false
+           Outcome = 'Succeeded'; Match = 'deleted=1 skipped=0 refused=0 incomplete=0'; Marker = $false; Stamped = $true },
+        @{ Name = 'the store still lists it'; Removes = $false; Unreadable = $false
+           Outcome = 'Incomplete'; Match = 'deleted=0 skipped=0 refused=0 incomplete=1'; Marker = $true; Stamped = $false },
+        @{ Name = 'the store could not be read'; Removes = $false; Unreadable = $true
+           Outcome = 'Incomplete'; Match = 'deleted=0 skipped=0 refused=0 incomplete=1'; Marker = $true; Stamped = $false }
+    )
+
+    foreach ($code in @(1641, 3010)) {
+        foreach ($entry in $case) {
+            $label = '{0} and {1}' -f $code, $entry['Name']
+            $sandbox = New-TestSandbox -Prefix 'dr-post-reboot'
+            try {
+                $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+                $xml = New-PnpUtilDriverXml -Row (New-SupersededPair)
+
+                Invoke-WithStubbedTool -Body {
+                    $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+                    Set-DeleteOutcome -ExitCode $code -StoreRemoves:([bool]$entry['Removes']) -ConfirmUnreadable:([bool]$entry['Unreadable'])
+
+                    $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+                    $enumeration = @(Get-EnumerationCall)
+                    Assert-Equal 2 $enumeration.Count ('{0}: the postcondition was skipped for a reboot-required exit' -f $label)
+
+                    # Order is load-bearing: confirming before the deletion would prove nothing.
+                    $delete = @(Get-DeleteCall)
+                    Assert-Equal 1 $delete.Count ('{0}: the wrong number of deletions ran' -f $label)
+                    Assert-True ($script:StubCall.IndexOf($delete[0]) -lt $script:StubCall.IndexOf($enumeration[1])) `
+                        ('{0}: the confirming enumeration ran before the deletion' -f $label)
+
+                    Assert-Equal $entry['Outcome'] $result.Outcome ('{0}: {1}' -f $label, $result.Detail)
+                    Assert-True ($result.Detail -match $entry['Match']) ('{0}: {1}' -f $label, $result.Detail)
+                    Assert-True ($result.Detail -match 'pending=0') ('{0}: {1}' -f $label, $result.Detail)
+
+                    # Reported from what the tool asked for, not from what could be proved: a
+                    # restart is what resolves the attempt either way.
+                    Assert-True $result.RebootRequired ('{0}: the run did not report that a reboot is required' -f $label)
+                }
+
+                # The export is kept in every one of the three. Two of them are unresolved and it
+                # may be the only copy of something that is already gone; the third is committed.
+                $left = @(Get-BackupDirectory -Root $backupRoot)
+                Assert-Equal 1 $left.Count ('{0}: the wrong number of exports was kept' -f $label)
+                Assert-Equal $entry['Marker'] (Test-Path -LiteralPath (Join-Path -Path $left[0].FullName -ChildPath $script:PendingName)) `
+                    ('{0}: the pending marker is in the wrong state' -f $label)
+                Assert-Equal $entry['Stamped'] (-not [string]::IsNullOrWhiteSpace((Get-BackupStamp -Path $left[0].FullName))) `
+                    ('{0}: the manifest stamp is in the wrong state' -f $label)
+            }
+            finally {
+                Remove-TestSandbox -Path $sandbox
+            }
+        }
+    }
+}
+
+Test-Case 'a reboot-pending package that is gone after the restart is committed by the next run' {
+    # The cross-run half. Run 1 sees 3010 with the package still listed and can prove nothing, so it
+    # keeps the export and the marker. After the restart the package is no longer enumerated at all,
+    # so it is no longer a candidate - nothing in the per-candidate loop would ever reach its
+    # directory again, and without the reconciliation the marker and the unstamped manifest would
+    # outlive the deletion they record for the life of the machine.
+    $sandbox = New-TestSandbox -Prefix 'dr-post-reboot-recover'
+    try {
+        $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+        $xml = New-PnpUtilDriverXml -Row (New-SupersededPair)
+        $afterRestart = Remove-StubDriverFromXml -Xml $xml -DriverName 'oem1.inf'
+
+        Invoke-WithStubbedTool -Body {
+            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+            Set-DeleteOutcome -ExitCode 3010
+
+            $first = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+            Assert-Equal 'Incomplete' $first.Outcome $first.Detail
+            Assert-True ($first.Detail -match 'candidates=1 deleted=0') $first.Detail
+        }
+
+        $left = @(Get-BackupDirectory -Root $backupRoot)
+        Assert-Equal 1 $left.Count 'run 1 threw away the export of a removal pending a restart'
+        $exportPath = $left[0].FullName
+        Assert-True (Test-Path -LiteralPath (Join-Path -Path $exportPath -ChildPath $script:PendingName)) `
+            'run 1 cleared the marker of an unproved removal'
+
+        # Run 2 is the first run after the restart. The store has lost the package.
+        Invoke-WithStubbedTool -Body {
+            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $afterRestart }
+
+            $second = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+            Assert-Equal 'Succeeded' $second.Outcome ('run 2 after the restart was not benign: {0}' -f $second.Detail)
+            Assert-True ($second.Detail -match 'candidates=0 deleted=1') ('run 2 did not settle the pending deletion: {0}' -f $second.Detail)
+            Assert-True ($second.Detail -match 'pending=1') $second.Detail
+            Assert-False $second.RebootRequired 'run 2 still asked for a restart that has already happened'
+
+            # Reconciled, not redone: one enumeration to read the store and one to confirm the
+            # pending package, and no /export-driver or /delete-driver at all.
+            Assert-Equal 2 @(Get-EnumerationCall).Count 'run 2 did not confirm the pending deletion against the store'
+            Assert-Equal 0 @(Get-DeleteCall).Count 'run 2 asked pnputil to remove a package again'
+            Assert-Equal 0 @(Get-ExportCall).Count 'run 2 exported a package again'
+        }
+
+        Assert-Equal 1 @(Get-BackupDirectory -Root $backupRoot).Count 'the committed backup was thrown away'
+        Assert-False (Test-Path -LiteralPath (Join-Path -Path $exportPath -ChildPath $script:PendingName)) `
+            'the marker survived a deletion the store has now proved'
+        Assert-True (-not [string]::IsNullOrWhiteSpace((Get-BackupStamp -Path $exportPath))) `
+            'the backup of a proved removal was never stamped, so a later run may reclaim it'
+
+        # Run 3 over the same persistent state: nothing pending, nothing enumerated, nothing to do.
+        Invoke-WithStubbedTool -Body {
+            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $afterRestart }
+
+            $third = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+            Assert-Equal 'Succeeded' $third.Outcome ('run 3 over a settled backup was not benign: {0}' -f $third.Detail)
+            Assert-Equal 1 @(Get-EnumerationCall).Count 'run 3 re-confirmed a deletion that is already committed'
+            Assert-Equal 0 @(Get-DeleteCall).Count $third.Detail
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a reboot-pending package that is still there after the restart stays a stable Incomplete' {
+    # The other side of the same state, and the invariant that has shipped broken twice: a package
+    # the restart did not remove must keep being reported, and it must never escalate into a
+    # SecurityRefusal. Export-WacDriverBackup refuses a directory carrying an unresolved attempt, so
+    # without the reconciliation withholding that candidate from the loop this run would refuse the
+    # package it is describing - on every later run, forever.
+    $sandbox = New-TestSandbox -Prefix 'dr-post-reboot-stuck'
+    try {
+        $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+        $xml = New-PnpUtilDriverXml -Row (New-SupersededPair)
+
+        Invoke-WithStubbedTool -Body {
+            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+            Set-DeleteOutcome -ExitCode 1641
+
+            $first = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+            Assert-Equal 'Incomplete' $first.Outcome $first.Detail
+        }
+
+        $exportPath = @(Get-BackupDirectory -Root $backupRoot)[0].FullName
+
+        foreach ($pass in @('run 2', 'run 3')) {
+            Invoke-WithStubbedTool -Body {
+                $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+
+                $later = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+                Assert-Equal 'Incomplete' $later.Outcome ('{0}: an unresolved reboot-pending deletion changed outcome: {1}' -f $pass, $later.Detail)
+                Assert-True ($later.Detail -match 'candidates=1 deleted=0 skipped=0 refused=0 incomplete=1') ('{0}: {1}' -f $pass, $later.Detail)
+                Assert-True ($later.Detail -match 'pending=1') ('{0}: {1}' -f $pass, $later.Detail)
+
+                Assert-Equal 2 @(Get-EnumerationCall).Count ('{0}: the pending deletion was not re-confirmed against the store' -f $pass)
+                Assert-Equal 0 @(Get-DeleteCall).Count ('{0}: a package with an unresolved attempt was deleted again' -f $pass)
+                Assert-Equal 0 @(Get-ExportCall).Count ('{0}: a package with an unresolved attempt was exported again' -f $pass)
+            }
+
+            Assert-Equal 1 @(Get-BackupDirectory -Root $backupRoot).Count ('{0}: the only possible copy was thrown away' -f $pass)
+            Assert-True (Test-Path -LiteralPath (Join-Path -Path $exportPath -ChildPath $script:PendingName)) `
+                ('{0}: the marker came off while the removal is still unproved' -f $pass)
+            Assert-Equal '' (Get-BackupStamp -Path $exportPath) `
+                ('{0}: a removal nobody has observed was stamped into the manifest' -f $pass)
         }
     }
     finally {
