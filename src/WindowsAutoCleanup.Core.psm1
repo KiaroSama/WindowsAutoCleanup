@@ -54,7 +54,7 @@ Export-ModuleMember -Function @(
     'Get-WacIoFailureKind',
     'Open-WacTrustedDirectory', 'New-WacBoundFile', 'Close-WacTrustedDirectory',
     'Test-WacTrustedDirectoryDescriptor', 'Set-WacDirectoryCreateProbe', 'Set-WacDirectoryTrustJudge',
-    'Get-WacDataRoot', 'Get-WacDeploymentRoot', 'Get-WacDriverBackupRoot', 'Get-WacLegacyDriverBackupRoot',
+    'Get-WacDataRoot', 'Get-WacFallbackDataRoot', 'Get-WacDeploymentRoot', 'Get-WacDriverBackupRoot', 'Get-WacLegacyDriverBackupRoot',
     'Initialize-WacRun', 'Write-WacLog', 'Close-WacLog', 'Get-WacLogPath', 'Get-WacExecutionId',
     'Get-WacLogDirectory', 'Get-WacLogHealth', 'Get-WacStateTrust',
     'Set-WacLogFallbackWriter', 'Set-WacLogWriter',

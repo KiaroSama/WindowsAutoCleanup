@@ -639,8 +639,16 @@ Test-Case 'The descriptor judged is the one read from the directory''s own handl
         $created.Writer.Dispose()
 
         Assert-Equal 1 $judged.Count 'the descriptor rule was never asked, so nothing was verified'
-        Assert-True ($judged[0].Contains('O:' + $expectedOwner)) `
-        ('the descriptor judged was not this directory''s. expected owner {0}, sddl {1}' -f $expectedOwner, $judged[0])
+
+        # The owner is PARSED out of the SDDL, never matched as a substring. SDDL abbreviates the
+        # well-known SIDs, so a directory owned by BUILTIN\Administrators renders as 'O:BA' and a
+        # Contains('O:S-1-5-32-544') check fails on it - which is exactly what happened: it passed in
+        # an unelevated shell, where the owner is a plain user SID with no alias, and failed on the
+        # elevated CI runner, where it is Administrators. RawSecurityDescriptor resolves both forms
+        # to the same SecurityIdentifier, so this now asserts the same thing at either privilege.
+        $judgedOwner = (New-Object System.Security.AccessControl.RawSecurityDescriptor($judged[0])).Owner
+        Assert-Equal $expectedOwner ([string]$judgedOwner.Value) `
+        ('the descriptor judged was not this directory''s. sddl {0}' -f $judged[0])
     }
     finally {
         Set-WacDirectoryTrustJudge -ScriptBlock $null

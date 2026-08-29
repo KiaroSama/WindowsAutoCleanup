@@ -74,6 +74,17 @@ $script:ShimBody['Core'] = @'
 . (Join-Path -Path $PSScriptRoot -ChildPath '_Plan.ps1')
 $script:RealInitializeWacRun = ${function:Initialize-WacRun}
 
+# The elevated candidate list ends at Get-WacFallbackDataRoot, and unshimmed that is a REAL machine
+# path no redirected environment variable can move. The refusal cases deliberately reject the first
+# candidate, so on an elevated runner the run fell through and created C:\Windows\Logs\
+# WindowsAutoCleanup on the live machine - which is why this passed on an unelevated developer shell
+# and failed in CI. Redirecting %SystemRoot% instead was tried and measured to be worse: on Windows
+# PowerShell 5.1 the .NET Framework resolves the GAC through it lazily and the child dies later on
+# an assembly it had not loaded yet.
+function Get-WacFallbackDataRoot {
+    return (Join-Path -Path (Split-Path -Path $env:ProgramData -Parent) -ChildPath 'WIN\Logs\WindowsAutoCleanup')
+}
+
 function Test-WacIsAdministrator { return $true }
 function Test-WacSystemDriveSupported { return $true }
 
@@ -314,7 +325,7 @@ function New-RunRig {
     $app = Join-Path -Path $sandbox -ChildPath 'app'
     $src = Join-Path -Path $app -ChildPath 'src'
     [void][System.IO.Directory]::CreateDirectory($src)
-    foreach ($leaf in @('PD', 'LA', 'TMP')) {
+    foreach ($leaf in @('PD', 'LA', 'TMP', 'WIN')) {
         [void][System.IO.Directory]::CreateDirectory((Join-Path -Path $sandbox -ChildPath $leaf))
     }
 
@@ -345,6 +356,7 @@ function New-RunRig {
     return [PSCustomObject]@{
         Sandbox      = $sandbox
         RunPath      = $runCopy
+        WindowsRoot  = Join-Path -Path $sandbox -ChildPath 'WIN'
         Src          = $src
         PlanPath     = Join-Path -Path $sandbox -ChildPath 'plan.json'
         ProgramData  = Join-Path -Path $sandbox -ChildPath 'PD'

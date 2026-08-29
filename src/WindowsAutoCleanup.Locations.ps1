@@ -13,13 +13,36 @@
     into every sandbox.
 #>
 
+function Get-WacFallbackDataRoot {
+    <#
+    .SYNOPSIS
+        The state/log root used when %ProgramData% cannot be, and the elevated second candidate.
+    .DESCRIPTION
+        Named rather than written inline at its two call sites, and that is not tidiness. It is a
+        REAL machine path that no environment variable a harness redirects can move, so every test
+        that reaches it leaves its sandbox: the elevated candidate list ends here, the refusal cases
+        deliberately reject the first candidate, and on an elevated runner the run then created
+        C:\Windows\Logs\WindowsAutoCleanup on the live machine. It passed on an unelevated developer
+        shell, which cannot create it, and failed in CI, which can.
+
+        Redirecting %SystemRoot% for the tests is not the answer and was measured not to be: on
+        Windows PowerShell 5.1 the .NET Framework resolves the GAC through it lazily, so a redirected
+        process dies later with "The given assembly name or codebase, ...\System.Web.Extensions.dll,
+        was invalid" the first time something needs an assembly it has not loaded yet.
+
+        One function is one seam. A harness replaces this and the whole candidate list is inside its
+        sandbox, with no environment variable touched.
+    #>
+    return (Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup')
+}
+
 function Get-WacDataRoot {
     <#
     .SYNOPSIS
         Machine-wide state/log root. Never inside a directory this tool cleans.
     #>
     if ($env:ProgramData) { return (Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup') }
-    return (Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup')
+    return (Get-WacFallbackDataRoot)
 }
 
 function Get-WacDeploymentRoot {
