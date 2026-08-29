@@ -478,4 +478,39 @@ Test-Case 'A descendant whose state cannot be read keeps the verdict unproven' {
     }
 }
 
+Test-Case 'The root exit check runs BEFORE the tree is read, so a dead pid never adopts strangers' {
+    <#
+        This is an ordering rule, so it is asserted as one. The behavioural case above passes either
+        way on a quiet machine: it only fails when an unrelated process happens to carry the exited
+        pid as its recorded parent, which is a 3%-per-round event under load and 0% at rest.
+
+        Why the order matters, measured rather than argued: Windows never clears
+        th32ParentProcessID when a parent exits, and it reuses process ids. Over 400 rounds of
+        start-exit-enumerate under six churn workers, 12 rounds showed an ALREADY-EXITED id with
+        recorded children, and they were live unrelated processes - conhost.exe, and once
+        Microsoft.CmdPal.UI.exe. Reading the tree first bound those and then terminated them.
+
+        A tree may only be owned if it was observed while its root was alive.
+    #>
+    $module = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'src\WindowsAutoCleanup.ProcessTree.ps1'
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($module, [ref]$null, [ref]$parseErrors)
+    Assert-Equal 0 @($parseErrors).Count 'the module no longer parses'
+
+    $body = @($ast.FindAll({
+                param($node)
+                ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+                ($node.Name -eq 'Stop-WacProcessTree')
+            }, $true))
+    Assert-Equal 1 $body.Count 'exactly one Stop-WacProcessTree must exist'
+
+    $text = $body[0].Extent.Text
+    $rootCheck = $text.IndexOf('WaitForProcessExit($root.Handle, 0)', [System.StringComparison]::Ordinal)
+    $treeRead = $text.IndexOf('Get-WacProcessDescendantId', [System.StringComparison]::Ordinal)
+
+    Assert-True ($rootCheck -ge 0) 'the root exit check is gone entirely'
+    Assert-True ($treeRead -ge 0) 'the descendant enumeration is gone entirely'
+    Assert-True ($rootCheck -lt $treeRead) `
+        'the tree is read before the root exit check, so an exited target can adopt an unrelated live process and kill it'
+}
 Complete-TestRun

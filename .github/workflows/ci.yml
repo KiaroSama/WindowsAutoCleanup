@@ -25,6 +25,21 @@ jobs:
         uses: actions/checkout@v7
         timeout-minutes: 5
 
+      - name: Whitespace and conflict markers
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          # Diffing against the empty-tree object lints EVERY tracked file, not just the last commit:
+          # a trailing space or a leftover conflict marker that arrived three commits ago is still in
+          # the tree someone clones.
+          $emptyTree = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+          git diff --check $emptyTree HEAD
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'git diff --check reported whitespace errors or conflict markers.'
+            exit 1
+          }
+          Write-Host 'No whitespace errors or conflict markers.'
+
       - name: Static analysis
         shell: pwsh
         timeout-minutes: 10

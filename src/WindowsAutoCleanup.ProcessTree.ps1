@@ -370,17 +370,26 @@ function Stop-WacProcessTree {
     }
 
     try {
+        # THE ROOT IS CHECKED BEFORE THE TREE, and the order is the whole point.
+        #
+        # A recorded parent id is NOT proof of parentage once that parent is dead: Windows never
+        # clears th32ParentProcessID when a parent exits, and it reuses process ids. So an exited
+        # target keeps "children" in the snapshot that are unrelated live processes which merely
+        # inherited its number. Measured on this machine: over 400 rounds of start-exit-enumerate
+        # under six churn workers, 12 rounds (3%) showed an already-exited id with recorded
+        # children, and they were real live processes - conhost.exe, and once Microsoft.CmdPal.UI.exe.
+        #
+        # Reading the tree first therefore did two bad things: it skipped this fast path, and then it
+        # BOUND AND TERMINATED those unrelated processes. A tree can only be owned if it was observed
+        # while its root was alive; a root that had already exited when the call began never gave us
+        # one, so the honest answer is "the target is gone" and nothing is killed.
+        if ([WacNative]::WaitForProcessExit($root.Handle, 0) -eq 0) {
+            return (New-WacTerminationResult -Root $ProcessId -Proven $true -Bound @($ProcessId) `
+                    -Reason 'The target had already exited before this call, so no live tree was ever observed and nothing was killed.')
+        }
+
         $descendant = Get-WacProcessDescendantId -ProcessId $ProcessId
         if ($null -eq $descendant) { $treeUnreadable = $true } else { & $bindEach $descendant }
-
-        # Already gone before anything was asked of it, and nothing under it. The handle is what
-        # makes this the TARGET's own exit rather than a later occupant of the number, so no kill is
-        # needed or attempted.
-        if (-not $treeUnreadable -and $unreadable.Count -eq 0 -and $bound.Count -eq 1 -and
-            [WacNative]::WaitForProcessExit($root.Handle, 0) -eq 0) {
-            return (New-WacTerminationResult -Root $ProcessId -Proven $true -Bound @($ProcessId) `
-                    -Reason 'The target had already exited and had no descendant.')
-        }
 
         $taskkillExit = Invoke-WacTaskkillTree -ProcessId $ProcessId -TimeoutMs $TimeoutMs
         $waitDeadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
