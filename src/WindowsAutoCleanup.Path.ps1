@@ -34,15 +34,32 @@ function Test-WacPathSegmentsPreserveIdentity {
         PowerShell 5.1 (.NET Framework). Asking each segment directly is what makes the answer the
         same on both, instead of encoding a character list that is wrong on one of them.
 
-        Each segment is canonicalised ALONE, against a synthetic root, so the question asked is only
-        "does this name survive preprocessing" and not "where does the whole path lead".
+        Each segment is canonicalised ALONE, so the question asked is only "does this name survive
+        preprocessing" and not "where does the whole path lead".
 
-        Truncation is the danger and it has a signature: the canonical form is a strict PREFIX of
-        the segment, i.e. characters were dropped off the end. A wholly different spelling is the
-        other legitimate transformation - GetFullPath expands an 8.3 short name, measured
-        'PROGRA~1' -> 'Program Files' - and that names the SAME object under another real name,
-        which this project deliberately relies on so both sides of a comparison agree. Rejecting on
-        inequality alone would refuse every short-name path.
+        THE SYNTHETIC ROOT DOES NOT EXIST, and that is the whole trick. GetFullPath performs TWO
+        transformations and the first version of this rule conflated them: it stripped trailing
+        characters, AND it expanded an 8.3 short name. Expansion is legitimate - measured,
+        'PROGRA~1' -> 'Program Files' names the same object under another real name, and this
+        project relies on it so both sides of a path comparison agree - so the rule tried to tell
+        them apart by asking whether the canonical form was a strict PREFIX of the segment.
+
+        That predicate was wrong, and 'PROGRA~1.' walked straight through it: preprocessing removed
+        the dot AND then expanded the short name, so the answer was 'Program Files', which is not a
+        prefix of 'PROGRA~1.', so the changed identity was ACCEPTED. Measured before this fix, on
+        both hosts, final and intermediate: 'C:\PROGRA~1.' canonicalised to 'C:\Program Files' and
+        'C:\PROGRA~1.\sub\leaf.txt' to 'C:\Program Files\sub\leaf.txt'.
+
+        Expansion needs a real directory to expand against. Under a root that does not exist it
+        cannot happen at all, so the only transformation left is the dangerous one and ANY character
+        loss is proof of it - no predicate needed to separate them. Measured on both hosts under a
+        GUID root: 'PROGRA~1' comes back unchanged while 'PROGRA~1.' and 'PROGRA~1 ' come back
+        shortened. The real 8.3 alias still expands later, in the one GetFullPath call that matters,
+        because there the parent is real.
+
+        The trailing ASCII dot and space are ALSO rejected lexically, before any of that. They are
+        the two characters Win32 documents itself as stripping, the check costs nothing, and it does
+        not depend on a host agreeing with us about anything.
     #>
     param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path)
 
@@ -54,18 +71,32 @@ function Test-WacPathSegmentsPreserveIdentity {
     if ($body.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) { $body = $body.Substring(4) }
     if ($body -match '^[A-Za-z]:') { $body = $body.Substring(2) }
 
+    # A root that cannot exist, so no segment below can be resolved into a real directory and no 8.3
+    # short name can expand. A GUID rather than a fixed name: a fixed one could be created by anyone
+    # who read this source, and the suppression would silently stop working the moment it was.
+    $ghost = 'C:\' + [guid]::NewGuid().ToString('N') + '\'
+
     foreach ($segment in $body.Split([char[]]@('\', '/'))) {
         # An empty segment is a separator run or a trailing separator, and '.'/'..' are navigation.
         if ($segment -eq '' -or $segment -eq '.' -or $segment -eq '..') { continue }
 
-        try { $canonical = [System.IO.Path]::GetFullPath('C:\' + $segment) }
+        # Lexical, and first. Win32 documents these two as stripped, so no host has to agree with
+        # us for this to be right, and it holds even if the canonicalisation below is ever fooled.
+        if ($segment.EndsWith('.', [System.StringComparison]::Ordinal) -or
+            $segment.EndsWith(' ', [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+
+        try { $canonical = [System.IO.Path]::GetFullPath($ghost + $segment) }
         catch { return $false }
 
-        if ($canonical.Length -lt 3) { return $false }
-        $resolved = $canonical.Substring(3)
+        # Fail closed rather than guess: if the answer did not come back under the root it was asked
+        # about, the two transformations cannot be told apart and the name is not provably safe.
+        if (-not $canonical.StartsWith($ghost, [System.StringComparison]::Ordinal)) { return $false }
+        $resolved = $canonical.Substring($ghost.Length)
 
-        if ($resolved -ceq $segment) { continue }
-        if ($segment.StartsWith($resolved, [System.StringComparison]::Ordinal)) { return $false }
+        # Under a root that cannot expand anything, ANY difference is character loss.
+        if ($resolved -cne $segment) { return $false }
     }
 
     return $true

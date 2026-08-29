@@ -294,8 +294,12 @@ function Test-WacDriverPackageRemoved {
         validated on the DriverName attribute alone, and ABSENCE is only ever an answer while
         NameInventoryComplete says every published element yielded a name. Anything else is Unknown.
 
-        A caller must NOT invoke this after a reboot-required exit code: the removal is pending a
-        restart, so the package is legitimately still enumerable and Present would be a false alarm.
+        IT IS ASKED AFTER A REBOOT-REQUIRED EXIT CODE TOO, and an earlier comment here said the
+        opposite. 3010 and 1641 do mean the removal finishes at the next restart, so the package is
+        legitimately still enumerable - but that is a reason to read the ANSWER differently, not a
+        reason to skip the question: the same code with the same store answer is also what a removal
+        that never happens looks like. Invoke-WacDriverPackagePrune therefore confirms every attempt
+        that started, and treats a reboot-required Present as unresolved rather than refuted.
     .OUTPUTS
         State: Removed | Present | Unknown, plus Reason for anything that is not Removed.
     #>

@@ -31,6 +31,12 @@ $script:StatusNameCollision = '0xC0000035'
 # FILE_ATTRIBUTE_REPARSE_POINT.
 $script:AttributeReparsePoint = 0x00000400
 
+# STATUS_OBJECT_NAME_NOT_FOUND and STATUS_FILE_IS_A_DIRECTORY. Compared as unsigned TEXT for the
+# reason above. A directory planted at a file's name is a refusal, not a mere failure: it is the
+# same planted-name attack as a link, wearing a different object type.
+$script:StatusNameNotFound   = '0xC0000034'
+$script:StatusIsADirectory   = '0xC00000BA'
+
 function Set-WacDirectoryCreateProbe {
     <#
     .SYNOPSIS
@@ -54,8 +60,12 @@ function Set-WacDirectoryTrustJudge {
     .SYNOPSIS
         Test seam. Replaces the owner/DACL judgement Test-WacTrustedDirectoryDescriptor makes.
     .DESCRIPTION
-        The scriptblock receives the SDDL read from the directory's own handle and must return an
-        object with IsTrusted and Reason. Pass $null to restore the real rule.
+        The scriptblock receives the SDDL read from the directory's own handle and a boolean saying
+        whether the STRICT rule was asked for, and must return an object with IsTrusted and Reason
+        (plus Writers, when it is answering a strict question and the caller reads that). Pass $null
+        to restore the real rule. A judge declaring only ($Sddl) still binds - the extra positional
+        argument lands in $args - so a seam written before the second parameter existed keeps
+        working, and keeps answering both questions the same way.
 
         It exists because the real answer is not reproducible in a test: a sandbox under %TEMP% is
         owned by whoever ran the suite, so the verdict would depend on whether that account is a
@@ -70,30 +80,149 @@ function Set-WacDirectoryTrustJudge {
     $script:DirectoryTrustJudge = $ScriptBlock
 }
 
+function Test-WacStrictAclIsAdministrative {
+    <#
+    .SYNOPSIS
+        The STRICT rule, taken over a descriptor the caller already holds: no non-administrative
+        principal may create, append, write, delete, re-permission or take ownership of what is here.
+    .DESCRIPTION
+        This is the descriptor-level twin of Test-WacPathIsMachineTrusted, and it exists because
+        that function can only be asked about a PATHNAME. A driver backup is the only copy of a
+        package about to be deleted, so the question has to be asked of the object actually opened -
+        through its own handle - and a second pathname resolution is exactly what the trusted-
+        directory primitive exists to avoid.
+
+        THE MASK IS DELIBERATELY THE SAME ONE, bit for bit, including the two generic rights that a
+        raw ACE never decomposes into specific rights. Two copies of a security rule is one copy
+        that gets fixed and one that does not, so until Test-WacPathIsMachineTrusted delegates here
+        the pair is pinned together by a test that runs both over the same battery of descriptors.
+
+        HOW IT DIFFERS FROM Test-WacAncestorAclIsAdministrative, which is the relaxed rule this
+        file's other judgement applies. The relaxed rule asks only whether an existing child can be
+        REPLACED: Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership and
+        GENERIC_ALL. It deliberately ignores create and plain write, because %ProgramData% grants
+        BUILTIN\Users create-file and create-folder on every stock install and this project may not
+        rewrite an ACL. That exemption is wrong for a backup directory, and measurably so: an ACE
+        that is INHERIT-ONLY on the parent grants nothing there - so the parent's Writers list comes
+        back empty - and the child created under it inherits the same mask with the inherit-only
+        flag CLEARED. Measured, parent (A;OICIIO;0x100116;;;BU) becomes child
+        (A;OICIID;0x100116;;;BU): BUILTIN\Users can write into the new directory, and the relaxed
+        rule accepts it because 0x100116 contains none of the replace bits.
+
+        An InheritOnly ACE is skipped HERE too, and that is not the same loophole: on the object's
+        OWN descriptor such an ACE grants nothing on that object by definition. The attack above is
+        caught because the child's own descriptor no longer carries the flag.
+    .OUTPUTS
+        IsTrusted / Owner / Reason / Writers.
+    #>
+    param([Parameter(Mandatory = $true)][System.Security.AccessControl.FileSystemSecurity]$Acl)
+
+    $verdict = [PSCustomObject]@{ IsTrusted = $false; Owner = $null; Reason = $null; Writers = @() }
+
+    $ownerSid = $null
+    try { $ownerSid = [string]$Acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { $ownerSid = $null }
+    $verdict.Owner = $ownerSid
+
+    $rules = $null
+    try { $rules = @($Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) }
+    catch {
+        $verdict.Reason = ('Access rules are unreadable: {0}' -f $_.Exception.Message)
+        return $verdict
+    }
+
+    # Only ATOMIC bits, for the reason Test-WacPathIsMachineTrusted records: a composite such as
+    # Modify also carries read and Synchronize bits, so OR-ing composites in would match a plain
+    # ReadAndExecute ACE. The composites are still caught, because each contains these atomic bits.
+    $writeRights = [int]([System.Security.AccessControl.FileSystemRights]::WriteData) -bor
+                   [int]([System.Security.AccessControl.FileSystemRights]::AppendData) -bor
+                   [int]([System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes) -bor
+                   [int]([System.Security.AccessControl.FileSystemRights]::WriteAttributes) -bor
+                   [int]([System.Security.AccessControl.FileSystemRights]::Delete) -bor
+                   [int]([System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -bor
+                   [int]([System.Security.AccessControl.FileSystemRights]::ChangePermissions) -bor
+                   [int]([System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+    # GENERIC_WRITE and GENERIC_ALL are not translated into specific rights inside a raw ACE.
+    $genericWriteRights = 0x40000000 -bor 0x10000000
+
+    $writers = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($rule in $rules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+
+        $propagation = [System.Security.AccessControl.PropagationFlags]::None
+        try { $propagation = $rule.PropagationFlags } catch { $propagation = [System.Security.AccessControl.PropagationFlags]::None }
+        if (([int]$propagation -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+
+        if ((([int]$rule.FileSystemRights -band $writeRights) -eq 0) -and
+            (([int]$rule.FileSystemRights -band $genericWriteRights) -eq 0)) { continue }
+
+        $sid = [string]$rule.IdentityReference.Value
+        if (Test-WacSidIsAdministrator -Sid $sid) { continue }
+
+        [void]$writers.Add($sid)
+    }
+
+    $verdict.Writers = @(@($writers.ToArray()) | Sort-Object -Unique)
+
+    # Reported before the owner is judged, and populated on every refusal: a caller that has to name
+    # the principal responsible cannot do it from a verdict that stopped at the first failure.
+    if (-not (Test-WacSidIsAdministrator -Sid ([string]$ownerSid))) {
+        $verdict.Reason = ('Owner {0} is not an administrative principal; an owner implicitly keeps WRITE_DAC.' -f $ownerSid)
+        return $verdict
+    }
+
+    if (@($verdict.Writers).Count -gt 0) {
+        $verdict.Reason = ('Non-administrative principals can create or modify content here: {0}' -f
+            (@($verdict.Writers) -join ', '))
+        return $verdict
+    }
+
+    # Zero rules is an EMPTY DACL, not a NULL one - see Test-WacPathIsMachineTrusted for the
+    # measurement. Either way there is nothing to evaluate, so fail closed.
+    if ($rules.Count -eq 0) {
+        $verdict.Reason = 'The security descriptor exposes no access rules to evaluate.'
+        return $verdict
+    }
+
+    $verdict.IsTrusted = $true
+    $verdict.Reason = 'Owner and DACL are administrative only, and no non-administrator may write here.'
+    return $verdict
+}
+
 function Test-WacTrustedDirectoryDescriptor {
     <#
     .SYNOPSIS
-        Judges an owner+DACL, supplied as SDDL, by the same rule the state-path preflight applies.
+        Judges an owner+DACL, supplied as SDDL, by one of the two rules this project uses.
     .DESCRIPTION
-        The rule is Test-WacAncestorAclIsAdministrative - administrative owner, and no non-
-        administrative principal able to delete, replace or re-permission what is here. It is NOT
-        the stricter "can a non-administrator write anything at all" rule: %ProgramData% grants
+        Without -Strict the rule is Test-WacAncestorAclIsAdministrative - administrative owner, and
+        no non-administrative principal able to delete, replace or re-permission what is here. It is
+        NOT the stricter "can a non-administrator write anything at all" rule: %ProgramData% grants
         BUILTIN\Users create-file and create-folder by default and this project may not rewrite an
         ACL, so the strict rule would refuse every stock Windows machine forever. Creating a NEW
         name beside an existing one cannot replace the existing one, and every file this primitive
         creates is created collision-failing, so a new name cannot be planted under one either.
 
+        With -Strict the rule is Test-WacStrictAclIsAdministrative, and the verdict carries Writers.
+        That is the rule a driver backup needs - see that function for why the relaxed one accepts a
+        directory an inherit-only parent ACE just made writable - and it is affordable only because
+        the backup root was moved somewhere BUILTIN\Users holds nothing.
+
         An SDDL that cannot be parsed is a refusal, not an exception: an unanswered security
         question is not a yes.
     .OUTPUTS
-        IsTrusted / Owner / Reason.
+        IsTrusted / Owner / Reason, plus Writers under -Strict.
     #>
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Sddl)
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Sddl,
+        [switch]$Strict
+    )
 
-    if ($script:DirectoryTrustJudge) { return (& $script:DirectoryTrustJudge $Sddl) }
+    # The seam is told WHICH question was asked. A scriptblock declaring only ($Sddl) still binds -
+    # measured on both hosts, the extra positional argument lands in $args - so every judge written
+    # before this parameter existed keeps working unchanged.
+    if ($script:DirectoryTrustJudge) { return (& $script:DirectoryTrustJudge $Sddl ([bool]$Strict)) }
 
     if ([string]::IsNullOrWhiteSpace($Sddl)) {
-        return [PSCustomObject]@{ IsTrusted = $false; Owner = $null; Reason = 'The directory exposed no security descriptor to evaluate.' }
+        return [PSCustomObject]@{ IsTrusted = $false; Owner = $null; Writers = @(); Reason = 'The directory exposed no security descriptor to evaluate.' }
     }
 
     $security = New-Object System.Security.AccessControl.DirectorySecurity
@@ -102,11 +231,12 @@ function Test-WacTrustedDirectoryDescriptor {
     }
     catch {
         return [PSCustomObject]@{
-            IsTrusted = $false; Owner = $null
+            IsTrusted = $false; Owner = $null; Writers = @()
             Reason = ('The security descriptor could not be interpreted: {0}' -f $_.Exception.Message)
         }
     }
 
+    if ($Strict) { return (Test-WacStrictAclIsAdministrative -Acl $security) }
     return (Test-WacAncestorAclIsAdministrative -Acl $security)
 }
 
@@ -214,6 +344,13 @@ function Open-WacTrustedDirectory {
                                 here. Do NOT pass it for a location inside the invoking user's own
                                 profile: the user owns that by construction and the rule would
                                 refuse it, correctly and uselessly.
+          -RequireStrictTrust   the same, judged by the STRICT rule instead: no non-administrative
+                                principal may create, append, write, delete, re-permission or take
+                                ownership here. Implies -RequireMachineTrust. Pass it when what is
+                                written here is the only copy of something, and read
+                                Test-WacStrictAclIsAdministrative for why the relaxed rule is not
+                                enough for that - it accepts a directory an inherit-only ancestor
+                                ACE made writable the moment this call created it.
           -MaxCreate            how many missing components may be created (default 8).
 
         OUTPUT - always an object, never $null:
@@ -224,6 +361,8 @@ function Open-WacTrustedDirectory {
           IsTrusted   $true only when every proof below passed
           Reason      why, in words. Always populated, on success as well as on refusal
           Sddl        the descriptor the verdict was reached on, or $null
+          Writers     under -RequireStrictTrust, the non-administrative principals that may write
+                      here. Empty on success, and populated on a refusal that names them
 
         WHAT IT PROVES, in order, stopping at the first failure:
           1. The deepest EXISTING ancestor of -Path is opened and pinned before anything is created,
@@ -236,8 +375,10 @@ function Open-WacTrustedDirectory {
              This is the half New-Item -Force does not have, in either respect.
           3. The leaf handle is asked, again, what object it is: not a reparse point, and resolving
              to the requested path.
-          4. With -RequireMachineTrust: the volume is a ready local fixed disk, and the owner and
-             DACL are read FROM THE HANDLE and judged by Test-WacTrustedDirectoryDescriptor.
+          4. With -RequireMachineTrust or -RequireStrictTrust: the volume is a ready local fixed
+             disk, and the owner and DACL are read FROM THE HANDLE and judged by
+             Test-WacTrustedDirectoryDescriptor - relaxed or strict as asked. The descriptor of the
+             object that was actually created or opened, never of the name it was asked for.
 
         THE PIN. The handle is opened with a share mode that withholds DELETE, so while the caller
         holds it the directory cannot be renamed out of the way or deleted by anyone. That is what
@@ -283,6 +424,7 @@ function Open-WacTrustedDirectory {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path,
         [switch]$RequireMachineTrust,
+        [switch]$RequireStrictTrust,
         [ValidateRange(1, 32)][int]$MaxCreate = 8
     )
 
@@ -294,6 +436,7 @@ function Open-WacTrustedDirectory {
         IsTrusted = $false
         Reason = $null
         Sddl = $null
+        Writers = @()
     }
 
     $normalized = Get-WacNormalizedPath -Path $Path
@@ -397,7 +540,7 @@ function Open-WacTrustedDirectory {
         }
         $verdict.FinalPath = $identity.FinalPath
 
-        if ($RequireMachineTrust) {
+        if ($RequireMachineTrust -or $RequireStrictTrust) {
             $volume = Test-WacBoundDirectoryVolume -FinalPath $identity.FinalPath
             if (-not $volume.IsTrusted) {
                 $verdict.Reason = $volume.Reason
@@ -412,7 +555,12 @@ function Open-WacTrustedDirectory {
             }
             $verdict.Sddl = $sddl
 
-            $judgement = Test-WacTrustedDirectoryDescriptor -Sddl $sddl
+            $judgement = Test-WacTrustedDirectoryDescriptor -Sddl $sddl -Strict:$RequireStrictTrust
+            # Read defensively: a judge installed as a test seam may return only the two properties
+            # the relaxed rule promises, and under Set-StrictMode 2.0 an absent property throws.
+            if (@($judgement.PSObject.Properties.Name) -ccontains 'Writers') {
+                $verdict.Writers = @($judgement.Writers)
+            }
             if (-not $judgement.IsTrusted) {
                 $verdict.Reason = ('{0} is not administrative-only: {1}' -f $normalized, [string]$judgement.Reason)
                 return $verdict
@@ -485,6 +633,102 @@ function New-WacBoundFile {
     catch {
         try { $safe.Dispose() } catch { $null = $_ }
         $result.Kind = 'Failed'
+    }
+
+    return $result
+}
+
+function Open-WacBoundFile {
+    <#
+    .SYNOPSIS
+        Opens ONE EXISTING file inside a directory handle for READING, and refuses anything that is
+        not an ordinary, single-linked file.
+    .DESCRIPTION
+        New-WacBoundFile's companion for the other direction. New-WacBoundFile is how a predictable
+        name is safely WRITTEN - it fails on collision, so a planted file, link or hard link is
+        refused rather than written through. This is how one is safely READ, which is a different
+        problem: the name already exists by the time anyone is interested, so refusing a collision
+        is not available and the object itself has to be judged.
+
+        THREE REFUSALS, all answered from the open handle rather than from the name:
+          * A REPARSE POINT. The open takes FILE_OPEN_REPARSE_POINT, so a symlink or mount point is
+            bound as the link itself and reported, never followed to whatever it names.
+          * A MULTI-LINK FILE. NumberOfLinks above 1 means these bytes are also reachable under
+            another name somebody else chose. This is the case a reparse check misses ENTIRELY: a
+            hard link carries no reparse attribute, resolves to an ordinary path, and is
+            indistinguishable from the real file by every check except this count.
+          * A DIRECTORY. FILE_NON_DIRECTORY_FILE turns one planted at the name into an open failure.
+
+        And, like every open in this file, it is BOUND: the name is resolved against a directory
+        object the caller holds open, so no swap of any ancestor can move where it lands.
+
+        WHAT IT DOES NOT CLOSE. It says nothing about WHO WROTE the content - only that the bytes
+        behind this name are reachable through this name alone, in the directory that was proved.
+        Judging who may write there is Open-WacTrustedDirectory's job, and callers here do that
+        first.
+    .OUTPUTS
+        Kind ('Opened' / 'Missing' / 'Refused' / 'Failed'), Stream (an open read FileStream, or
+        $null), Links, NtStatus and Reason. The caller owns the stream and must dispose it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$DirectoryHandle,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $result = [PSCustomObject]@{ Kind = 'Failed'; Stream = $null; Links = 0; NtStatus = 0; Reason = '' }
+
+    if (-not (Initialize-WacNative)) {
+        $result.Reason = 'The native surface is unavailable, so no file can be bound to a handle.'
+        return $result
+    }
+
+    $handle = [IntPtr]::Zero
+    $attributes = [uint32]0
+    $links = [uint32]0
+    $status = [WacNative]::OpenBoundLeafForRead($DirectoryHandle, $Name, [ref]$handle, [ref]$attributes, [ref]$links)
+    $result.NtStatus = $status
+    $result.Links = [int]$links
+
+    if ($status -ne 0) {
+        if (('0x{0:X8}' -f $status) -eq $script:StatusNameNotFound) {
+            $result.Kind = 'Missing'
+            $result.Reason = ('{0} is not there.' -f $Name)
+        }
+        elseif (('0x{0:X8}' -f $status) -eq $script:StatusIsADirectory) {
+            $result.Kind = 'Refused'
+            $result.Reason = ('{0} is a directory, not the file this name is supposed to hold.' -f $Name)
+        }
+        else {
+            $result.Reason = ('{0} could not be opened inside the directory that was proved (NTSTATUS 0x{1:X8}).' -f $Name, $status)
+        }
+        return $result
+    }
+
+    # Both refusals close the handle here: a caller that was told no must not be able to read.
+    if (([int]$attributes -band $script:AttributeReparsePoint) -ne 0) {
+        [WacNative]::CloseNativeHandle($handle)
+        $result.Kind = 'Refused'
+        $result.Reason = ('{0} is a reparse point, so it can redirect elsewhere.' -f $Name)
+        return $result
+    }
+
+    if ([int]$links -ne 1) {
+        [WacNative]::CloseNativeHandle($handle)
+        $result.Kind = 'Refused'
+        $result.Reason = ('{0} has {1} hard links, so the same bytes are reachable under a name this tool never chose.' -f $Name, [int]$links)
+        return $result
+    }
+
+    $safe = New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($handle, $true)
+    try {
+        $result.Stream = New-Object System.IO.FileStream($safe, [System.IO.FileAccess]::Read)
+        $result.Kind = 'Opened'
+        $result.Reason = ('{0} is an ordinary single-linked file in the directory that was proved.' -f $Name)
+    }
+    catch {
+        try { $safe.Dispose() } catch { $null = $_ }
+        $result.Kind = 'Failed'
+        $result.Reason = ('{0} could not be read: {1}' -f $Name, $_.Exception.Message)
     }
 
     return $result

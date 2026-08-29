@@ -148,6 +148,25 @@ Test-Case 'A name that cannot be canonicalised without changing which object it 
             ('an ambiguous INTERMEDIATE segment was canonicalised: ' + $intermediate)
     }
 
+    # An 8.3 SHORT NAME carrying a trailing character was the hole the first version of this rule
+    # left open, and it is the composition that makes it subtle: preprocessing removes the dot AND
+    # THEN expands the alias, so 'PROGRA~1.' answers 'Program Files'. That is not a prefix of the
+    # literal segment, so a rule that used "not a prefix" as proof of a safe 8.3 spelling accepted a
+    # changed identity. Measured on both hosts before the fix, final and intermediate:
+    # 'C:\PROGRA~1.' -> 'C:\Program Files', 'C:\PROGRA~1.\sub\leaf.txt' -> 'C:\Program Files\sub\leaf.txt'.
+    foreach ($alias in @('C:\PROGRA~1.', 'C:\PROGRA~1 ', 'C:\PROGRA~1.\sub\leaf.txt',
+                         'C:\sub\PROGRA~1.\leaf.txt', '\\?\C:\PROGRA~1.')) {
+        Assert-Equal $null (Get-WacNormalizedPath -Path $alias) `
+            ('an 8.3 alias with a trailing character was canonicalised onto a different object: ' + $alias)
+    }
+
+    # And the other half, which is what makes the fix a fix rather than a ban: a BARE alias still
+    # resolves, because expansion is only suppressed while asking whether the literal name survives.
+    Assert-Equal 'C:\Program Files' (Get-WacNormalizedPath -Path 'C:\PROGRA~1') `
+        'a genuine 8.3 alias stopped resolving, which would refuse every short-name path'
+    Assert-Equal 'C:\Program Files\Common Files' (Get-WacNormalizedPath -Path 'C:\PROGRA~1\Common Files') `
+        'an 8.3 alias stopped resolving as an intermediate segment'
+
     # The control. A guard that also refuses these would be worse than the defect it closes.
     Assert-Equal 'C:\dir\note.txt' (Get-WacNormalizedPath -Path 'C:\dir\note.txt')
     Assert-Equal 'C:\dir'          (Get-WacNormalizedPath -Path 'C:\dir\')

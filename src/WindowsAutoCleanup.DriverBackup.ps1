@@ -271,57 +271,6 @@ function Test-WacDriverBackupIntact {
     return $result
 }
 
-function Set-WacDriverBackupDeletePending {
-    <#
-    .SYNOPSIS
-        Records that a deletion is about to be attempted. True only once the marker is on disk.
-    .DESCRIPTION
-        A caller that cannot write this must not delete: without the marker an interrupted deletion
-        looks exactly like an export that never finished, and the next run would reclaim the only
-        copy left of a package that is gone.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$DriverName
-    )
-
-    try {
-        $record = 'driver={0} attemptedUtc={1} executionId={2}' -f $DriverName,
-            (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), [string](Get-WacExecutionId)
-        [System.IO.File]::WriteAllText((Get-WacLongPath -Path (Join-Path -Path $Path -ChildPath $script:BackupPendingName)),
-            $record, (New-Object System.Text.UTF8Encoding($false)))
-    }
-    catch {
-        return $false
-    }
-
-    return (Test-WacDriverBackupDeletePending -Path $Path)
-}
-
-function Test-WacDriverBackupDeletePending {
-    <#
-    .SYNOPSIS
-        True while a recorded deletion attempt against this directory has not been committed.
-    #>
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    return (Test-Path -LiteralPath (Join-Path -Path $Path -ChildPath $script:BackupPendingName) -PathType Leaf)
-}
-
-function Clear-WacDriverBackupDeletePending {
-    <#
-    .SYNOPSIS
-        Removes the marker. True only when nothing is left at its path.
-    #>
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $marker = Join-Path -Path $Path -ChildPath $script:BackupPendingName
-    try { [System.IO.File]::Delete((Get-WacLongPath -Path $marker)) }
-    catch { $null = $_ }
-
-    return (-not (Test-Path -LiteralPath $marker))
-}
-
 function Test-WacDriverBackupIsResidue {
     <#
     .SYNOPSIS
@@ -354,18 +303,34 @@ function Test-WacDriverBackupIsResidue {
 
     # Checked FIRST and without reading anything: once a deletion may have happened, no manifest
     # state - absent, unreadable or unstamped - can turn this directory back into ordinary residue.
-    if (Test-WacDriverBackupDeletePending -Path $Path) {
+    # Only a PROVED absence clears it; a marker this tool cannot open, or a directory whose trust
+    # cannot be established, both read as an attempt that may still be outstanding.
+    $marker = Read-WacDriverBackupControlFile -Path $Path -Name $script:BackupPendingName
+    if ($marker.Kind -cne 'Missing') {
         $result.IsResidue = $false
         $result.Reason = 'it carries an uncommitted deletion attempt, so the package it holds may already be gone'
+        if ($marker.Kind -cne 'Read') {
+            $result.Reason = ('its deletion marker could not be read ({0}: {1}), so whether a deletion was attempted here is unknown' -f
+                $marker.Kind, [string]$marker.Reason)
+        }
         return $result
     }
 
-    $manifestPath = Join-Path -Path $Path -ChildPath $script:BackupManifestName
-    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return $result }
+    # Through the directory's own pinned handle, no-follow and link-counted. Reclaiming is a
+    # RECURSIVE DELETE decided by what this file says, so a planted symlink or hard link at this
+    # name must not be what says it.
+    $record = Read-WacDriverBackupControlFile -Path $Path -Name $script:BackupManifestName
+    if ($record.Kind -ceq 'Missing') { return $result }
+    if ($record.Kind -cne 'Read') {
+        $result.IsResidue = $false
+        $result.Reason = ('its manifest could not be read ({0}: {1}), so what it holds is unknown' -f
+            $record.Kind, [string]$record.Reason)
+        return $result
+    }
 
     $manifest = $null
     try {
-        $manifest = [System.IO.File]::ReadAllText((Get-WacLongPath -Path $manifestPath)) | ConvertFrom-Json -ErrorAction Stop
+        $manifest = $record.Text | ConvertFrom-Json -ErrorAction Stop
     }
     catch {
         $result.Reason = 'its manifest is not readable JSON, so an earlier export never completed'
@@ -435,64 +400,6 @@ function Remove-WacDriverBackupDirectory {
     return (-not (Test-Path -LiteralPath $Path))
 }
 
-function Complete-WacDriverBackup {
-    <#
-    .SYNOPSIS
-        Stamps the deletion into the manifest, which is what turns an export into a backup.
-    .DESCRIPTION
-        Called only once pnputil has really removed the package, and the ONLY thing that may turn an
-        export into a backup. The commit is a staged write plus File.Replace, so a reader sees either
-        the whole old manifest or the whole new one: a torn manifest reads as "no completed deletion"
-        and would invite the next run to reclaim the only copy of a package that is gone.
-        Delete-then-move is the fallback for a volume that refuses Replace, and it is safe here only
-        because the pending marker is still standing over it.
-
-        The marker comes off LAST, after the committed file has been read back, because an in-memory
-        stamp proves nothing about what survived on disk. A false return therefore leaves the
-        directory protected - the correct end state for a package that is gone and a backup that is
-        not provably recoverable.
-
-        It rewrites the object THIS run built rather than re-reading the file. Measured on both
-        hosts: ConvertFrom-Json leaves an ISO-8601 string alone on Windows PowerShell 5.1 but parses
-        it into a [datetime] on PowerShell 7, so a read-modify-write would round-trip CreatedUtc
-        through a different type on one host and could rewrite it in another form.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)]$Manifest
-    )
-
-    $manifestPath = Get-WacLongPath -Path (Join-Path -Path $Path -ChildPath $script:BackupManifestName)
-    $stagingPath = $manifestPath + '.commit'
-
-    try {
-        $Manifest.DeletedUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        [System.IO.File]::WriteAllText($stagingPath, ($Manifest | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
-
-        try { [System.IO.File]::Replace($stagingPath, $manifestPath, $null) }
-        catch {
-            [System.IO.File]::Delete($manifestPath)
-            [System.IO.File]::Move($stagingPath, $manifestPath)
-        }
-    }
-    catch {
-        try { [System.IO.File]::Delete($stagingPath) } catch { $null = $_ }
-        return $false
-    }
-
-    $committed = $null
-    try { $committed = [System.IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json -ErrorAction Stop }
-    catch {
-        return $false
-    }
-
-    if ($null -eq $committed) { return $false }
-    if (@($committed.PSObject.Properties.Name) -cnotcontains 'DeletedUtc') { return $false }
-    if ([string]::IsNullOrWhiteSpace([string]$committed.DeletedUtc)) { return $false }
-
-    return (Clear-WacDriverBackupDeletePending -Path $Path)
-}
-
 function Export-WacDriverBackup {
     <#
     .SYNOPSIS
@@ -508,11 +415,16 @@ function Export-WacDriverBackup {
                        package it holds is still installed.
           containment- the identity directory would fall outside the backup root. REFUSED.
           trust      - the identity directory is not on a local fixed volume, has a reparse point
-                       in its chain, or is owned by or replaceable by a non-administrator. REFUSED,
-                       and for an EXISTING directory the refusal comes before its manifest is read:
-                       a directory a standard user can rewrite must not be allowed to say whether
-                       an earlier deletion is reclaimable, and must not be deleted on its say-so
-                       either.
+                       in its chain, or a non-administrator may write to, replace or own it.
+                       REFUSED, and for an EXISTING directory the refusal comes before its manifest
+                       is read: a directory a standard user can rewrite must not be allowed to say
+                       whether an earlier deletion is reclaimable, and must not be deleted on its
+                       say-so either. The verdict is taken by the STRICT rule from the directory's
+                       OWN handle, which is what catches the case a pathname pre-check cannot: an
+                       inherit-only ancestor ACE grants nothing on the parent and becomes effective
+                       on the child the moment this function creates it.
+          collision  - the identity directory name appeared between the check and the create, or a
+                       control file name inside it is already taken. REFUSED rather than adopted.
           timeout    - the export was killed on its deadline, so what is on disk is unknown.
           empty      - /export-driver reported success and produced no .inf. Nothing recoverable.
           mismatch   - the export changed between being hashed and being trusted.
@@ -545,14 +457,29 @@ function Export-WacDriverBackup {
     $result.Directory = $directory
 
     if (Test-Path -LiteralPath $directory) {
-        # BEFORE anything inside is read. The backup root passed this same walk, but an ACE that is
-        # inherit-only THERE grants nothing on the root and everything on the children under it, so
-        # an existing identity directory is asked in its own right - and asked first, because the
-        # next thing this function does is believe that directory's manifest.
+        # BEFORE anything inside is read, in two halves that answer different questions.
+        #
+        # The walk answers for the ancestor CHAIN - a reparse point or a weak DACL anywhere above
+        # this directory - which a handle bound to the directory itself deliberately says nothing
+        # about.
         $existingTrust = Test-WacStatePathIsTrusted -Path $directory
         if (-not $existingTrust.IsTrusted) {
             $result.Outcome = 'SecurityRefusal'
             $result.Reason = 'an export directory with the same package identity already exists and is not machine-trusted ({0})' -f [string]$existingTrust.Reason
+            return $result
+        }
+
+        # The strict proof answers for THIS directory, from its own handle. Test-WacStatePathIsTrusted
+        # only REPORTS its Writers list and applies the relaxed replace-rule, so a directory an
+        # inherit-only ancestor ACE made writable passes the walk and is refused here - which is the
+        # whole point, because the next thing this function does is believe this directory's
+        # manifest, and then delete the directory on the strength of it.
+        $existingProof = Open-WacDriverBackupDirectory -Path $directory
+        Close-WacTrustedDirectory -Handle $existingProof.Handle
+        if (-not $existingProof.IsTrusted) {
+            $result.Outcome = 'SecurityRefusal'
+            $result.Reason = 'an export directory with the same package identity already exists and is not machine-trusted ({0}{1})' -f `
+                [string]$existingProof.Reason, $(if (@($existingProof.Writers).Count -gt 0) { ' writers=' + (@($existingProof.Writers) -join ', ') } else { '' })
             return $result
         }
 
@@ -576,12 +503,21 @@ function Export-WacDriverBackup {
         }
     }
 
-    try {
-        # No -Force: an existing directory must fail here rather than be silently adopted.
-        [void](New-Item -Path $directory -ItemType Directory -ErrorAction Stop)
-    }
-    catch {
-        $result.Reason = 'the export directory could not be created ({0}): {1}' -f (Get-WacIoFailureKind -ErrorRecord $_), $_.Exception.Message
+    # Created through the pinned-handle primitive, never Test-Path then New-Item. Three properties
+    # the pathname create did not have, and all three are load-bearing here:
+    #   * COLLISION-FAILING, so a name that appeared after the check above - the second half of the
+    #     creation race - is refused rather than adopted. New-Item without -Force had this much.
+    #   * BOUND, so the create is anchored to the proved parent rather than to a path walked from
+    #     the volume root, and no swap of any ancestor can move where it lands.
+    #   * PROVED AFTERWARDS BY THE STRICT RULE, from the handle of the directory that was actually
+    #     created. This is the half nothing had: the pre-create verdict was taken on the PARENT, and
+    #     an inherit-only ACE there grants nothing on the parent and full write on this new child.
+    $made = Open-WacDriverBackupDirectory -Path $directory -MayCreate
+    Close-WacTrustedDirectory -Handle $made.Handle
+    if (-not $made.IsTrusted) {
+        $result.Outcome = 'SecurityRefusal'
+        $result.Reason = 'the export directory could not be created and proved ({0}{1})' -f `
+            [string]$made.Reason, $(if (@($made.Writers).Count -gt 0) { ' writers=' + (@($made.Writers) -join ', ') } else { '' })
         return $result
     }
 
@@ -622,13 +558,15 @@ function Export-WacDriverBackup {
 
         $manifest = New-WacDriverBackupManifest -Driver $Driver -Identity $identity -File $file -EnumeratedPackage $EnumeratedPackage
 
-        try {
-            $json = $manifest | ConvertTo-Json -Depth 6
-            $manifestPath = Join-Path -Path $directory -ChildPath $script:BackupManifestName
-            [System.IO.File]::WriteAllText((Get-WacLongPath -Path $manifestPath), $json, (New-Object System.Text.UTF8Encoding($false)))
-        }
-        catch {
-            $result.Reason = 'the backup manifest could not be written ({0}): {1}' -f (Get-WacIoFailureKind -ErrorRecord $_), $_.Exception.Message
+        # Created collision-failing inside the directory's own pinned handle. The directory was
+        # created by this call a moment ago, so the name should be free - and 'should be' is exactly
+        # the assumption a planted file, symlink or hard link at this name exists to break. An
+        # ordinary WriteAllText would have truncated all three.
+        $written = Write-WacDriverBackupControlFile -Path $directory -Name $script:BackupManifestName `
+            -Content ($manifest | ConvertTo-Json -Depth 6)
+        if (-not $written.Ok) {
+            $result.Outcome = 'SecurityRefusal'
+            $result.Reason = 'the backup manifest could not be written ({0})' -f [string]$written.Reason
             return $result
         }
 

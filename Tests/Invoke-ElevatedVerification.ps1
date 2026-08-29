@@ -32,6 +32,11 @@
     They still redirect the same roots, still disable EVERY allow-list category, and still skip the
     Recycle Bin, so the only machine state either one may change is the state its own step owns.
 
+    DRIVERS is the one scenario whose evidence lives OUTSIDE the sandbox. Its exports go where the
+    shipped Get-WacDriverBackupRoot says - %SystemRoot%\Logs\WindowsAutoCleanup\DriverBackup, which
+    no redirected variable moves - so the scenario asks that function for the path rather than
+    spelling it out, and this harness never deletes anything under it.
+
     /ResetBase is excluded from EVERY scenario - it makes each installed update permanently
     un-installable. Every child is launched with -ResetWindowsUpdateBase:$false, and DRIVERS and
     CLEANMGR both assert from the child's own log that it really was off.
@@ -158,8 +163,10 @@ $script:HostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.F
 # Windows 11 install, a sandbox under a per-user temp directory answers untrusted at every level
 # of the chain, so every scenario that reached the footer would exit 7 (security refusal) instead
 # of the code it was checking. %ProgramData%\WindowsAutoCleanup is trusted, and it is also a safer
-# home for the DRIVERS sandbox, which is KEPT when it holds the only recoverable copy of a deleted
-# driver package - a temp cleaner is exactly what must not reach that.
+# home for the DRIVERS sandbox, which is KEPT after a real removal because its run log is this
+# machine's record of one - a temp cleaner is exactly what must not reach that. The driver EXPORTS
+# are not in here at all: they go to Get-WacDriverBackupRoot, under %SystemRoot%\Logs, which this
+# harness must not redirect and never deletes from.
 $script:SandboxRoot = [System.IO.Path]::GetFullPath((Join-Path -Path (Get-WacDataRoot) -ChildPath 'Verification\Sandbox'))
 try { [void][System.IO.Directory]::CreateDirectory($script:SandboxRoot) }
 catch {
@@ -208,8 +215,9 @@ Write-Host '(without /ResetBase), pnpclean and the Delivery Optimization purge; 
 if ($machineSelected.Count -gt 0) {
     Write-Host ''
     Write-Host ('*** {0} CHANGE THIS MACHINE and are not sandboxed:' -f ($machineSelected -join ' and '))
-    Write-Host '***   DRIVERS  deletes superseded driver packages, each exported first; if any package is'
-    Write-Host '***            removed its sandbox is KEPT, because it then holds the only recoverable copy.'
+    Write-Host '***   DRIVERS  deletes superseded driver packages, each exported first to the machine backup'
+    Write-Host '***            root under %SystemRoot%\Logs. Nothing here ever deletes from that root, and'
+    Write-Host '***            after a real removal the sandbox is KEPT too, for the run log of it.'
     Write-Host '***   CLEANMGR runs cleanmgr /sagerun, which enumerates EVERY drive in this computer.'
     Write-Host '*** /ResetBase is excluded from every scenario. Use -Scenario Sandboxed for the safe set.'
 }
