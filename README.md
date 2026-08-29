@@ -274,7 +274,7 @@ here imports its dependencies from module scope, where it does not.
 | `src/WindowsAutoCleanup.RunReport.ps1` | Dot-sourced by `Run.ps1`: the header, the run-level verdicts and the footer. |
 | `Tests/` | Self-contained test harness, bounded parallel runner, and behavioural suites. |
 | `Tests/Invoke-ElevatedVerification.ps1` | Elevated-only harness (with its `_ElevatedVerification.*.ps1` parts) for the exit paths and the opt-in switches that cannot be reached unprivileged. Refuses to run without administrator rights, and is not one of the discovered `*.Tests.ps1` suites. |
-| `.github/workflows/ci.yml` | Analyzer and tests on Windows PowerShell 5.1 and PowerShell 7. |
+| `.github/workflows/ci.yml` | Whitespace and conflict markers over the whole tracked tree, the analyzer, and every suite on Windows PowerShell 5.1 and PowerShell 7, plus a guard that each discovered suite actually ran. Pure-ASCII source, no byte-order mark, and the 800-line file ceiling are enforced by `Tests/RepositoryHygiene.Tests.ps1` rather than by a bespoke CI step, so they hold locally too. |
 | `GITHUB_RELEASE_NOTES.md` | Release notes for the current version. |
 | `LICENSE` | MIT License. |
 

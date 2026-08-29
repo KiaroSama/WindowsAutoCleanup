@@ -166,7 +166,11 @@ before it was fixed.
   external tool a deadline derived from the remaining run budget, captures output without
   deadlocking, and terminates the whole process tree on timeout — a parent-only `Kill()` left
   children running, and the terminator now binds a real kernel handle and verifies the target is
-  gone instead of treating `taskkill` merely exiting as proof. Blocking work that never leaves the
+  gone instead of treating `taskkill` merely exiting as proof. It also refuses to kill anything when
+  the target had **already exited** before it was asked: Windows never clears a recorded parent
+  process id when the parent dies and it reuses ids, so a dead target still appears to have children
+  — measured here at 3% of attempts under load, and they were live unrelated processes. Reading the
+  tree before checking the root meant terminating those strangers. Blocking work that never leaves the
   process — the Delivery Optimization cmdlets, WMI profile discovery, the registry snapshot, the
   Recycle Bin scan, building the allow-list — runs under its own bound too, because a call blocked
   in the OS blocks every deadline check behind it. The default internal budget is 210 minutes, below
