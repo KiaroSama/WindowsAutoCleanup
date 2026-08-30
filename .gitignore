@@ -108,3 +108,6 @@ Desktop.ini
 !/.env.sample
 !/.env.template
 !/.env.dist
+
+# Local advisor output: generated implementation plans, not part of the shipped project.
+/plans/
