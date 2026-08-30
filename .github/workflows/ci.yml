@@ -45,11 +45,21 @@ jobs:
         timeout-minutes: 10
         run: |
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+          # The one floating external input this repository has. There is no manifest and no
+          # lockfile, so nothing else records which analyzer produced a given result, and dependabot
+          # has no ecosystem to watch it through. Unpinned, a new default rule turns an unrelated
+          # pull request red with findings about code it never touched, and nothing in the diff or
+          # the log explains why today differs from yesterday. Bumping this is a deliberate commit:
+          # update the version, rerun the scan locally, and fix what the new rules find in the same
+          # change. The guard filters on the exact version because a runner image that ships its own
+          # PSScriptAnalyzer would otherwise win and make the pin cosmetic.
+          $analyzerVersion = '1.25.0'
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer | Where-Object { $_.Version -eq $analyzerVersion })) {
             Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
-            Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck
+            Install-Module -Name PSScriptAnalyzer -RequiredVersion $analyzerVersion -Force -Scope CurrentUser -AllowClobber -SkipPublisherCheck
           }
-          Import-Module PSScriptAnalyzer
+          Import-Module PSScriptAnalyzer -RequiredVersion $analyzerVersion
+          Write-Host ('PSScriptAnalyzer {0}' -f (Get-Module PSScriptAnalyzer).Version)
           # Scan the SHIPPED set rather than '.', so the identical command is runnable in a working
           # tree that also holds git-ignored agent runtimes and gives the same answer as CI.
           $shipped = @('Run.ps1', 'Install-WindowsAutoCleanupTask.ps1', 'Uninstall-WindowsAutoCleanupTask.ps1', 'src', 'Tests')

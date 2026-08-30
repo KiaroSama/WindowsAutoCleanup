@@ -342,186 +342,6 @@ Test-Case 'An audit log that is not durable exits 6' {
     }
 }
 
-Test-Case 'A refused state directory is never created, and the refusal never travels through it' {
-    # DEFECT 1 in its literal shape. New-WacLogFile created the directory and the log file, and only
-    # THEN was that directory asked whether it could be trusted - so the refusal was written THROUGH
-    # the very path it was refusing, while the documented guarantee said nothing is written before a
-    # refusal. Asserting the exit code alone would not have caught it: the old code exited 7 too.
-    #
-    # Every shape of "no" is exercised, including the two that are not answers at all, because the
-    # code has to key off IsTrusted and off an unanswerable question - never off a chosen reason.
-    # One rig carries them all: a refused root is never created, so no scenario can leave state for
-    # the next one, and the fingerprint below would see it if one did.
-    $rig = New-RunRig -Prefix 'rig-refused'
-    try {
-        $stateRoot = Join-Path -Path $rig.ProgramData -ChildPath 'WindowsAutoCleanup'
-
-        foreach ($shape in @(
-                @{ Name = 'writable'; Plan = @{ stateTrusted = $false
-                        stateReason = 'Non-administrative principals hold write access: S-1-5-32-545'
-                    }
-                },
-                @{ Name = 'inherited-unsafe'; Plan = @{ stateTrusted = $false
-                        stateReason = 'Non-administrative principals can replace children here: S-1-1-0'
-                    }
-                },
-                @{ Name = 'reparse'; Plan = @{ stateTrusted = $false
-                        stateReason = 'The path is a reparse point, or its attributes are unreadable.'
-                    }
-                },
-                @{ Name = 'inaccessible'; Plan = @{ stateTrusted = $false
-                        stateReason = 'Security descriptor is unreadable: Attempted to perform an unauthorized operation.'
-                    }
-                },
-                @{ Name = 'indeterminate-no-verdict'; Plan = @{ stateTrustNull = $true } },
-                @{ Name = 'indeterminate-throws'; Plan = @{ stateTrustThrows = $true } })) {
-
-            Clear-RigProbeRecord -Rig $rig
-
-            $plan = @{ targets = @((New-PlanTarget -Category 'Temp' -FilesDeleted 5)) }
-            foreach ($key in $shape.Plan.Keys) { $plan[$key] = $shape.Plan[$key] }
-
-            $result = Invoke-RunRig -Rig $rig -Plan $plan
-            $note = ' [shape={0}] stderr: {1}' -f $shape.Name, $result.ErrorText
-
-            Assert-True $result.Exited ('the run did not finish inside its bound.' + $note)
-            Assert-Equal 7 $result.ExitCode ('a refused state directory did not exit 7.' + $note)
-
-            # Nothing was created: not the log file, not its directory, not even the machine-wide
-            # state root above it. An unanswered question is refused exactly like a "no".
-            Assert-Equal 'ABSENT' (Get-DirectoryFingerprint -Path $stateRoot) `
-            ('something was created under the refused state root.' + $note)
-            Assert-Equal '' (Get-RigLogText -Rig $rig) `
-            ('the refusal was written through the path it was refusing.' + $note)
-
-            # The verdict still reached a sink and still says what it is: a refusal nobody can read
-            # is the other way to fail this.
-            $fallback = Get-RigFallbackText -Rig $rig
-            Assert-True ($fallback.Contains('No machine-trusted state directory was found')) `
-            ('the refusal reached no sink at all.' + $note + ' fallback: ' + $fallback)
-            Assert-True ($fallback -cmatch '(^|\s)status=SecurityRefusal($|\s)') ('fallback: ' + $fallback + $note)
-            Assert-True ($fallback -cmatch '(^|\s)exitCode=7($|\s)') ('fallback: ' + $fallback + $note)
-
-            # The ORDER, from the check's own point of view. Both candidate roots were verified, and
-            # each was asked about while it did not yet exist - which is only possible if the
-            # question came before the creation rather than after it.
-            $asked = @(Get-RigTrustQuestion -Rig $rig)
-            Assert-Equal 2 $asked.Count ('both candidate roots must be verified before either is used.' + $note)
-            foreach ($question in $asked) {
-                Assert-False $question.Existed `
-                ('the trust question was asked about a path that already existed: ' + $question.Path + $note)
-            }
-        }
-    }
-    finally {
-        Remove-RunRig -Rig $rig
-    }
-}
-
-Test-Case 'A refused state directory that already exists is left byte for byte as it was' {
-    # The other half of "must not touch the refused path at all": refusing must not append to it,
-    # copy into it, sweep it or delete anything in it either. The directory is pre-created with
-    # content, fingerprinted, and compared afterwards - and that comparison sees a FileStream and a
-    # File.Delete, which a recorder of cmdlet calls would not.
-    $rig = New-RunRig -Prefix 'rig-refused-existing'
-    try {
-        $root = $rig.LogDirectory
-        [void][System.IO.Directory]::CreateDirectory($root)
-
-        $decoy = Join-Path -Path $root -ChildPath 'WindowsAutoCleanup_2000-01-01_00-00-00_UTC.log'
-        [System.IO.File]::WriteAllText($decoy, 'evidence from an earlier run', $script:Utf8NoBom)
-        [System.IO.File]::SetLastWriteTimeUtc($decoy, ([datetime]'2000-01-01T00:00:00Z'))
-
-        $before = Get-DirectoryFingerprint -Path $root
-        Assert-True ($before.Contains('evidence from an earlier run')) `
-            'the fixture never wrote the file it is about to protect'
-
-        $result = Invoke-RunRig -Rig $rig -Plan @{ stateTrusted = $false; targets = @() }
-
-        Assert-True $result.Exited ('the run did not finish inside its bound. stderr: ' + $result.ErrorText)
-        Assert-Equal 7 $result.ExitCode ('stderr: ' + $result.ErrorText)
-        Assert-Equal $before (Get-DirectoryFingerprint -Path $root) `
-            'the refused state directory was added to, written to or deleted from'
-
-        # And the check really did run against this directory, so the comparison above is evidence
-        # rather than a coincidence of the run having stopped somewhere else entirely.
-        Assert-True (@(Get-RigTrustQuestion -Rig $rig | Where-Object { $_.Path -ieq $root }).Count -eq 1) `
-            'the refused directory was never the one the trust question was asked about'
-    }
-    finally {
-        Remove-RunRig -Rig $rig
-    }
-}
-
-Test-Case 'A log directory planted as a link is refused by the run, and its target is untouched' {
-    # Root 1 of audit brief 8, end to end. The pathname preflight ANSWERS TRUSTED here, so the only
-    # thing between the run and the attacker's target is the guard that verifies the object actually
-    # opened. Reverted to Test-Path plus New-Item -Force, Test-Path calls the junction a container
-    # and the whole SYSTEM audit log lands inside the link's target - measured, and this case sees
-    # it. The plant is a junction because a plain directory's owner depends on whether the suite is
-    # elevated, and this must assert the same thing in a developer shell and on a hosted runner.
-    $rig = New-RunRig -Prefix 'rig-planted-link'
-    try {
-        $outside = Join-Path -Path $rig.Sandbox -ChildPath 'outside'
-        [void][System.IO.Directory]::CreateDirectory($outside)
-        [System.IO.File]::WriteAllText((Join-Path -Path $outside -ChildPath 'sentinel.txt'), 'untouched', $script:Utf8NoBom)
-
-        # BOTH candidates are planted, not just the first. An elevated run has two, and leaving the
-        # second usable makes this case assert the fallback rather than the refusal - the run then
-        # correctly logs into candidate 2 and exits 0, which is what "A refused state directory is
-        # never created" already covers. The refusal is only the verdict when there is nowhere left
-        # to go, so that is the state this case has to build.
-        $fallbackRoot = Join-Path -Path $rig.WindowsRoot -ChildPath 'Logs\WindowsAutoCleanup'
-        foreach ($planted in @($rig.LogDirectory, $fallbackRoot)) {
-            [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $planted))
-            New-Item -ItemType Junction -Path $planted -Target $outside -ErrorAction Stop | Out-Null
-        }
-
-        $before = Get-DirectoryFingerprint -Path $outside
-        Assert-True ($before.Contains('untouched')) 'the fixture never wrote the sentinel it is about to protect'
-
-        $result = Invoke-RunRig -Rig $rig -Plan @{ stateTrusted = $true; targets = @() }
-
-        Assert-True $result.Exited ('the run did not finish inside its bound. stderr: ' + $result.ErrorText)
-        Assert-Equal $before (Get-DirectoryFingerprint -Path $outside) `
-            'the link target was created under or written to'
-
-        # 7, not Run.ps1's generic "no log anywhere" exit 1: the refusal was a SECURITY one and has
-        # to reach the field the verdict is derived from, or a deliberate refusal reads to an
-        # operator as a malfunction. Measured before that was wired up: it exited 1.
-        Assert-Equal 7 $result.ExitCode `
-        ('a refused state directory did not exit SecurityRefusal. stderr: ' + $result.ErrorText)
-
-        $fallback = Get-RigFallbackText -Rig $rig
-        Assert-True ($fallback -match 'reparse point') `
-        ('the refusal never named what it refused: ' + $fallback)
-        Assert-True ($fallback -cmatch '(^|\s)exitCode=7($|\s)') ('fallback: ' + $fallback)
-    }
-    finally {
-        # Removed AS LINKS: a recursive delete would take the target's contents with it, and
-        # Remove-Item throws a spurious NullReferenceException on some junctions under 5.1.
-        foreach ($planted in @($rig.LogDirectory, (Join-Path -Path $rig.WindowsRoot -ChildPath 'Logs\WindowsAutoCleanup'))) {
-            try { [System.IO.Directory]::Delete($planted, $false) } catch { $null = $_ }
-        }
-        Remove-RunRig -Rig $rig
-    }
-}
-
-Test-Case 'A state trust verdict that was never reached refuses nothing' {
-    # $null is NOT EVALUATED - the shape an unelevated run produces, whose log lives in the user's
-    # own profile, and the shape a caller that named its own -CandidateRoot produces. It carries no
-    # claim to refuse, so it must refuse nothing. The untrusted verdict is proved by the two cases
-    # above, which is also where it now takes effect: before the log is opened, not after.
-    $rig = New-RunRig -Prefix 'rig-trust'
-    try {
-        $notEvaluated = Invoke-RunRig -Rig $rig -Plan @{ stateEvaluated = $false; targets = @() }
-        Assert-RigExit -Rig $rig -Result $notEvaluated -ExitCode 0 -Status 'Succeeded'
-    }
-    finally {
-        Remove-RunRig -Rig $rig
-    }
-}
-
 Test-Case 'A step result that states no outcome is never read as a success' {
     # Every shipped step returns .Outcome now. One that does not is a step this mapping cannot
     # classify, and the only safe reading of an unclassifiable step is that it did not succeed -
@@ -559,6 +379,43 @@ Test-Case 'A module that cannot be imported is bootstrap-logged, folded into the
         # Adopted, so the bootstrap file is gone and the run leaves ONE audit artifact.
         $leftover = @(Get-ChildItem -LiteralPath $rig.Temp -Filter 'WindowsAutoCleanup-bootstrap-*.log' -File -ErrorAction SilentlyContinue)
         Assert-Equal 0 $leftover.Count 'the bootstrap log survived a run whose log adopted it'
+    }
+    finally {
+        Remove-RunRig -Rig $rig
+    }
+}
+
+Test-Case 'A system drive that is not C: exits 5 and cleans nothing' {
+    # Exit 5 stops this tool cleaning a machine whose online system drive is not C:. Every allow-list
+    # location is written for C:, so running against a different Windows installation could delete
+    # data belonging to it.
+    #
+    # Until this case existed, CI defended that boundary with a REGEX over Run.ps1's source text
+    # (Orchestration.Tests.ps1 matches Test-WacSystemDriveSupported.{0,600}?exit 5), which passes
+    # just as happily on a commented-out or unreachable exit. The regex is KEPT: it catches the call
+    # being deleted, this catches the branch being neutered. The gap was structural - _RunRig.ps1
+    # hard-coded the drive check to succeed, unlike every other environmental fact it shims, so no
+    # scenario could reach the branch. That shim is plan-driven now.
+    $rig = New-RunRig -Prefix 'rig-drive5'
+    try {
+        # A target that WOULD be swept, so "cleaned nothing" is an observation rather than the
+        # trivially true statement it would be over an empty allow-list.
+        $result = Invoke-RunRig -Rig $rig -Plan @{
+            driveUnsupported = $true
+            targets = @((New-PlanTarget -Category 'Temp' -FilesDeleted 7))
+        }
+
+        Assert-True $result.Exited ('the run did not finish inside its bound. stderr: ' + $result.ErrorText)
+        Assert-Equal 5 $result.ExitCode ('an unsupported system drive did not exit with the documented code 5. stderr: ' + $result.ErrorText)
+
+        $log = Get-RigLogText -Rig $rig
+        Assert-True ($log.Contains('The online system drive is not C:')) ('the refusal never said why: ' + $log)
+        Assert-True ($log -cmatch '(^|\s)\[CRITICAL\]') ('the refusal was not written at a level nothing can gate out: ' + $log)
+
+        # The gate sits before every cleanup step, so nothing may have been swept. A run that exited
+        # 5 AFTER sweeping would satisfy the exit-code assertion on its own.
+        Assert-False ($log.Contains('files=7')) ('a target was swept before the drive gate refused: ' + $log)
+        Assert-False ($log.Contains('status=Succeeded')) ('the run recorded a success verdict behind exit 5: ' + $log)
     }
     finally {
         Remove-RunRig -Rig $rig

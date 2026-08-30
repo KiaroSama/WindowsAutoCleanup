@@ -677,4 +677,42 @@ Test-Case 'the pre-relocation backup root is detected, never believed, and never
     }
 }
 
+Test-Case 'the manifest file list is ordered ordinally, so both hosts produce the same order' {
+    # This list is compared INDEX BY INDEX when an export is verified, so its order is part of the
+    # contract. Sort-Object is culture-sensitive, and the two hosts were MEASURED to disagree with
+    # each other over these very names under the same en-US culture: oem-a.inf sorts 5th under
+    # pwsh 7 and 7th under Windows PowerShell 5.1. A manifest written by the scheduled task under
+    # one host and verified by an operator under the other would then report a path mismatch for a
+    # backup whose files and hashes are all intact.
+    #
+    # The expected order is computed ORDINALLY in the test. Ordinal ordering is host-independent by
+    # definition, so this same assertion passing under both hosts IS the cross-host proof. What it
+    # does not prove: that a manifest physically written by 5.1 verifies under 7 - the harness runs
+    # one host per process and never hands one process's file to another.
+    $sandbox = New-TestSandbox -Prefix 'dbh-order'
+    try {
+        # Every name must differ by more than CASE: NTFS is case-insensitive, so OEM_b.cat and
+        # oem_B.cat are one file and the list would silently come back one entry short.
+        $names = @('oem_a.inf', 'oem-a.inf', 'oemA.inf', 'oem1.sys', 'oem_b.cat', 'oemZ.dll')
+        foreach ($name in $names) {
+            [System.IO.File]::WriteAllText((Join-Path -Path $sandbox -ChildPath $name), $name)
+        }
+
+        $hashed = Get-WacDriverBackupFileHash -Path $sandbox
+        Assert-True $hashed.Ok ('the file list could not be built: ' + [string]$hashed.Reason)
+
+        $expected = @($names)
+        [array]::Sort($expected, [System.StringComparer]::OrdinalIgnoreCase)
+
+        $actual = @($hashed.File | ForEach-Object { [string]$_.Path })
+        Assert-Equal $expected.Count $actual.Count 'the file list lost or gained an entry'
+        for ($i = 0; $i -lt $expected.Count; $i++) {
+            Assert-Equal $expected[$i] $actual[$i] ('manifest order differs at index ' + $i + ': ' + ($actual -join ','))
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun

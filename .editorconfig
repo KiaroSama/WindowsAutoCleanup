@@ -1,0 +1,35 @@
+# The two cheapest ways to fail CI here are trailing whitespace (the workflow runs `git diff --check`
+# over every tracked file, not just the last commit) and a stray byte above 0x7F or a byte-order mark
+# (Tests/RepositoryHygiene.Tests.ps1 fails on either). Both are things an editor prevents at save
+# time for free. .gitattributes normalises line endings on COMMIT; this file is what an editor reads
+# while you type, and the two agree by design.
+#
+# EditorConfig has no ASCII-only setting - charset = utf-8 is the closest it gets, and it stops a
+# silent BOM or re-encode rather than a typed smart quote. RepositoryHygiene stays the real gate; do
+# not delete that test on the strength of this file.
+
+root = true
+
+[*]
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+
+# Matches .gitattributes: *.ps1/*.psm1/*.psd1 are text eol=crlf, because the Windows hosts and
+# editors this project targets expect it.
+[*.{ps1,psm1,psd1}]
+end_of_line = crlf
+
+# Matches .gitattributes: *.md and *.yml are text eol=lf.
+[*.{yml,yaml}]
+end_of_line = lf
+indent_size = 2
+
+[*.md]
+end_of_line = lf
+# Markdown gives two trailing spaces the meaning of a hard line break, so trimming them silently
+# changes rendering. The workflow's whitespace gate still applies here, so keep the file clean by
+# hand rather than letting an editor decide.
+trim_trailing_whitespace = false

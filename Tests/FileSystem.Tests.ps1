@@ -108,6 +108,34 @@ Test-Case 'Remove-WacTree -DeleteRoot removes the root as well' {
     }
 }
 
+Test-Case 'A root whose parent is the volume root is deleted, not refused as an identity mismatch' {
+    # The fixture has to sit DIRECTLY under C:\ - that is the whole point. Every other -DeleteRoot
+    # case builds several levels under %TEMP%, which is why nine adversarial audits never saw this.
+    # The handle-bound delete proves the parent by comparing two strings built by rules that disagree
+    # about exactly one case: SplitLeaf keeps the volume root's trailing separator (the open needs
+    # it, since "C:" names the current directory) and FinalPathOf strips it. They could never match,
+    # so C:\Windows.old - the only allow-list target with this shape, and the only one whose own root
+    # is deleted - was emptied but never removed, and the resulting RefusedIdentity raised the entire
+    # run to SecurityRefusal. RefusedIdentity is the assertion that fails against the unfixed code.
+    $root = 'C:\wac-test-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    try {
+        [void][System.IO.Directory]::CreateDirectory($root)
+        [void](New-TestFile (Join-Path -Path $root -ChildPath 'a.txt'))
+
+        $result = Remove-WacTree -Category 'volroot' -Path $root -DeleteRoot
+
+        Assert-True $result.Attempted
+        Assert-Equal 0 ([int]$result.RefusedIdentity) 'the volume-root parent failed its own identity proof'
+        Assert-False ([System.IO.Directory]::Exists($root)) 'the root survived a -DeleteRoot sweep'
+        Assert-True ([System.IO.Directory]::Exists('C:\')) 'deletion climbed above the root'
+    }
+    finally {
+        if ([System.IO.Directory]::Exists($root)) {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------------------------
 # Reparse points
 # ---------------------------------------------------------------------------------------------

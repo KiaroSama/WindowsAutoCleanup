@@ -24,7 +24,7 @@ If you used an earlier version, read this section before upgrading.
 - **The scheduled task no longer runs your source checkout.** The installer copies the runtime into `%ProgramFiles%\WindowsAutoCleanup` and registers that copy.
 - **Logs moved to `%ProgramData%\WindowsAutoCleanup\Logs`.** Logs must not live inside a directory the tool cleans, and a `SYSTEM` task must not depend on the checkout being writable.
 - **`cleanmgr /sagerun` is no longer part of the default run.** Microsoft documents that `/sagerun` enumerates every drive and that `/d` is not honoured with it, so it cannot be part of a `C:`-only default. It is still available behind `-EnableLegacyDiskCleanup`.
-- **Superseded driver-package pruning is now opt-in** (`-PruneSupersededDrivers`) and exports a recoverable backup before deleting anything. A package is only ever a candidate when the documented structured inventory shows it installed on **no device**, connected or disconnected; uncertainty always means skip. **Backups moved to `%SystemRoot%\Logs\WindowsAutoCleanup\DriverBackup`.** An export is the only copy of a package about to be deleted, so nobody outside the administrators may be able to create a name beside it — and `%ProgramData%` cannot offer that: it carries an inherited `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` that every child inherits and no healthy install can shed, which would let a standard user plant the manifest, the pending marker or the commit file before the run writes them. This project is not allowed to rewrite an ACL, so the location is the whole lever. Pruning now **refuses** rather than warning when its root has any non-administrative writer, and the verdict is taken on the object that was actually opened or created, through that object's own handle — checking the parent by name is not enough, because an ACE that is *inherit-only* there grants nothing on the parent and everything on the child created under it. The three predictable control files are created collision-failing and no-follow, so a manifest, pending marker or commit file already sitting at the name — as an ordinary file, a link, or an extra hard link to something outside — is refused rather than truncated, replaced or followed. Anything left in the old location is never read, written or deleted — the reason that location was abandoned is exactly that its evidence cannot be trusted, so nothing there is believed. It is not ignored either: every run **counts** what is still sitting in it, and while anything remains the driver step cannot report a clean outcome, only `Incomplete`. Clearing it is deliberately an operator's job — inspect those exports by hand, recover what you need, and remove the rest. Until you do, the run keeps telling you they are there. Each backup sits in a directory named for the package identity rather than its recyclable `oem<n>.inf` number, with a `wac-driver-backup.json` manifest carrying the deletion evidence and a SHA-256 per exported file. If you ever find a `wac-driver-delete.pending` file beside that manifest, a deletion was attempted and its record never became durable: the package may already be gone, that export is protected from every later run, and recovering it and removing the marker is a manual step. Every started deletion is confirmed against the driver store itself rather than believed on `pnputil`'s exit code, so a removal that happened behind a non-success exit is counted but still reports the run as failed. **A reboot-required result is no exception.** `3010` and `1641` used to skip the check on the reasoning that the package is legitimately still listed until the restart — true, but not a reason to assert a removal nobody observed. The store is now asked after every started deletion, and a package still present behind a reboot-required exit keeps its export and its pending marker, counts nothing, and reports the run incomplete. A later run reconciles that marker: only a confirmed absence after the restart commits the backup and counts the removal, and a package still there stays incomplete rather than being quietly forgotten. The backup root, and every identity directory already inside it, must pass the same machine-trust walk the log directory gets; pruning refuses rather than writing a recovery export somewhere a standard user could tamper with it.
+- **Superseded driver-package pruning is now opt-in** (`-PruneSupersededDrivers`) and exports a recoverable backup before deleting anything. A package is only ever a candidate when the documented structured inventory shows it installed on **no device**, connected or disconnected; uncertainty always means skip. **Backups moved to `%SystemRoot%\Logs\WindowsAutoCleanup\DriverBackup`.** An export is the only copy of a package about to be deleted, so nobody outside the administrators may be able to create a name beside it — and `%ProgramData%` cannot offer that: it carries an inherited `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` that every child inherits and no healthy install can shed, which would let a standard user plant the manifest, the pending marker or the commit file before the run writes them. This project is not allowed to rewrite an ACL, so the location is the whole lever. Pruning now **refuses** rather than warning when its root has any non-administrative writer, and the verdict is taken on the object that was actually opened or created, through that object's own handle — checking the parent by name is not enough, because an ACE that is *inherit-only* there grants nothing on the parent and everything on the child created under it. The three predictable control files are created collision-failing and no-follow, so a manifest, pending marker or commit file already sitting at the name — as an ordinary file, a link, or an extra hard link to something outside — is refused rather than truncated, replaced or followed. Anything left in the old location is never read, written or deleted — the reason that location was abandoned is exactly that its evidence cannot be trusted, so nothing there is believed. It is not ignored either: every run **counts** what is still sitting in it, and while anything remains the driver step cannot report a clean outcome, only `Incomplete`. Clearing it is deliberately an operator's job — inspect those exports by hand, recover what you need, and remove the rest. Until you do, the run keeps telling you they are there. The step-by-step procedure for finding a backup, verifying its hashes and re-adding the package is under [Recovering a pruned driver package](#recovering-a-pruned-driver-package). Each backup sits in a directory named for the package identity rather than its recyclable `oem<n>.inf` number, with a `wac-driver-backup.json` manifest carrying the deletion evidence and a SHA-256 per exported file. If you ever find a `wac-driver-delete.pending` file beside that manifest, a deletion was attempted and its record never became durable: the package may already be gone, that export is protected from every later run, and recovering it and removing the marker is a manual step. Every started deletion is confirmed against the driver store itself rather than believed on `pnputil`'s exit code, so a removal that happened behind a non-success exit is counted but still reports the run as failed. **A reboot-required result is no exception.** `3010` and `1641` used to skip the check on the reasoning that the package is legitimately still listed until the restart — true, but not a reason to assert a removal nobody observed. The store is now asked after every started deletion, and a package still present behind a reboot-required exit keeps its export and its pending marker, counts nothing, and reports the run incomplete. A later run reconciles that marker: only a confirmed absence after the restart commits the backup and counts the removal, and a package still there stays incomplete rather than being quietly forgotten. The backup root, and every identity directory already inside it, must pass the same machine-trust walk the log directory gets; pruning refuses rather than writing a recovery export somewhere a standard user could tamper with it.
 - **The Recycle Bin is now actually emptied under `SYSTEM`.** `Clear-RecycleBin` only clears the calling identity's bin, so a scheduled run used to clear essentially nothing while reporting success.
 - `-SkipAclHardening` is accepted but ignored, so a task registered by an older installer keeps working.
 
@@ -71,7 +71,7 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Run.ps1 -ResetWindowsUpdateB
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-WindowsAutoCleanupTask.ps1
 ```
 
-The installer deploys the runtime to `%ProgramFiles%\WindowsAutoCleanup`, verifies that no non-administrative principal can write to it, and only then registers the task. Pass `-DailyRunTime 03:00` to change the schedule and `-NoPause` for automation.
+The installer deploys the runtime to `%ProgramFiles%\WindowsAutoCleanup`, verifies that no non-administrative principal can write to it, and only then registers the task. Pass `-DailyRunTime 03:00` to change the schedule and `-NoPause` for automation; the opt-in switches that decide what the daily run actually does are listed under [Installer and uninstaller parameters](#installer-and-uninstaller-parameters).
 
 ### Remove the scheduled task
 
@@ -99,7 +99,44 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Invoke-ElevatedVerific
 
 `-Scenario Sandboxed` proves exit codes `5`, `3`, and `2` end to end inside redirected sandboxes. `-Scenario All` additionally runs `DRIVERS` and `CLEANMGR`, which exercise the two opt-in switches against the real `pnputil` and `cleanmgr` and therefore **change the machine they run on**. No scenario ever passes `/ResetBase`.
 
+### Before you open a pull request
+
+CI enforces four gates. All four are runnable locally, and running them first is faster than
+learning about them from a red build.
+
+**Whitespace and conflict markers.** Diffing against the empty-tree object lints every tracked file,
+not just your last commit — a trailing space that arrived three commits ago still fails.
+
+```bash
+git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
+```
+
+**Static analysis.** Scanning the shipped set rather than `.` gives the same answer as CI in a
+working tree that also holds git-ignored tooling. Install the analyzer once with
+`Install-Module -Name PSScriptAnalyzer -Scope CurrentUser`; it is installed at job time in CI and is
+not a repository dependency.
+
+```powershell
+$shipped = @('Run.ps1', 'Install-WindowsAutoCleanupTask.ps1', 'Uninstall-WindowsAutoCleanupTask.ps1', 'src', 'Tests')
+@($shipped | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings .\Tests\PSScriptAnalyzerSettings.psd1 })
+```
+
+**Every suite on both hosts**, with `Run-Tests.ps1 -Host both` as above. Use `-Filter <name>` while
+iterating and run the full set before pushing.
+
+**Four hard rules**, each enforced by a test rather than by review:
+
+- Every PowerShell file is pure ASCII with no byte-order mark — `Tests/RepositoryHygiene.Tests.ps1`.
+- No PowerShell file reaches 800 lines — same suite. Split by responsibility rather than deleting an
+  assertion to fit.
+- Shipped code never calls an ACL, owner or terminal-wrapper cmdlet, and never resolves an
+  executable through `Get-Command` — `Tests/ShippedCodeBan.Tests.ps1`.
+- Every `Tests\*.Tests.ps1` file is discovered and must actually run — a CI guard compares the
+  discovered set against the manifest the runner writes, so a suite cannot be silently skipped.
+
 ## Parameters
+
+### `Run.ps1` parameters
 
 | Parameter | Default | Effect |
 | --- | --- | --- |
@@ -119,6 +156,23 @@ Parameters bind **by name only**. `-ResetWindowsUpdateBase $false` — with a sp
 ```bash
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Run.ps1 -ResetWindowsUpdateBase:$false
 ```
+
+### Installer and uninstaller parameters
+
+The three opt-in switches are passed to the **installer**, which writes them into the registered
+task action — so a daily scheduled run performs them. They are not manual-run-only, and hand-editing
+the registered task instead is what the ownership proof and the exact action parsing exist to catch.
+
+| Script | Parameter | Default | Effect |
+| --- | --- | --- | --- |
+| Install | `-DailyRunTime` | `20:00` | Daily task run time, 24-hour `HH:mm`. |
+| Install | `-NoPause` | off | Do not wait for a key press before exiting. For automation and tests. |
+| Install | `-ResetWindowsUpdateBase` | `$true` | Registers the task with DISM `/ResetBase` enabled. Pass `-ResetWindowsUpdateBase:$false` to register it without; that value survives the elevation relaunch and is always written into the task action explicitly. |
+| Install | `-PruneSupersededDrivers` | off | Adds `-PruneSupersededDrivers` to the task action. |
+| Install | `-EnableLegacyDiskCleanup` | off | Adds `-EnableLegacyDiskCleanup` to the task action. **`cleanmgr /sagerun` enumerates every drive, which breaks the `C:`-only guarantee.** |
+| Uninstall | `-NoPause` | off | As above. |
+| Uninstall | `-RemoveLogs` | off | Also delete the log files under `%ProgramData%\WindowsAutoCleanup\Logs`. The log this run is writing survives, so the uninstall stays auditable. |
+| Uninstall | `-KeepLogs` | — | Keep the logs even when `-RemoveLogs` is also passed. Makes the safe choice explicit in a script whose flags come from somewhere else. |
 
 ## Exit codes
 
@@ -251,6 +305,72 @@ Nothing in v1.2.0 recreates any of this — the capability is gone, and a test f
 
 **The installer refuses to register the task.** The deployment directory failed the machine-trust check, meaning a non-administrative principal could still write to what `SYSTEM` would execute. The log names the exact path and principal. This fails closed on purpose.
 
+### Recovering a pruned driver package
+
+Driver pruning exports a package before it deletes it, so a device that stops working can be put
+back. Re-adding a driver package is a machine change **you** make by hand, outside this tool — the
+tool deletes and reports, it has never installed anything and will not do this for you.
+
+Backups live at `%SystemRoot%\Logs\WindowsAutoCleanup\DriverBackup`, one directory per package
+identity. The directory is named by a content hash rather than by the `oem<n>.inf` name, because
+Windows recycles those numbers and two different packages can both call themselves `oem5.inf`.
+
+**1. Find the right package.** Each identity directory holds a `wac-driver-backup.json` manifest
+recording the original INF name, provider, version and the published name:
+
+```powershell
+Get-ChildItem 'C:\Windows\Logs\WindowsAutoCleanup\DriverBackup' -Directory | ForEach-Object {
+    $manifest = Join-Path $_.FullName 'wac-driver-backup.json'
+    if (Test-Path -LiteralPath $manifest) {
+        $m = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+        [PSCustomObject]@{
+            Directory  = $_.Name
+            Original   = $m.OriginalName
+            Published  = $m.DriverName
+            Provider   = $m.ProviderName
+            Version    = $m.VersionText
+            DeletedUtc = $m.DeletedUtc
+            Pending    = (Test-Path -LiteralPath (Join-Path $_.FullName 'wac-driver-delete.pending'))
+        }
+    }
+} | Format-Table -AutoSize
+```
+
+An empty `DeletedUtc` means the export exists but the package was never actually removed — the
+driver is still in the store and there is nothing to restore.
+
+**2. Verify the export before you trust it.** The manifest records a SHA-256 for every exported
+file. A mismatch means the backup is not usable and must not be installed:
+
+```powershell
+$dir = 'C:\Windows\Logs\WindowsAutoCleanup\DriverBackup\<identity-directory>'
+$m = Get-Content -LiteralPath (Join-Path $dir 'wac-driver-backup.json') -Raw | ConvertFrom-Json
+foreach ($entry in $m.File) {
+    $file = Join-Path $dir $entry.Path
+    $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+    [PSCustomObject]@{ Path = $entry.Path; Matches = ($actual -eq $entry.Sha256.ToUpperInvariant()) }
+} | Format-Table -AutoSize
+```
+
+**3. Put it back.** From an **elevated** prompt, point `pnputil` at the exported INF:
+
+```powershell
+pnputil /add-driver "C:\Windows\Logs\WindowsAutoCleanup\DriverBackup\<identity-directory>\<name>.inf" /install
+```
+
+**4. Confirm it landed** by looking for the published name in the store:
+
+```powershell
+pnputil /enum-drivers
+```
+
+**A `wac-driver-delete.pending` marker.** The tool started a deletion and could not confirm how it
+ended, so it kept both the marker and the copy, and the driver step will not report better than
+`Incomplete` until an operator resolves it. Decide by asking the store whether the package is still
+installed (`pnputil /enum-drivers`, looking for the manifest's `DriverName`). If it is gone and you
+do not need it back, deleting the marker file is a deliberate manual act that tells the next run the
+question is settled. If it is still installed, the deletion did not happen and nothing is lost.
+
 **`Get-ScheduledTask` does not show the task.**
 The task is registered under `\WindowsAutoCleanup\` with a `SYSTEM` principal, and its security descriptor is not readable by a standard user, so an unelevated `Get-ScheduledTask` or `schtasks /query` reports nothing at all. Query it from an elevated shell, or read the Task Scheduler operational event log, which records registration (event 106) and each run (events 100/102/201) regardless of privilege.
 
@@ -267,12 +387,6 @@ The task is registered under `\WindowsAutoCleanup\` with a `SYSTEM` principal, a
 | `src/WindowsAutoCleanup.Steps.psm1` | Package entry point over `StepContract`, `RecycleBin` and `DiskCleanup`: the shared result vocabulary, DISM, Delivery Optimization, the Recycle Bin sweep and the opt-in cleanmgr step. |
 | `src/WindowsAutoCleanup.Drivers.psm1` | Package entry point over `DriverInventory` and `DriverBackup`: pnpclean, the structured pnputil inventory, and opt-in package pruning with content-addressed backups. |
 | `src/WindowsAutoCleanup.Deploy.psm1` | Package entry point over `DeploymentTree`, `DeploymentProof` and `ScheduledTask`: the shared operation lock, staging and rollback, ownership proof, and task action parsing. |
-
-A package entry point `.psm1` **dot-sources** its `.ps1` parts rather than importing them as nested
-modules, and re-exports the same names it always did, so nothing that imports it has to change. That
-is not a style choice: a nested module gets its own session state, so a call from one part to
-another resolves only while the parent happens to be imported at global scope - and every module
-here imports its dependencies from module scope, where it does not.
 | `Install-WindowsAutoCleanupTask.ps1` | Deploys the runtime and registers the daily task. |
 | `Uninstall-WindowsAutoCleanupTask.ps1` | Removes the task and the deployment. |
 | `src/WindowsAutoCleanup.EntryGate.ps1` | The pre-flight safety verdict, dot-sourced by **both** entry points so the two cannot drift: log health and state trust are decided before the first mutation, and an unknown answer refuses just as a false one does. |
