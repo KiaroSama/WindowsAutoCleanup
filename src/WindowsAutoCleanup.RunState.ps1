@@ -600,6 +600,36 @@ function Get-WacLogDirectory {
     try { return (Split-Path -Parent $script:LogPath) } catch { return $null }
 }
 
+function ConvertTo-WacLogSafeText {
+    <#
+    .SYNOPSIS
+        One log record stays one physical line, whatever the value contained.
+    .DESCRIPTION
+        Values reaching the log come from the filesystem and from external process output, and NTFS
+        permits CR and LF in a name even though Explorer cannot type one. A raw line break ends the
+        record early and hands the rest of the line to whoever chose the name - which, in a
+        world-writable swept location, is anyone. Measured: one Write-WacLog call with a CR+LF in a
+        -Data value produced TWO lines, the second of which was a complete forged record carrying
+        its own timestamp, level, component and status.
+
+        Quoting does not contain it. The key=value rule already quotes a value matching \s, and \s
+        MATCHES a newline - but quoting only wraps a string that still holds the break, so the
+        record still splits and the closing quote lands inside the forged half.
+
+        The escapes are readable rather than lossy, so the audit trail still shows what the name
+        really was. The angle-bracket form is deliberate: a backslash escape (\r) would be ambiguous
+        against an ordinary path, because C:\reports genuinely contains the two characters \ and r,
+        and disambiguating it would mean doubling every backslash - turning every logged path into
+        C:\\Windows\\Temp. Windows forbids < and > in a file name, so <CR> cannot be produced by any
+        real path, and ordinary paths pass through completely untouched.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    $safe = $Text.Replace("`r", '<CR>').Replace("`n", '<LF>').Replace("`t", '<TAB>')
+    # Anything else below 0x20, plus DEL, becomes <0xNN> rather than reaching the file raw.
+    return [regex]::Replace($safe, '[\x00-\x1F\x7F]', { param($m) '<0x{0:X2}>' -f [int][char]$m.Value })
+}
+
 function Write-WacLog {
     <#
     .SYNOPSIS
@@ -623,13 +653,17 @@ function Write-WacLog {
     # broken, the same lines go to the fallback instead of evaporating.
     if (-not $script:LogWriter -and -not $script:LogDegraded) { return }
 
+    # $Level and $Component are constrained by ValidateSet and by caller-supplied constants, so they
+    # are NOT escaped - doing so would change the documented format. $Message and every $Data value
+    # can carry a filename or external process output, so both go through the escape first.
     $line = '[{0} UTC] [{1}] [{2}] {3}' -f `
-        (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Component, $Message
+        (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Component,
+        (ConvertTo-WacLogSafeText -Text $Message)
 
     if ($Data -and $Data.Count -gt 0) {
         $parts = New-Object 'System.Collections.Generic.List[string]'
         foreach ($key in @($Data.Keys | Sort-Object)) {
-            $value = [string]$Data[$key]
+            $value = ConvertTo-WacLogSafeText -Text ([string]$Data[$key])
             if ($value -match '[\s"]') { $value = '"{0}"' -f ($value -replace '"', "'") }
             [void]$parts.Add(('{0}={1}' -f $key, $value))
         }

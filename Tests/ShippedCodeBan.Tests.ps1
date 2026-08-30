@@ -126,4 +126,120 @@ Test-Case 'The shipped-code scanner flags a real call and ignores the same words
     }
 }
 
+# ---------------------------------------------------------------------------------------------
+# A trust verdict's Reason stays inert (the tripwire behind RunExitCode's three-shape refusal loop)
+# ---------------------------------------------------------------------------------------------
+
+function Get-ReasonBranchSite {
+    <#
+    .SYNOPSIS
+        Every place a shipped file uses a .Reason property as a BRANCH CONDITION.
+    .DESCRIPTION
+        Assigning it and logging it are fine and expected - Reason exists to be written into the
+        audit trail. What must not happen is code DECIDING on it: the moment a branch keys off the
+        wording of a reason, the four "why was it untrusted" variants RunExitCode.Tests.ps1 used to
+        spawn a child process for each stop being redundant.
+
+        The AST is walked rather than the text scanned: a comment mentioning .Reason, and the string
+        interpolations that build log messages out of it, must not read as violations.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$errors)
+    Assert-Equal 0 @($errors).Count ('{0} does not parse' -f $Path)
+
+    $sites = New-Object 'System.Collections.Generic.List[string]'
+
+    # Collect the CONDITION subtrees explicitly, by node type. Reaching for a generic .Condition
+    # property does not work: an IfStatementAst carries .Clauses, not .Condition, and under
+    # Set-StrictMode -Version 2.0 asking for the missing property is a terminating error.
+    $conditions = New-Object 'System.Collections.Generic.List[object]'
+
+    foreach ($node in @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] }, $true))) {
+        foreach ($clause in $node.Clauses) { [void]$conditions.Add($clause.Item1) }
+    }
+    foreach ($node in @($ast.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.WhileStatementAst] -or
+                    $n -is [System.Management.Automation.Language.DoWhileStatementAst] -or
+                    $n -is [System.Management.Automation.Language.DoUntilStatementAst] -or
+                    $n -is [System.Management.Automation.Language.SwitchStatementAst]
+                }, $true))) {
+        if ($node.Condition) { [void]$conditions.Add($node.Condition) }
+    }
+    # Any COMPARISON involving .Reason, wherever it sits: assigning the result of one to a variable
+    # and branching on that variable later is the same decision, one statement apart. Only
+    # comparison operators count - in PowerShell `+` and `-f` are BinaryExpressionAst too, so a
+    # catch-all here reports every log line that formats a Reason into a message. Measured: 55
+    # false positives before this filter, 0 after.
+    $comparison = @('Ieq', 'Ine', 'Ceq', 'Cne', 'Igt', 'Ige', 'Ilt', 'Ile', 'Cgt', 'Cge', 'Clt', 'Cle',
+        'Ilike', 'Inotlike', 'Clike', 'Cnotlike', 'Imatch', 'Inotmatch', 'Cmatch', 'Cnotmatch',
+        'Icontains', 'Inotcontains', 'Ccontains', 'Cnotcontains', 'Iin', 'Inotin', 'Cin', 'Cnotin',
+        'Is', 'IsNot')
+    foreach ($node in @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.BinaryExpressionAst] }, $true))) {
+        if ($comparison -contains [string]$node.Operator) { [void]$conditions.Add($node) }
+    }
+
+    foreach ($condition in $conditions) {
+        foreach ($hit in @($condition.FindAll({
+                        param($inner)
+                        $inner -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                        $inner.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                        $inner.Member.Value -ieq 'Reason'
+                    }, $true))) {
+            # An assignment TO .Reason is not a decision, and the left side of one never appears
+            # inside a condition subtree, so nothing extra is needed to exclude it.
+            [void]$sites.Add(('{0}:{1}' -f (Split-Path -Leaf $Path), $hit.Extent.StartLineNumber))
+        }
+    }
+
+    return @($sites.ToArray())
+}
+
+Test-Case 'No shipped file branches on a trust verdict Reason' {
+    # RunExitCode.Tests.ps1 exercises ONE untrusted shape rather than four, because the four differed
+    # only in this string. That reduction is safe exactly as long as this stays true; when it stops
+    # being true, this case fails and points straight at the shapes that need to come back.
+    $offenders = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($file in Get-ShippedFile) {
+        foreach ($site in (Get-ReasonBranchSite -Path $file)) { [void]$offenders.Add($site) }
+    }
+
+    Assert-Equal 0 $offenders.Count ('a shipped file decides on a Reason string: ' + ($offenders -join ', '))
+}
+
+Test-Case 'The Reason scanner flags a real branch and ignores an assignment or a log line' {
+    # A scanner that cannot detect its own target is worse than no scanner.
+    $sandbox = New-TestSandbox -Prefix 'reason-scan'
+    try {
+        $violation = Join-Path -Path $sandbox -ChildPath 'violation.ps1'
+        [System.IO.File]::WriteAllText($violation, @'
+function Test-Thing {
+    $verdict = Get-Something
+    if ($verdict.Reason -eq 'reparse') { return $false }
+    return $true
+}
+'@)
+        Assert-True (@(Get-ReasonBranchSite -Path $violation).Count -ge 1) 'the scanner missed a real branch on Reason'
+
+        $benign = Join-Path -Path $sandbox -ChildPath 'benign.ps1'
+        [System.IO.File]::WriteAllText($benign, @'
+function Test-Thing {
+    $result = [PSCustomObject]@{ Reason = '' }
+    $verdict = Get-Something
+    $result.Reason = 'Owner is not administrative'
+    # A comment mentioning $verdict.Reason must not count.
+    Write-Thing -Data @{ reason = [string]$verdict.Reason }
+    if ($verdict.IsTrusted) { return $true }
+    return $result
+}
+'@)
+        Assert-Equal 0 @(Get-ReasonBranchSite -Path $benign).Count 'the scanner flagged an assignment or a log line'
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun

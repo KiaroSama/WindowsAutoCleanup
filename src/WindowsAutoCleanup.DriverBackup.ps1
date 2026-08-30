@@ -158,7 +158,22 @@ function Get-WacDriverBackupFileHash {
     }
 
     $result.Ok = $true
-    $result.File = @(@($entry.ToArray()) | Sort-Object -Property { [string]$_.Path })
+    # ORDINAL, not Sort-Object. This list is compared INDEX BY INDEX when an export is verified, so
+    # its order is part of the contract - and Sort-Object is culture-sensitive. Measured on this
+    # machine, both hosts under en-US, over realistic driver file names: the two hosts disagree with
+    # EACH OTHER (oem-a.inf sorts 5th under pwsh 7 and 7th under Windows PowerShell 5.1, and the two
+    # cat files swap), while the ordinal order is identical on both. A manifest written by the
+    # scheduled task under one host and verified by an operator under the other would therefore
+    # report 'expected <a>, found <b>' for a backup whose files and hashes are all intact - declaring
+    # a usable recovery copy unusable, which is the one thing this whole protocol exists to prevent.
+    # OrdinalIgnoreCase rather than Ordinal, so the sort and the -ine comparison below share a case
+    # rule. FileSystem.psm1 carries the same fix in its ordering form.
+    $ordered = @($entry.ToArray())
+    [array]::Sort($ordered, [System.Comparison[object]] {
+            param($x, $y)
+            [string]::Compare([string]$x.Path, [string]$y.Path, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    $result.File = @($ordered)
     return $result
 }
 

@@ -570,7 +570,15 @@ public static class WacNative
             // open below then pins it, so a swap after this point cannot move the target.
             string actualParent = FinalPathOf(parentHandle);
             if (actualParent == null) { win32Error = Marshal.GetLastWin32Error(); return DELETE_IDENTITY_MISMATCH; }
-            if (!string.Equals(actualParent, parent, StringComparison.OrdinalIgnoreCase))
+            // TrimEnd, because the two sides are built by rules that disagree about exactly one case.
+            // FinalPathOf strips the trailing separator; SplitLeaf deliberately KEEPS it on a volume
+            // root, because "C:" alone names the process's current directory on that drive rather than
+            // the root, and the OPEN above needs the separator form. Comparing them directly could
+            // therefore never match for a child of the volume root - so C:\Windows.old, the one target
+            // whose own root is deleted, failed this proof on every machine, was emptied but never
+            // removed, and its RefusedIdentity raised the whole run to SecurityRefusal (exit 7).
+            // SplitLeaf only ever appends a separator in that one case, so this trims nothing else.
+            if (!string.Equals(actualParent, parent.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
             {
                 return DELETE_IDENTITY_MISMATCH;
             }

@@ -55,6 +55,7 @@ function Get-WacTestPlan {
         targetBlockMs = 0
         targetThrow = $false
         telemetryFails = $false
+        driveUnsupported = $false
     }
 
     $path = [string]$env:WAC_TEST_PLAN
@@ -86,7 +87,16 @@ function Get-WacFallbackDataRoot {
 }
 
 function Test-WacIsAdministrator { return $true }
-function Test-WacSystemDriveSupported { return $true }
+
+# Plan-driven, like the telemetry shims below, rather than a hard $true. Exit 5 - the refusal that
+# stops this tool cleaning a machine whose system drive is not C: - is a documented contract row and
+# one of the hard safety boundaries, and with this shim wired shut no rig scenario could reach its
+# Run.ps1 site at all. CI therefore defended it with a REGEX over Run.ps1's source text, which would
+# pass just as happily on a commented-out or unreachable exit.
+function Test-WacSystemDriveSupported {
+    if ((Get-WacTestPlan).driveUnsupported) { return $false }
+    return $true
+}
 
 # Telemetry, and only telemetry. Both of these are diagnostics the run writes about itself and
 # neither may reach the verdict, so the scenario that proves it has to be able to break them. They
