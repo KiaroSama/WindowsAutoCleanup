@@ -16,8 +16,10 @@
 
     RunReport.ps1 is DOT-SOURCED rather than imported: it is not a module, deliberately, because it
     runs in Run.ps1's own script scope (see RunSurface.Tests.ps1 for why that must stay true).
-    Drivers.psm1 holds a second copy of the same rank table and is reached through its module scope,
-    since it does not export the function.
+    The rank table and Get-WacHigherOutcome live in StepContract.psm1 - ONE copy, reached through
+    Steps.psm1. RunReport.ps1 and Drivers.psm1 each used to hold their own; Run.ps1 held a third as a
+    raw table index. Invoke-DriverHigherOutcome below still calls through the driver module's scope
+    on purpose, because that reachability is what the merge could have broken.
 #>
 
 Set-StrictMode -Version 2.0
@@ -28,6 +30,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
 Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Core.psm1') `
+    -Force -DisableNameChecking -ErrorAction Stop
+Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Steps.psm1') `
     -Force -DisableNameChecking -ErrorAction Stop
 Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Drivers.psm1') `
     -Force -DisableNameChecking -ErrorAction Stop
@@ -48,6 +52,15 @@ $script:ExpectedLogLevel = [ordered]@{
 }
 
 function Invoke-DriverHigherOutcome {
+    <#
+    .SYNOPSIS
+        The lattice as the DRIVER module sees it.
+    .DESCRIPTION
+        Drivers.psm1 used to define its own byte-identical copy; the two were merged into
+        StepContract.psm1, which Drivers reaches through Steps.psm1. This still calls through the
+        driver module's scope on purpose - it proves the merged function is actually reachable from
+        that load path, which is the thing the merge could have broken.
+    #>
     param([string]$Current, [string]$Candidate)
 
     return (& $script:DriverModule { param($c, $n) Get-WacHigherOutcome -Current $c -Candidate $n } $Current $Candidate)
@@ -65,26 +78,34 @@ Test-Case 'every ordered pair of outcomes resolves to the higher-ranked one' {
         foreach ($candidate in $script:ExpectedRank.Keys) {
             $expected = if ($script:ExpectedRank[$candidate] -gt $script:ExpectedRank[$current]) { $candidate } else { $current }
 
-            Assert-Equal $expected (Get-WacHigherRunOutcome -Current $current -Candidate $candidate) `
-            ('run lattice disagreed for current={0} candidate={1}' -f $current, $candidate)
+            Assert-Equal $expected (Get-WacHigherOutcome -Current $current -Candidate $candidate) `
+            ('the lattice disagreed for current={0} candidate={1}' -f $current, $candidate)
             Assert-Equal $expected (Invoke-DriverHigherOutcome -Current $current -Candidate $candidate) `
             ('driver lattice disagreed for current={0} candidate={1}' -f $current, $candidate)
         }
     }
 }
 
-Test-Case 'the run lattice and the driver lattice hold the same table' {
-    # The two copies have not drifted. Nothing prevents it, and a drift would surface only as a run
-    # whose driver step and whose footer disagree about which outcome wins.
-    $driverRank = Get-ModuleVariableValue -Module $script:DriverModule -Name 'OutcomeRank'
+Test-Case 'exactly one rank table exists, and it is the documented one' {
+    # This case used to assert that the run copy and the driver copy AGREED, because there were two
+    # byte-identical tables and nothing prevented them drifting. They were merged into
+    # StepContract.psm1; the case is kept rather than deleted so the reason the merge was safe stays
+    # on record, and it now asserts what replaced the agreement: one table, reachable from the load
+    # paths that used to hold their own, carrying exactly the documented ranks.
+    $table = Get-WacOutcomeRankTable
 
-    Assert-Equal $script:ExpectedRank.Keys.Count @($driverRank.Keys).Count 'the driver rank table has a different number of outcomes'
-    Assert-Equal $script:ExpectedRank.Keys.Count @($script:OutcomeRank.Keys).Count 'the run rank table has a different number of outcomes'
-
+    Assert-Equal $script:ExpectedRank.Keys.Count @($table.Keys).Count 'the rank table has a different number of outcomes'
     foreach ($name in $script:ExpectedRank.Keys) {
-        Assert-Equal $script:ExpectedRank[$name] $script:OutcomeRank[$name] ('run rank for {0}' -f $name)
-        Assert-Equal $script:ExpectedRank[$name] $driverRank[$name] ('driver rank for {0}' -f $name)
+        Assert-Equal $script:ExpectedRank[$name] $table[$name] ('rank for {0}' -f $name)
     }
+
+    # A caller may not mutate the rule the exit code rests on.
+    $table['Succeeded'] = 99
+    Assert-Equal 0 (Get-WacOutcomeRankTable)['Succeeded'] 'the accessor handed out the live table rather than a copy'
+
+    # And the merged function is reachable from the driver load path, not just from Steps.
+    Assert-Equal 'SecurityRefusal' (Invoke-DriverHigherOutcome -Current 'Failed' -Candidate 'SecurityRefusal') `
+        'the driver module cannot reach the merged lattice'
 }
 
 # ---------------------------------------------------------------------------------------------

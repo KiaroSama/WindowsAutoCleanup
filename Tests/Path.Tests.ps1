@@ -212,4 +212,50 @@ Test-Case 'A name is never trimmed into a different name, and the two hosts do n
     Assert-Equal $interior (Get-WacNormalizedPath -Path $interior) 'an interior U+00A0 was treated as trimmable whitespace'
 }
 
+Test-Case 'Test-WacIsProtectedPath compares ordinally, and is still case-insensitive' {
+    <#
+        Regression guard for the ordinal sweep. The equality half of the protection rule is
+        [string]::Equals(..., OrdinalIgnoreCase) rather than -ieq, because -ieq is a LINGUISTIC
+        comparison decided by the thread's culture and this is a security decision.
+
+        What this case actually defends is the OTHER mistake, and it is the likely one: reaching for
+        ::Ordinal and making the comparison case-SENSITIVE. Windows paths are case-insensitive, so
+        that would be a real regression. Every path below is the registered root in another casing
+        and is neither a descendant nor an ancestor of it, so only the EQUALITY branch can answer -
+        which is what makes this a mutation test for that specific line.
+    #>
+    Clear-WacProtectedRoot
+    Add-WacProtectedRoot -Path 'C:\Temp\wacordinal'
+
+    Assert-True (Test-WacIsProtectedPath -Path 'C:\TEMP\WACORDINAL') 'an all-upper form of the root'
+    Assert-True (Test-WacIsProtectedPath -Path 'c:\temp\wacordinal') 'an all-lower form of the root'
+    Assert-True (Test-WacIsProtectedPath -Path 'C:\Temp\WacOrdinal') 'a mixed-case form of the root'
+
+    Clear-WacProtectedRoot
+}
+
+Test-Case 'Test-WacIsWithinRoot compares ordinally, and is still case-insensitive' {
+    <#
+        The containment guard. Its equality half is ordinal for the same reason, and the same
+        case-sensitivity mutation would break it; the first two assertions guard against that.
+
+        The last assertion is not hypothetical. Measured on this machine while making this change:
+        'STRASSE' -ieq 'STRA<U+00DF>E' is TRUE on Windows PowerShell 5.1 and FALSE on PowerShell 7,
+        for the same two strings, in both en-US and tr-TR - the hosts disagree because 5.1 compares
+        through NLS and 7 through ICU. They name two different directories, so FALSE is the correct
+        answer, and the ordinal rule gives it on both hosts. Against the previous -ieq implementation
+        this assertion FAILS on 5.1, which is what makes it worth having.
+    #>
+    Assert-True (Test-WacIsWithinRoot -ChildPath 'C:\TEMP\ROOT' -RootPath 'c:\temp\root') `
+        'the root itself, written in another casing'
+    Assert-True (Test-WacIsWithinRoot -ChildPath 'C:\temp\root\SUB\leaf.txt' -RootPath 'C:\Temp\Root') `
+        'a descendant, written in another casing'
+    Assert-False (Test-WacIsWithinRoot -ChildPath 'C:\Temp\rootx' -RootPath 'C:\Temp\root') `
+        'a sibling sharing a name prefix'
+
+    $sharpS = [char]0x00DF
+    Assert-False (Test-WacIsWithinRoot -ChildPath 'C:\Temp\STRASSE' -RootPath ('C:\Temp\STRA' + $sharpS + 'E')) `
+        'a linguistically-equal but ordinally-different name was judged to be inside the root'
+}
+
 Complete-TestRun

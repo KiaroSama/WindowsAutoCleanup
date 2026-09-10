@@ -74,6 +74,25 @@ public static class WacNative
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessTimes(IntPtr process, out long created,
+        out long exited, out long kernel, out long user);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_BASIC_INFORMATION
+    {
+        public int ExitStatus;
+        public IntPtr PebBaseAddress;
+        public UIntPtr AffinityMask;
+        public int BasePriority;
+        public UIntPtr UniqueProcessId;
+        public UIntPtr InheritedFromUniqueProcessId;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationProcess(IntPtr process, int informationClass,
+        out PROCESS_BASIC_INFORMATION information, int informationLength, out int returnLength);
+
     private const uint FILE_READ_ATTRIBUTES         = 0x0080;
     private const uint FILE_SHARE_READ_WRITE_DELETE = 0x0007;
     private const uint OPEN_EXISTING                = 3;
@@ -84,6 +103,7 @@ public static class WacNative
     private const int  MOVEFILE_DELAY_UNTIL_REBOOT  = 0x00000004;
     private const int  SYNCHRONIZE                  = 0x00100000;
     private const int  PROCESS_TERMINATE             = 0x00000001;
+    private const int  PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000;
     private const uint DELETE_ACCESS                = 0x00010000;
     private const int  FileDispositionInformation   = 13;
 
@@ -241,10 +261,8 @@ public static class WacNative
     // has it exited yet, terminate it - is then asked of the HANDLE, so the answer keeps referring
     // to the process that was opened however Windows later reuses the number.
     //
-    // The mask is exactly the two rights used: SYNCHRONIZE to wait on it and PROCESS_TERMINATE to
-    // kill it. PROCESS_QUERY_LIMITED_INFORMATION is deliberately NOT requested - nothing here reads
-    // an exit code, the wait is the exit test, and every unnecessary right is one more reason for
-    // the OS to refuse an open it would otherwise have granted.
+    // Query access is needed to prove creation time and parentage on this SAME handle before a
+    // snapshot candidate may be terminated; a recorded parent PID alone is not ownership.
     //
     // Returns 0 with the handle set, otherwise the Win32 error with handle = IntPtr.Zero. Measured
     // identically on both shipped hosts: 87 ERROR_INVALID_PARAMETER when nothing owns the id
@@ -254,9 +272,25 @@ public static class WacNative
     // asked" is told apart from "nothing owns this id".
     public static int OpenProcessForTermination(int processId, out IntPtr handle)
     {
-        handle = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, false, processId);
+        handle = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
         if (handle == IntPtr.Zero) { return Marshal.GetLastWin32Error(); }
         return 0;
+    }
+
+    public static bool ReadProcessIdentity(IntPtr handle, out int parentId, out long created)
+    {
+        parentId = -1;
+        created = 0;
+        long exited, kernel, user;
+        if (!GetProcessTimes(handle, out created, out exited, out kernel, out user)) { return false; }
+        PROCESS_BASIC_INFORMATION information;
+        int returned;
+        if (NtQueryInformationProcess(handle, 0, out information,
+            Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)), out returned) != 0) { return false; }
+        ulong parent = information.InheritedFromUniqueProcessId.ToUInt64();
+        if (parent > int.MaxValue || created <= 0) { return false; }
+        parentId = (int)parent;
+        return true;
     }
 
     // 0 is WAIT_OBJECT_0: the process this handle is bound to has exited. 258 is WAIT_TIMEOUT.

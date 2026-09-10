@@ -87,7 +87,7 @@ function New-WacDeploymentManifest {
         if ($relative.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
             $relative = $relative.Substring($prefix.Length)
         }
-        if ($relative -ieq $script:DeploymentManifestName) { continue }
+        if ([string]::Equals($relative, $script:DeploymentManifestName, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
 
         $hash = Get-WacDeploymentFileHash -Path $item.Path
         if (-not $hash) { throw ("A staged file could not be hashed: {0}" -f $item.Path) }

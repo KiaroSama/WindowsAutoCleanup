@@ -179,7 +179,62 @@ function Invoke-WacStepBounded {
         -ImportModule @($script:StepsModulePath) -Component $Component -IgnoreRunBudget:$IgnoreRunBudget)
 }
 
+# ------------------------------------------------------------------------------------------------
+# Outcome precedence - ONE copy
+# ------------------------------------------------------------------------------------------------
+#
+# This rule decides the process exit code, and it used to exist THREE times: a table plus a function
+# in RunReport.ps1, a byte-identical pair in Drivers.psm1, and a raw table index in Run.ps1 with no
+# function boundary at all. Adding a sixth outcome meant three synchronised edits with nothing to
+# catch a missed one, and a miss would surface only as a run whose driver step and whose footer
+# disagree about which outcome wins.
+#
+# It lives here because this file is already the shared result vocabulary, and because it is the one
+# place BOTH load paths reach: Run.ps1 imports Steps.psm1 (which dot-sources this) and dot-sources
+# RunReport.ps1 into its own scope, while Drivers.psm1 imports Steps.psm1 too. RunReport.ps1 cannot
+# become a module - it deliberately runs in Run.ps1's script scope - so the shared home had to be
+# somewhere both could import from.
+
+$script:OutcomeRank = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 1; 'Failed' = 2; 'SecurityRefusal' = 3 }
+
+function Get-WacHigherOutcome {
+    <#
+    .SYNOPSIS
+        The higher-precedence of two outcomes. Pure.
+    .DESCRIPTION
+        Equal ranks keep $Current, so SafeSkip after Succeeded stays Succeeded - both map to exit 0,
+        so either answer is right at the exit code and only one is right here.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Current,
+        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Candidate
+    )
+
+    if ($script:OutcomeRank[$Candidate] -gt $script:OutcomeRank[$Current]) { return $Candidate }
+    return $Current
+}
+
+function Test-WacOutcomeIsClean {
+    <#
+    .SYNOPSIS
+        True when an outcome carries no bad news. Replaces a raw rank index in Run.ps1.
+    #>
+    param([Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Outcome)
+
+    return ($script:OutcomeRank[$Outcome] -eq 0)
+}
+
+function Get-WacOutcomeRankTable {
+    <#
+    .SYNOPSIS
+        A COPY of the rank table, for tests that assert the contract. Callers get a clone so nothing
+        outside this file can mutate the rule the exit code rests on.
+    #>
+    return @{} + $script:OutcomeRank
+}
+
 Export-ModuleMember -Function @(
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath',
-    'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded'
+    'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded',
+    'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable'
 )

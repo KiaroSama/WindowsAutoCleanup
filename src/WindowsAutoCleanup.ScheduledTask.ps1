@@ -56,7 +56,8 @@ function Test-WacTaskExecuteIsCanonicalHost {
     [void]$canonical.Add((Get-WacNormalizedPath -Path (Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe')))
 
     foreach ($host51 in $canonical) {
-        if ($host51 -and $normalized -ieq $host51) { return $true }
+        # ORDINAL, not -ieq: this decides whether the task runs a canonical PowerShell host.
+        if ($host51 -and [string]::Equals($normalized, $host51, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
 
     return $false
@@ -121,7 +122,11 @@ function Test-WacTaskQueryIsNotFound {
 
     $category = ''
     try { $category = [string]$ErrorRecord.CategoryInfo.Category } catch { $category = '' }
-    return ($category -ieq 'ObjectNotFound')
+    # Group C, decided: this is a stringified ErrorCategory ENUM MEMBER NAME, an invariant program
+    # token rather than user input or a display string, so ordinal is the correct comparison and a
+    # culture-sensitive one buys nothing. Kept case-insensitive only because the host, not us,
+    # produces the casing.
+    return ([string]::Equals($category, 'ObjectNotFound', [System.StringComparison]::OrdinalIgnoreCase))
 }
 
 function Get-WacTaskQueryResult {
@@ -302,7 +307,7 @@ function Get-WacLegacyTaskScriptPath {
 
     $path = Get-WacNormalizedPath -Path $match.Groups['path'].Value
     if (-not $path) { return $null }
-    if (-not ([System.IO.Path]::GetFileName($path) -ieq 'Run.ps1')) { return $null }
+    if (-not [string]::Equals([System.IO.Path]::GetFileName($path), 'Run.ps1', [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
     return $path
 }
 
@@ -404,7 +409,8 @@ function Test-WacTaskIsOurs {
         if ($workingDirectory) {
             $normalizedWorking = Get-WacNormalizedPath -Path $workingDirectory
             $normalizedRoot = Get-WacNormalizedPath -Path $DeploymentRoot
-            if (-not $normalizedWorking -or -not $normalizedRoot -or ($normalizedWorking -ine $normalizedRoot)) {
+            if (-not $normalizedWorking -or -not $normalizedRoot -or
+                -not [string]::Equals($normalizedWorking, $normalizedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $result.Reason = ('The action working directory {0} is not the deployment root {1}.' -f $workingDirectory, $DeploymentRoot)
                 return $result
             }

@@ -96,7 +96,8 @@ function Write-WacRunHeader {
 # was correctly not run (an opt-in that is off, a tool that is absent) is not a defect.
 # ------------------------------------------------------------------------------------------------
 
-$script:OutcomeRank = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 1; 'Failed' = 2; 'SecurityRefusal' = 3 }
+# The rank table and Get-WacHigherOutcome live in StepContract.psm1 - ONE copy. This file used to
+# hold a second, and Run.ps1 a third as a raw index.
 $script:OutcomeExitCode = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 6; 'Failed' = 2; 'SecurityRefusal' = 7 }
 
 # The level the run's verdict and the evidence behind it are written at, decided by the OUTCOME.
@@ -107,20 +108,6 @@ $script:OutcomeExitCode = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 6; 
 $script:OutcomeLogLevel = @{
     'Succeeded' = 'INFO'; 'SafeSkip' = 'INFO'
     'Incomplete' = 'CRITICAL'; 'Failed' = 'CRITICAL'; 'SecurityRefusal' = 'CRITICAL'
-}
-
-function Get-WacHigherRunOutcome {
-    <#
-    .SYNOPSIS
-        The higher-precedence of two outcomes. Pure.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Current,
-        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Candidate
-    )
-
-    if ($script:OutcomeRank[$Candidate] -gt $script:OutcomeRank[$Current]) { return $Candidate }
-    return $Current
 }
 
 function Get-WacStepOutcome {
@@ -163,7 +150,7 @@ function Get-WacRunLevelOutcome {
 
     if (Test-WacDeadlineExpired) {
         Write-WacLog -Level $script:OutcomeLogLevel['Incomplete'] -Component 'Summary' -Message 'The run budget expired, so not everything this run was asked to do was attempted.'
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete'
+        $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
     }
 
     $logHealth = Get-WacLogHealth
@@ -171,7 +158,7 @@ function Get-WacRunLevelOutcome {
         Write-WacLog -Level $script:OutcomeLogLevel['Incomplete'] -Component 'Summary' -Message 'The durable audit log this run was asked to produce is incomplete.' -Data @{
             reason = [string]$logHealth.Reason; fallback = [string]$logHealth.FallbackKind; failedWrites = $logHealth.FailedWrites
         }
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete'
+        $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
     }
 
     # $null is NOT EVALUATED, which is the correct answer for an unelevated run whose log lives in
@@ -182,7 +169,7 @@ function Get-WacRunLevelOutcome {
         Write-WacLog -Level $script:OutcomeLogLevel['SecurityRefusal'] -Component 'Summary' -Message 'The directory holding this run state and audit log is not machine-trusted.' -Data @{
             path = [string]$stateTrust.Path; reason = [string]$stateTrust.Reason
         }
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'SecurityRefusal'
+        $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'SecurityRefusal'
     }
 
     return $outcome
@@ -270,17 +257,17 @@ function Write-WacRunFooter {
     # rolls its outcome into the totals rather than repeating every line.
     foreach ($step in $StepResult) {
         $stepOutcome = Get-WacStepOutcome -Step $step
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate $stepOutcome
+        $outcome = Get-WacHigherOutcome -Current $outcome -Candidate $stepOutcome
 
         if ($stepOutcome -ceq 'Failed') { $totals.failed++ }
         elseif ($stepOutcome -ceq 'Incomplete') { $totals.stepIncomplete++ }
         elseif ($stepOutcome -ceq 'SecurityRefusal') { $totals.stepRefused++ }
     }
 
-    if ($totals.failed -gt 0) { $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Failed' }
-    if ($totals.skipDeadline -gt 0) { $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'Incomplete' }
+    if ($totals.failed -gt 0) { $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Failed' }
+    if ($totals.skipDeadline -gt 0) { $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete' }
     if (($totals.refusedIdentity + $totals.refusedOutOfRoot) -gt 0) {
-        $outcome = Get-WacHigherRunOutcome -Current $outcome -Candidate 'SecurityRefusal'
+        $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'SecurityRefusal'
     }
 
     $delta = $null

@@ -55,7 +55,8 @@ function Test-WacSystemDriveSupported {
         The whole allow-list is written for C:. Anything else must fail loudly, not half-work.
     #>
     $systemDrive = Get-WacNormalizedPath -Path $env:SystemDrive
-    return ($systemDrive -ieq $script:TargetDrive)
+    # ORDINAL, not -ieq: the whole allow-list depends on this being the target drive.
+    return ([string]::Equals($systemDrive, $script:TargetDrive, [System.StringComparison]::OrdinalIgnoreCase))
 }
 
 function Get-WacCanonicalPowerShellHost {
@@ -144,7 +145,7 @@ function Get-WacUserProfilePath {
         if (-not $normalized) { return }
         if (-not (Test-WacIsRealUserProfilePath -Path $normalized -RequireUserHive:$RequireHive)) { return }
         foreach ($existing in $results) {
-            if ($existing -ieq $normalized) { return }
+            if ([string]::Equals($existing, $normalized, [System.StringComparison]::OrdinalIgnoreCase)) { return }
         }
         [void]$results.Add($normalized)
     }

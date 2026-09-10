@@ -129,7 +129,8 @@ function Get-WacDriverBackupFileHash {
             }
             # The manifest records this list so it cannot be part of it, and the pending marker is
             # only ever written after the list was verified. Neither is export content.
-            if ($relative -ieq $script:BackupManifestName -or $relative -ieq $script:BackupPendingName) { continue }
+            if ([string]::Equals($relative, $script:BackupManifestName, [System.StringComparison]::OrdinalIgnoreCase) -or
+                [string]::Equals($relative, $script:BackupPendingName, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
 
             $stream = New-Object System.IO.FileStream($file.FullName, [System.IO.FileMode]::Open,
                 [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
@@ -166,7 +167,7 @@ function Get-WacDriverBackupFileHash {
     # scheduled task under one host and verified by an operator under the other would therefore
     # report 'expected <a>, found <b>' for a backup whose files and hashes are all intact - declaring
     # a usable recovery copy unusable, which is the one thing this whole protocol exists to prevent.
-    # OrdinalIgnoreCase rather than Ordinal, so the sort and the -ine comparison below share a case
+    # OrdinalIgnoreCase rather than Ordinal, so the sort and the comparison below share a case
     # rule. FileSystem.psm1 carries the same fix in its ordering form.
     $ordered = @($entry.ToArray())
     [array]::Sort($ordered, [System.Comparison[object]] {
@@ -262,13 +263,20 @@ function Test-WacDriverBackupIntact {
     $recorded = @($Manifest.File)
     $observed = @($current.File)
 
+    # Older manifests used culture-dependent ordering. Compare content, not the writer's host order;
+    # sort a new array so verification never mutates the manifest supplied by the caller.
+    [array]::Sort($recorded, [System.Comparison[object]] {
+            param($x, $y)
+            [string]::Compare([string]$x.Path, [string]$y.Path, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+
     if ($recorded.Count -ne $observed.Count) {
         $result.Reason = 'the export holds {0} file(s), the manifest recorded {1}' -f $observed.Count, $recorded.Count
         return $result
     }
 
     for ($i = 0; $i -lt $recorded.Count; $i++) {
-        if ([string]$recorded[$i].Path -ine [string]$observed[$i].Path) {
+        if (-not [string]::Equals([string]$recorded[$i].Path, [string]$observed[$i].Path, [System.StringComparison]::OrdinalIgnoreCase)) {
             $result.Reason = 'expected {0}, found {1}' -f $recorded[$i].Path, $observed[$i].Path
             return $result
         }
@@ -276,7 +284,7 @@ function Test-WacDriverBackupIntact {
             $result.Reason = '{0} is {1} byte(s), the manifest recorded {2}' -f $observed[$i].Path, $observed[$i].Bytes, $recorded[$i].Bytes
             return $result
         }
-        if ([string]$recorded[$i].Sha256 -ine [string]$observed[$i].Sha256) {
+        if (-not [string]::Equals([string]$recorded[$i].Sha256, [string]$observed[$i].Sha256, [System.StringComparison]::OrdinalIgnoreCase)) {
             $result.Reason = '{0} does not match its recorded SHA-256' -f $observed[$i].Path
             return $result
         }
@@ -362,7 +370,7 @@ function Test-WacDriverBackupIsResidue {
         return $result
     }
 
-    if ([string]$manifest.IdentityHash -ine [string]$Identity.Hash) {
+    if (-not [string]::Equals([string]$manifest.IdentityHash, [string]$Identity.Hash, [System.StringComparison]::OrdinalIgnoreCase)) {
         $result.IsResidue = $false
         $result.Reason = 'its manifest records a different package identity'
         return $result

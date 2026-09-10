@@ -32,26 +32,6 @@ Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAut
 Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.FileSystem.psm1') `
     -Force -DisableNameChecking -ErrorAction Stop
 
-function New-TestJunction {
-    <#
-    .SYNOPSIS
-        Creates a real directory junction, or throws if the OS refused.
-    .DESCRIPTION
-        cmd's mklink /J needs no elevation, unlike a symbolic link, so these cases run identically
-        on a developer shell and on an elevated CI runner.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Link,
-        [Parameter(Mandatory = $true)][string]$Target
-    )
-
-    $cmd = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cmd.exe'
-    & $cmd /c mklink /J "$Link" "$Target" | Out-Null
-    if (-not (Test-Path -LiteralPath $Link)) {
-        throw ('the junction could not be created: {0} -> {1}' -f $Link, $Target)
-    }
-}
-
 function Remove-TestJunction {
     param([Parameter(Mandatory = $true)][string]$Link)
 
@@ -84,7 +64,7 @@ function New-EscapeFixture {
     $sentinel = Join-Path -Path $outside -ChildPath 'SENTINEL.dll'
     [System.IO.File]::WriteAllText($sentinel, 'must survive')
 
-    New-TestJunction -Link $link -Target $outside
+    [void](New-TestJunction -Link $link -Target $outside)
 
     return [PSCustomObject]@{
         Root = $root
@@ -491,7 +471,7 @@ Test-Case 'A junction AT the root is refused before anything is enumerated' {
         [System.IO.File]::WriteAllText((Join-Path -Path $outside -ChildPath 'SENTINEL.txt'), 'must survive')
 
         $rootLink = Join-Path -Path $sandbox -ChildPath 'rootlink'
-        New-TestJunction -Link $rootLink -Target $outside
+        [void](New-TestJunction -Link $rootLink -Target $outside)
 
         $result = Remove-WacTree -Category 'reparse root' -Path $rootLink
 

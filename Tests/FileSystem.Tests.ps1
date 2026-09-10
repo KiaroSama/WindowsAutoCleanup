@@ -38,16 +38,6 @@ function New-TestFile {
     return $Path
 }
 
-function New-TestJunction {
-    param(
-        [Parameter(Mandatory = $true)][string]$Link,
-        [Parameter(Mandatory = $true)][string]$Target
-    )
-
-    New-Item -ItemType Junction -Path $Link -Target $Target -ErrorAction Stop | Out-Null
-    return $Link
-}
-
 function Get-TestResultLogLine {
     <#
     .SYNOPSIS

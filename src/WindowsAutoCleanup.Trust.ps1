@@ -382,7 +382,7 @@ function Test-WacStatePathIsTrusted {
         if ([string]::IsNullOrEmpty($parent)) { $reachedRoot = $true; break }
 
         $next = Get-WacNormalizedPath -Path $parent
-        if (-not $next -or $next -ieq $current) {
+        if (-not $next -or [string]::Equals($next, $current, [System.StringComparison]::OrdinalIgnoreCase)) {
             [void]$failures.Add([PSCustomObject]@{
                 Path = $current
                 Reason = 'The ancestor chain could not be followed to the volume root.'
@@ -449,7 +449,8 @@ function Test-WacSidIsAdministrator {
     try {
         $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)
         foreach ($member in $members) {
-            if ([string]$member.SID.Value -ieq $Sid) { return $true }
+            # ORDINAL, not -ieq: a SID match decides administrator membership.
+            if ([string]::Equals([string]$member.SID.Value, $Sid, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
         }
     }
     catch {
@@ -457,7 +458,7 @@ function Test-WacSidIsAdministrator {
         # the current elevated identity, which is who is installing.
         try {
             $current = [Security.Principal.WindowsIdentity]::GetCurrent()
-            if ([string]$current.User.Value -ieq $Sid -and (Test-WacIsAdministrator)) { return $true }
+            if ([string]::Equals([string]$current.User.Value, $Sid, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-WacIsAdministrator)) { return $true }
         }
         catch {
             $null = $_

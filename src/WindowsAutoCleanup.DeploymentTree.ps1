@@ -30,7 +30,7 @@ function Test-WacIsExcludedDeploymentName {
 
     if ([string]::IsNullOrWhiteSpace($Name)) { return $true }
     if ($Name.StartsWith('.')) { return $true }
-    if ($Name -ieq 'Logs') { return $true }
+    if ([string]::Equals($Name, 'Logs', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     return $false
 }
 
@@ -282,7 +282,8 @@ function Remove-WacDeployment {
     $allowed = @($slots.Root, $slots.Staging, $slots.Previous)
     $isAllowed = $false
     foreach ($candidate in $allowed) {
-        if ($normalized -ieq $candidate) { $isAllowed = $true; break }
+        # ORDINAL, not -ieq: this is the delete allow-list for the deployment slots.
+        if ([string]::Equals($normalized, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) { $isAllowed = $true; break }
     }
 
     if (-not $isAllowed) {

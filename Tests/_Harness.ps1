@@ -415,6 +415,31 @@ function Start-TestRestrictedProcess {
     return [PSCustomObject]@{ Child = $started.Child; Error = [string]$started.Error }
 }
 
+function New-TestJunction {
+    <#
+    .SYNOPSIS
+        Creates a real directory junction and returns its path, or throws if the OS refused.
+    .DESCRIPTION
+        cmd's mklink /J needs no elevation, unlike a symbolic link, so these cases run identically on
+        a developer shell and on an elevated CI runner. That is why this does not use
+        New-Item -ItemType Junction: the repository used to carry BOTH implementations, in four
+        copies across four suites, with different creation mechanisms and different return contracts,
+        so a fix applied to one silently left the other suites on the other behaviour - and two of
+        the four copies were dead code nobody called.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Link,
+        [Parameter(Mandatory = $true)][string]$Target
+    )
+
+    $cmd = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cmd.exe'
+    & $cmd /c mklink /J "$Link" "$Target" | Out-Null
+    if (-not (Test-Path -LiteralPath $Link)) {
+        throw ('the junction could not be created: {0} -> {1}' -f $Link, $Target)
+    }
+    return $Link
+}
+
 function New-TestSandbox {
     <#
     .SYNOPSIS

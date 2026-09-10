@@ -138,7 +138,10 @@ function Restore-CapturedTask {
     }
 
     $lookup = Get-WacInstalledTask -IncludeLegacy
-    $back = @(@($lookup.Task) | Where-Object { ('{0}{1}' -f [string]$_.TaskPath, [string]$_.TaskName) -ieq $label })
+    # ORDINAL, not -ieq: this identifies which task was read back after a rollback.
+    $back = @(@($lookup.Task) | Where-Object {
+        [string]::Equals(('{0}{1}' -f [string]$_.TaskPath, [string]$_.TaskName), $label, [System.StringComparison]::OrdinalIgnoreCase)
+    })
     if ($lookup.State -eq 'Failed' -or $back.Count -ne 1) {
         Write-InstallerMessage -Level CRITICAL -Message 'Rollback re-registered the task this run removed but could not read it back, so its restoration is unproven.' -Data @{
             task = $label; state = [string]$lookup.State
@@ -266,7 +269,8 @@ function Assert-RegisteredTask {
     # that is in fact exactly right.
     $actualWorking = Get-WacNormalizedPath -Path ([string]$action.WorkingDirectory)
     $expectedWorking = Get-WacNormalizedPath -Path $ExpectedWorkingDirectory
-    if (-not $actualWorking -or -not $expectedWorking -or ($actualWorking -ine $expectedWorking)) {
+    if (-not $actualWorking -or -not $expectedWorking -or
+        -not [string]::Equals($actualWorking, $expectedWorking, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw ("The registered task's WorkingDirectory is '{0}' instead of '{1}'." -f [string]$action.WorkingDirectory, $ExpectedWorkingDirectory)
     }
 
