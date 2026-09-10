@@ -273,6 +273,7 @@ function Clear-WacDeliveryOptimizationCache {
 Export-ModuleMember -Function @(
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath', 'Get-WacDiskCleanupCategory',
     'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded',
+    'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable',
     'Invoke-WacComponentCleanup',
     'Test-WacRecycleBinEntryName', 'Get-WacRecycleBinScan', 'Clear-WacRecycleBin',
     'Get-WacDeliveryOptimizationCacheLocation', 'Clear-WacDeliveryOptimizationCache',

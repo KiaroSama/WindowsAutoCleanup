@@ -32,12 +32,21 @@
 .PARAMETER IdleTimeoutSeconds
     Ceiling on the time a suite may run without producing output.
 
+.PARAMETER MaxWorkers
+    Upper bound on concurrent suite processes. A CEILING, not a target: it can only lower the count
+    the machine formula computed (at least 2, at most 8, and cores - 2 so the OS, this runner and
+    logging keep headroom). The environment variable HOOKMAKER_MAX_TEST_WORKERS applies the same kind
+    of ceiling and is what the installed test-guard hooks set; when both are present the LOWER wins.
+
 .PARAMETER ManifestPath
     Optional file receiving the name of every suite that actually executed. CI compares it against
     the discovered set so a suite cannot be silently skipped.
 
 .EXAMPLE
     .\Tests\Run-Tests.ps1 -Host both -Filter FileSystem
+
+.EXAMPLE
+    .\Tests\Run-Tests.ps1 -Host both -MaxWorkers 2
 #>
 
 [CmdletBinding()]
@@ -53,6 +62,13 @@ param(
 
     [ValidateRange(15, 3600)][int]$TimeoutSeconds = 300,
     [ValidateRange(10, 3600)][int]$IdleTimeoutSeconds = 120,
+
+    # A CEILING, never a target: it can only lower the count the machine formula computed, never
+    # raise it. Discoverable through Get-Help, unlike HOOKMAKER_MAX_TEST_WORKERS below - which stays
+    # under that exact name because it is the documented shared ceiling the installed test-guard
+    # hooks set, so agents, builds and suites do not each saturate the same CPU independently.
+    [ValidateRange(1, 64)][int]$MaxWorkers,
+
     [string]$ManifestPath
 )
 
@@ -197,6 +213,13 @@ if ($suites.Count -eq 0) {
 
 $cores = [Environment]::ProcessorCount
 $workers = [Math]::Max(2, [Math]::Min(8, $cores - 2))
+# Both ceilings apply and the LOWER one wins. The parameter is the discoverable one; the environment
+# variable is what the installed test-guard hooks set, so an agent-driven run stays inside the shared
+# budget even when nobody passed a switch. Neither may raise the count above what the machine formula
+# allows - a ceiling that could raise it would defeat its own purpose.
+if ($PSBoundParameters.ContainsKey('MaxWorkers')) {
+    $workers = [Math]::Min($workers, $MaxWorkers)
+}
 if ($env:HOOKMAKER_MAX_TEST_WORKERS) {
     $cap = 0
     if ([int]::TryParse($env:HOOKMAKER_MAX_TEST_WORKERS, [ref]$cap) -and $cap -ge 1) {

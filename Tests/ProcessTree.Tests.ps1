@@ -397,10 +397,9 @@ function Test-TreeSurvivesUselessTaskkill {
         $env:SystemRoot = $realRoot
 
         if ($TaskkillExit -ge 0) {
-            Assert-True (Test-Path -LiteralPath $log) 'the stand-in taskkill was never invoked'
-            Assert-Equal ('/T /F /PID ' + $tree.Parent.Id) (([System.IO.File]::ReadAllText($log)).Trim()) `
-                'taskkill was handed the wrong argument vector'
+            Assert-False (Test-Path -LiteralPath $log) 'an unvalidated taskkill tree walk was invoked'
         }
+        Assert-Equal $null $verdict.TaskkillExit 'termination must use only validated handles'
 
         # THE assertion. The child is a grandchild of this suite and was never named to anything:
         # only a body that ENUMERATED the tree and bound the child before killing can reach it.

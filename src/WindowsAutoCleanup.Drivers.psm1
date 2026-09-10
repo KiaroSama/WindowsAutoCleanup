@@ -58,22 +58,9 @@ $script:PnpUtilRebootCode  = @(3010, 1641)
 # rest on.
 $script:PnpUtilEnumArgument = @('/enum-drivers', '/devices', '/format', 'xml')
 
-# Run-level precedence: SecurityRefusal beats Failed beats Incomplete beats a clean outcome.
-$script:OutcomeRank = @{ 'Succeeded' = 0; 'SafeSkip' = 0; 'Incomplete' = 1; 'Failed' = 2; 'SecurityRefusal' = 3 }
-
-function Get-WacHigherOutcome {
-    <#
-    .SYNOPSIS
-        The higher-precedence of two outcomes. Pure.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Current,
-        [Parameter(Mandatory = $true)][ValidateSet('Succeeded', 'SafeSkip', 'Incomplete', 'SecurityRefusal', 'Failed')][string]$Candidate
-    )
-
-    if ($script:OutcomeRank[$Candidate] -gt $script:OutcomeRank[$Current]) { return $Candidate }
-    return $Current
-}
+# Run-level precedence (SecurityRefusal beats Failed beats Incomplete beats a clean outcome) lives in
+# StepContract.psm1, which this module reaches through Steps.psm1. There used to be a byte-identical
+# copy of the table and the function here.
 
 function New-WacDriverStepResult {
     <#

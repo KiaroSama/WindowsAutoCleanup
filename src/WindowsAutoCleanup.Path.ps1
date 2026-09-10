@@ -202,7 +202,12 @@ function Test-WacIsOnTargetDrive {
     $normalized = Get-WacNormalizedPath -Path $Path
     if (-not $normalized) { return $false }
 
-    return ($normalized -ieq $script:TargetDrive -or
+    # ORDINAL, not -ieq. PowerShell's -ieq is a LINGUISTIC comparison decided by the thread's culture,
+    # and these are security decisions: whether a path is the target drive, whether it sits inside a
+    # protected root, whether a resolved handle is the object we meant. The harness's own Assert-Equal
+    # has always compared ordinally, and FileSystem.psm1 carries the same fix in its ordering form.
+    # OrdinalIgnoreCase, never Ordinal - Windows paths are case-insensitive and always were.
+    return ([string]::Equals($normalized, $script:TargetDrive, [System.StringComparison]::OrdinalIgnoreCase) -or
             $normalized.StartsWith($script:TargetDrive + '\', [System.StringComparison]::OrdinalIgnoreCase))
 }
 
@@ -216,7 +221,7 @@ function Add-WacProtectedRoot {
     $normalized = Get-WacNormalizedPath -Path $Path
     if (-not $normalized) { return }
     foreach ($existing in $script:ProtectedRoots) {
-        if ($existing -ieq $normalized) { return }
+        if ([string]::Equals($existing, $normalized, [System.StringComparison]::OrdinalIgnoreCase)) { return }
     }
     [void]$script:ProtectedRoots.Add($normalized)
 }
@@ -270,11 +275,11 @@ function Test-WacIsProtectedPath {
     if (-not $normalized) { return $true }
 
     foreach ($p in (Get-WacFixedProtectedRoot)) {
-        if ($normalized -ieq $p) { return $true }
+        if ([string]::Equals($normalized, $p, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
 
     foreach ($root in $script:ProtectedRoots) {
-        if ($normalized -ieq $root) { return $true }
+        if ([string]::Equals($normalized, $root, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
         if ($normalized.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
         if ($root.StartsWith($normalized + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
@@ -301,11 +306,11 @@ function Test-WacIsProtectedSubtree {
     if (-not $normalized) { return $true }
 
     foreach ($p in (Get-WacFixedProtectedRoot)) {
-        if ($normalized -ieq $p) { return $true }
+        if ([string]::Equals($normalized, $p, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
 
     foreach ($root in $script:ProtectedRoots) {
-        if ($normalized -ieq $root) { return $true }
+        if ([string]::Equals($normalized, $root, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
         if ($normalized.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
 
@@ -333,7 +338,8 @@ function Test-WacIsWithinRoot {
     $root = Get-WacNormalizedPath -Path $RootPath
     if (-not $child -or -not $root) { return $false }
 
-    return ($child -ieq $root -or $child.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase))
+    return ([string]::Equals($child, $root, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $child.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase))
 }
 
 function Get-WacFinalPath {
@@ -412,7 +418,7 @@ function Test-WacPathResolvesToItself {
     $final = Get-WacFinalPath -Path $expected
     if (-not $final) { return $false }
 
-    return ($final -ieq $expected)
+    return ([string]::Equals($final, $expected, [System.StringComparison]::OrdinalIgnoreCase))
 }
 
 function Test-WacIsReparsePoint {

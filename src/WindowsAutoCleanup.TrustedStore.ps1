@@ -292,7 +292,8 @@ function Test-WacBoundDirectoryIdentity {
         return $result
     }
 
-    if ($finalPath -ine $ExpectedPath) {
+    # ORDINAL, not -ine: this is the handle-bound identity proof, and -ine is culture-sensitive.
+    if (-not [string]::Equals($finalPath, $ExpectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
         $result.Reason = ('{0} actually resolved to {1}, so it is not the object that was asked for.' -f $ExpectedPath, $finalPath)
         return $result
     }

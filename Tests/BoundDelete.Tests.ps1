@@ -38,33 +38,6 @@ function New-TestFile {
     return $Path
 }
 
-function New-TestJunction {
-    param(
-        [Parameter(Mandatory = $true)][string]$Link,
-        [Parameter(Mandatory = $true)][string]$Target
-    )
-
-    New-Item -ItemType Junction -Path $Link -Target $Target -ErrorAction Stop | Out-Null
-    return $Link
-}
-
-function Get-TestResultLogLine {
-    <#
-    .SYNOPSIS
-        The one 'Target complete.' line in a run log that carries the given category, or $null.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$LogPath,
-        [Parameter(Mandatory = $true)][string]$Category
-    )
-
-    $needle = 'category=' + $Category
-    foreach ($line in [System.IO.File]::ReadAllLines($LogPath)) {
-        if ($line.Contains('[Result] Target complete.') -and $line.Contains($needle)) { return $line }
-    }
-    return $null
-}
-
 # ---------------------------------------------------------------------------------------------
 # Containment
 # ---------------------------------------------------------------------------------------------

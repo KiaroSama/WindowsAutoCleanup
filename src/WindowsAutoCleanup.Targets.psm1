@@ -110,6 +110,7 @@ function Add-WacTarget {
     )
 
     foreach ($skip in $SkipCategory) {
+        # Display-category matching is deliberately linguistic, unlike filesystem identities.
         if ($Category -ieq $skip) { return }
     }
 

@@ -726,7 +726,7 @@ function Remove-WacOldLog {
     if ($files.Count -le $KeepCount) { return 0 }
 
     foreach ($file in $files[$KeepCount..($files.Count - 1)]) {
-        if ($script:LogPath -and $file.FullName -ieq $script:LogPath) { continue }
+        if ($script:LogPath -and [string]::Equals($file.FullName, $script:LogPath, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
         try {
             [System.IO.File]::Delete($file.FullName)
             $removed++

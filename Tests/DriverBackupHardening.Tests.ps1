@@ -269,11 +269,16 @@ Test-Case 'an inherit-only parent ACE becomes an effective writer on the directo
         Assert-True (@($childVerdict.Writers) -contains $script:Users) `
             ('BUILTIN\Users can write into the created backup root and it was not reported: {0}' -f $childVerdict.Sddl)
         Assert-False $childVerdict.IsTrusted ('a directory BUILTIN\Users can write into was accepted: {0}' -f $childVerdict.Reason)
-        Assert-True ($childVerdict.Reason -match $script:Users) ('the refusal never named the principal: {0}' -f $childVerdict.Reason)
+        # Isolate the inherited writer from the sandbox owner's independent refusal. This changes
+        # only an IN-MEMORY descriptor; the real directory's owner and ACL stay untouched.
+        $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($childVerdict.Sddl)
+        $descriptor.Owner = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $descriptorText = $descriptor.GetSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+        $strict = Test-WacTrustedDirectoryDescriptor -Sddl $descriptorText -Strict
+        Assert-False $strict.IsTrusted 'the inherited writer alone must refuse the child'
+        Assert-True ($strict.Reason -match $script:Users) ('the refusal never named the writer: {0}' -f $strict.Reason)
 
-        # The same descriptor under the RELAXED rule, which is what the primitive applied before:
-        # accepted, with no mention of BUILTIN\Users. That is the whole defect in one comparison.
-        $relaxed = Test-WacTrustedDirectoryDescriptor -Sddl $childVerdict.Sddl
+        $relaxed = Test-WacTrustedDirectoryDescriptor -Sddl $descriptorText
         Assert-False ([string]$relaxed.Reason -match $script:Users) `
             ('the relaxed rule has changed and now names BUILTIN\Users, so this comparison is stale: {0}' -f $relaxed.Reason)
     }
@@ -713,6 +718,28 @@ Test-Case 'the manifest file list is ordered ordinally, so both hosts produce th
     finally {
         Remove-TestSandbox -Path $sandbox
     }
+}
+
+Test-Case 'intact legacy manifests remain valid regardless of recorded file order' {
+    $sandbox = New-TestSandbox -Prefix 'dbh-legacy-order'
+    try {
+        foreach ($name in @('oem-a.inf', 'oem_a.inf')) {
+            [System.IO.File]::WriteAllText((Join-Path $sandbox $name), $name,
+                (New-Object System.Text.UTF8Encoding($false)))
+        }
+        $hashed = Get-WacDriverBackupFileHash -Path $sandbox
+        Assert-True $hashed.Ok $hashed.Reason
+        $recorded = @($hashed.File)
+        [array]::Reverse($recorded)
+        $manifest = [PSCustomObject]@{ File = $recorded }
+        $verified = Test-WacDriverBackupIntact -Path $sandbox -Manifest $manifest
+        Assert-True $verified.Intact $verified.Reason
+
+        $manifest.File[0].Sha256 = 'invalid'
+        Assert-False (Test-WacDriverBackupIntact -Path $sandbox -Manifest $manifest).Intact `
+            'order-independent verification ignored a changed hash'
+    }
+    finally { Remove-TestSandbox -Path $sandbox }
 }
 
 Complete-TestRun

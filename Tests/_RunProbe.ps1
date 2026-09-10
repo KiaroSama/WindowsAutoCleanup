@@ -11,9 +11,7 @@
     dot-source time.
 #>
 
-# The host running this suite, taken from the live process rather than PATH, so the child is the
-# same edition that is currently under test.
-$script:HostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+. (Join-Path -Path $PSScriptRoot -ChildPath '_ProbeProcess.ps1')
 
 # ---------------------------------------------------------------------------------------------
 # Lifting the function under test out of Run.ps1
@@ -45,66 +43,6 @@ function Get-RunFunctionText {
 # ---------------------------------------------------------------------------------------------
 # Child processes
 # ---------------------------------------------------------------------------------------------
-
-function Start-ProbeProcess {
-    <#
-    .SYNOPSIS
-        Starts a child of the host running this suite with one pre-quoted command line.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$CommandLine,
-        [hashtable]$Environment = @{},
-        [string]$HostExe
-    )
-
-    if (-not $HostExe) { $HostExe = $script:HostExe }
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $HostExe
-    $psi.Arguments = $CommandLine
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.WorkingDirectory = $script:RepoRoot
-    foreach ($key in $Environment.Keys) { $psi.EnvironmentVariables[$key] = [string]$Environment[$key] }
-
-    return [System.Diagnostics.Process]::Start($psi)
-}
-
-function Wait-ProbeProcess {
-    <#
-    .SYNOPSIS
-        Bounded wait plus process-tree kill, so a child that never exits cannot hang this suite:
-        "did not finish inside the bound" is the detected signal, not a stalled run.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]$Process,
-        [int]$TimeoutMs = 90000
-    )
-
-    $outTask = $Process.StandardOutput.ReadToEndAsync()
-    $errTask = $Process.StandardError.ReadToEndAsync()
-    $exited = $Process.WaitForExit($TimeoutMs)
-
-    if (-not $exited) {
-        [void](Stop-WacProcessTree -ProcessId $Process.Id)
-        [void]$Process.WaitForExit(10000)
-    }
-
-    [void]$outTask.Wait(5000)
-    [void]$errTask.Wait(5000)
-
-    $exitCode = -1
-    if ($exited) { try { $exitCode = [int]$Process.ExitCode } catch { $exitCode = -1 } }
-
-    return [PSCustomObject]@{
-        Exited    = $exited
-        ExitCode  = $exitCode
-        Output    = $(if ($outTask.IsCompleted) { [string]$outTask.Result } else { '' })
-        ErrorText = $(if ($errTask.IsCompleted) { [string]$errTask.Result } else { '' })
-    }
-}
 
 function Invoke-Probe {
     param(

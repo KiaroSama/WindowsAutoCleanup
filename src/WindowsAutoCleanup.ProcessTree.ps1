@@ -90,11 +90,9 @@ public static class WacProcessTree
     // one per level, and no WMI/CIM service is involved - this runs on the path that has to work
     // when something is already wedged.
     //
-    // Windows does not reuse the id of a LIVE process, so while the root is alive an entry naming
-    // it as parent really is its child: the same relation taskkill /T walks. An ORPHAN whose own
-    // parent exited long ago can still carry a recycled number, which is why the caller binds a
-    // kernel handle to every id this returns BEFORE it kills anything, and never terminates
-    // through the number itself.
+    // These are CANDIDATES, not proven descendants. Parent IDs outlive their original processes.
+    // The caller checks each bound candidate's current parent ID and creation time against its
+    // already-bound parent before admitting it to the termination set.
     //
     // null means the snapshot could not be taken or read. That is not the same answer as an empty
     // array and the caller must not read it as one.
@@ -203,7 +201,17 @@ function Open-WacProcessBinding {
         $win32 = [WacNative]::OpenProcessForTermination($ProcessId, [ref]$handle)
     }
 
-    return [PSCustomObject]@{ Id = $ProcessId; Handle = $handle; Win32Error = $win32 }
+    $parentId = -1
+    $created = 0L
+    $identityKnown = $false
+    if ($handle -ne [IntPtr]::Zero) {
+        try { $identityKnown = [WacNative]::ReadProcessIdentity($handle, [ref]$parentId, [ref]$created) }
+        catch { $identityKnown = $false }
+    }
+    return [PSCustomObject]@{
+        Id = $ProcessId; Handle = $handle; Win32Error = $win32
+        ParentId = $parentId; Created = $created; IdentityKnown = $identityKnown
+    }
 }
 
 function New-WacTerminationResult {
@@ -234,78 +242,20 @@ function New-WacTerminationResult {
     }
 }
 
-function Invoke-WacTaskkillTree {
-    <#
-    .SYNOPSIS
-        Runs taskkill /T /F against one id and returns its exit code, or $null. Never throws.
-    .DESCRIPTION
-        Kept because /T is the only mechanism that reaches a whole tree in ONE call, and because its
-        exit code is the evidence of WHY a kill did not take: measured on both shipped hosts, 0 is
-        success, 128 is "not found" and 255 is "could not be terminated". Evidence, never the
-        verdict - the caller proves the outcome on its own handles.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][int]$ProcessId,
-        [Parameter(Mandatory = $true)][int]$TimeoutMs
-    )
-
-    $exitCode = $null
-    try {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = (Join-Path -Path $env:SystemRoot -ChildPath 'System32\taskkill.exe')
-        $psi.Arguments = ConvertTo-WacCommandLine -ArgumentList @('/T', '/F', '/PID', [string]$ProcessId)
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-
-        $killer = [System.Diagnostics.Process]::Start($psi)
-        if ($killer) {
-            [void]$killer.StandardOutput.ReadToEndAsync()
-            [void]$killer.StandardError.ReadToEndAsync()
-            if ($killer.WaitForExit($TimeoutMs)) {
-                try { $exitCode = [int]$killer.ExitCode } catch { $exitCode = $null }
-            }
-            else {
-                # taskkill itself overran its bound. Killing it directly is not recursion: it is our
-                # own child and has no tree of its own worth walking.
-                try { $killer.Kill() } catch { $null = $_ }
-            }
-            try { $killer.Dispose() } catch { $null = $_ }
-        }
-    }
-    catch {
-        $exitCode = $null
-    }
-
-    return $exitCode
-}
-
 function Stop-WacProcessTree {
     <#
     .SYNOPSIS
         Kills a process AND its descendants, and reports termination as PROVEN only when every one
         of them is known to have exited.
     .DESCRIPTION
-        Two defects, one after the other, in the same place.
+        Snapshot entries are only candidates. Each one is opened before termination and its
+        parent ID and creation time are read from that same handle. It is admitted only when its
+        parent is already bound and it is not older than that parent. This rejects stale parent
+        IDs and IDs reused between enumeration and binding. taskkill /T is not used, because its
+        independent walk would bypass those checks. TaskkillExit remains null for compatibility.
 
-        The first was taking taskkill's exit as the answer. Measured on both shipped hosts,
-        taskkill /T /F /PID returns 0 (terminated), 128 (not found) and 255 (could not be
-        terminated), and all three EXIT - so "taskkill ran" was reported as "the process is dead".
-        That was fixed by binding a kernel handle to the target at entry and waiting on it.
-
-        The second is the one this body exists for: only the ROOT was ever bound. If taskkill is
-        missing, refuses, or exits 0 having killed nothing, the escalation - TerminateProcess
-        through the root's own handle - reaches the root and NOTHING BELOW IT, so the call returned
-        $true while a child of the process it was told to remove kept running and kept writing.
-
-        So the tree is bound, not just the root. Every descendant is enumerated and OPENED BEFORE
-        anything is killed, which is what keeps each later answer attached to the process that was
-        opened however Windows reuses the number, and the verdict is the conjunction over all of
-        them. A tree that cannot be enumerated at all, or an identity that cannot be opened for a
-        reason other than "nothing owns this id", leaves Proven $false: unreadable state is never
-        reported as proof, the same way Test-WacIsReparsePoint refuses to call an unreadable
-        descriptor safe.
+        Termination and exit verification use the retained handles, never a later PID lookup.
+        An unreadable tree or a candidate whose identity cannot be proved leaves Proven false.
 
         A Windows job object with kill-on-close would be stronger still, because a job assigned AT
         CREATION cannot be escaped by a grandchild. It is not reachable from here.
@@ -363,7 +313,21 @@ function Stop-WacProcessTree {
             if ($known -or $unreadable.Contains([int]$id)) { continue }
 
             $binding = Open-WacProcessBinding -ProcessId ([int]$id)
-            if ($binding.Handle -ne [IntPtr]::Zero) { [void]$bound.Add($binding); continue }
+            if ($binding.Handle -ne [IntPtr]::Zero) {
+                if (-not $binding.IdentityKnown) {
+                    [void]$unreadable.Add([int]$id)
+                    [WacNative]::CloseProcessHandle($binding.Handle)
+                    continue
+                }
+                $parent = @($bound | Where-Object { $_.Id -eq $binding.ParentId })
+                if ($parent.Count -ne 1 -or $binding.Created -lt $parent[0].Created) {
+                    # A different parent, or a child older than its alleged parent, is not ours.
+                    [WacNative]::CloseProcessHandle($binding.Handle)
+                    continue
+                }
+                [void]$bound.Add($binding)
+                continue
+            }
             if ($binding.Win32Error -eq 87) { continue }
             [void]$unreadable.Add([int]$id)
         }
@@ -388,18 +352,19 @@ function Stop-WacProcessTree {
                     -Reason 'The target had already exited before this call, so no live tree was ever observed and nothing was killed.')
         }
 
+        if (-not $root.IdentityKnown) {
+            return (New-WacTerminationResult -Root $ProcessId -Proven $false -Survivor @($ProcessId) `
+                    -Reason 'The bound root identity could not be read; no process was terminated.')
+        }
+
         $descendant = Get-WacProcessDescendantId -ProcessId $ProcessId
         if ($null -eq $descendant) { $treeUnreadable = $true } else { & $bindEach $descendant }
 
-        $taskkillExit = Invoke-WacTaskkillTree -ProcessId $ProcessId -TimeoutMs $TimeoutMs
+        # Never hand the root to taskkill /T: its independent PID walk bypasses our identity proof.
+        # TaskkillExit stays null in the compatibility result; termination uses only bound handles.
         $waitDeadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
 
-        # Anything taskkill has not already killed is escalated at once rather than waited out
-        # first. Waiting the caller's whole bound before escalating was measured at 20.8 s per case
-        # against a taskkill that killed nothing - the exact scenario this function exists for -
-        # because every bound identity was still pending and the wait had nothing to wait for.
-        # taskkill has already EXITED by this point, so whatever it did land is a few milliseconds
-        # away, and TerminateProcess against a process already tearing down is harmless.
+        # Terminate validated identities at once rather than waiting out the caller's bound first.
         #
         # Three passes: every pass after the first exists only for a process that appeared DURING
         # the kill, and a tree still spawning after three is not settling - the caller needs an

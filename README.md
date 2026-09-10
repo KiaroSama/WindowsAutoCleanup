@@ -185,7 +185,7 @@ the registered task instead is what the ownership proof and the exact action par
 | `4` | Elevation was cancelled or failed. |
 | `5` | Unsupported environment: the online system drive is not `C:`. |
 | `6` | Incomplete: the run did not finish what it was asked to do, or cannot prove it did. The budget expired, a step hit its deadline, an elevated child had to be terminated, or the durable audit log could not be produced. |
-| `7` | Security refusal: a safety check refused to proceed on evidence. A cleanup path failed its identity or containment re-check, or the directory holding the run state and audit log is not machine-trusted. When no candidate state directory is trusted the run creates **nothing** — no directory, no log file — and the refusal goes to the Windows event log, or the console, instead of to a run log. |
+| `7` | Security refusal: a safety check refused to proceed on evidence. A cleanup path failed its identity or containment re-check, or the directory holding the run state and audit log is not machine-trusted. If no state directory passes verification, no run log is written and the refusal goes to the Windows event log or console; a directory created before a later trust refusal may remain. |
 
 A run reports its **worst** outcome: a refusal outranks a failure, which outranks incomplete work. A benign skip does not affect the code — a reparse point left alone, a protected path stepped around, or an opt-in step that is switched off all keep the run at `0`.
 
@@ -257,7 +257,7 @@ The directory is created through a **pinned handle**, not by pathname. The old s
 
 If no log file can be created anywhere, the run aborts rather than proceeding silently.
 
-An elevated run verifies every candidate directory **before** it creates anything, and when none is machine-trusted it creates nothing at all — no directory, no log file — and writes the refusal to the Windows event log or the console instead. What is *not* claimed is a handle-bound check here, the way deletion has one: the directory is verified by pathname and the log file is then created by pathname, so an attacker able to replace that directory or an ancestor in the window between the two could still redirect the log. Closing it needs a handle-relative create, which managed code cannot express.
+An elevated run checks each candidate's ancestor trust before creation, then checks the resulting directory's identity and descriptor through its pinned handle. A missing directory is created with collision-failing semantics; the log file is created relative to the verified directory handle. If the new directory inherits an unsafe descriptor, it is refused before any log file is written. When no candidate is usable, the refusal goes to the Windows event log or console instead; an empty directory created before that refusal may remain.
 
 Format is one structured line per event:
 
@@ -267,7 +267,7 @@ Format is one structured line per event:
 [2026-08-23 13:29:19 UTC] [INFO] [Dism] Step complete. | attempted=True category="Windows component store cleanup (DISM)" detail="exit 3010" durationMs=17422 failed=False reboot=True skipped=False succeeded=True
 ```
 
-Values are quoted only when they contain a space, and keys are sorted so two runs can be diffed.
+Values containing whitespace or quotes are quoted, and keys are sorted so two runs can be diffed. Message and value control characters are escaped as `<CR>`, `<LF>`, `<TAB>` or `<0xNN>` so a filename cannot forge another physical log record. Ordinary Windows paths are unchanged.
 
 Levels are `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Skips are broken out by reason — `skipLocked`, `skipDenied`, `skipNotEmpty`, `skipReparse`, `skipProtected`, `skipOutOfRoot`, `skipVanished`, `skipDeadline` — so a large skip count can be diagnosed instead of guessed at. The newest 30 run logs are kept; older ones are deleted at the start of each run.
 
@@ -336,8 +336,9 @@ Get-ChildItem 'C:\Windows\Logs\WindowsAutoCleanup\DriverBackup' -Directory | For
 } | Format-Table -AutoSize
 ```
 
-An empty `DeletedUtc` means the export exists but the package was never actually removed — the
-driver is still in the store and there is nothing to restore.
+An empty `DeletedUtc` means removal was not durably confirmed, **not** that the driver is still
+installed. A pending marker can survive a successful deletion when confirmation or manifest commit
+failed. Preserve the backup and inspect the current driver inventory before deciding what to restore.
 
 **2. Verify the export before you trust it.** The manifest records a SHA-256 for every exported
 file. A mismatch means the backup is not usable and must not be installed:
@@ -345,11 +346,12 @@ file. A mismatch means the backup is not usable and must not be installed:
 ```powershell
 $dir = 'C:\Windows\Logs\WindowsAutoCleanup\DriverBackup\<identity-directory>'
 $m = Get-Content -LiteralPath (Join-Path $dir 'wac-driver-backup.json') -Raw | ConvertFrom-Json
-foreach ($entry in $m.File) {
+@($m.File | ForEach-Object {
+    $entry = $_
     $file = Join-Path $dir $entry.Path
     $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
     [PSCustomObject]@{ Path = $entry.Path; Matches = ($actual -eq $entry.Sha256.ToUpperInvariant()) }
-} | Format-Table -AutoSize
+}) | Format-Table -AutoSize
 ```
 
 **3. Put it back.** From an **elevated** prompt, point `pnputil` at the exported INF:
@@ -366,15 +368,21 @@ pnputil /enum-drivers
 
 **A `wac-driver-delete.pending` marker.** The tool started a deletion and could not confirm how it
 ended, so it kept both the marker and the copy, and the driver step will not report better than
-`Incomplete` until an operator resolves it. Decide by asking the store whether the package is still
-installed (`pnputil /enum-drivers`, looking for the manifest's `DriverName`). If it is gone and you
-do not need it back, deleting the marker file is a deliberate manual act that tells the next run the
-question is settled. If it is still installed, the deletion did not happen and nothing is lost.
+`Incomplete` until it is resolved. Inspect `pnputil /enum-drivers`, comparing the package's original
+INF, provider, class and version as well as its published name: Windows can reuse `oem<n>.inf`.
+Do not delete the marker or an unstamped backup merely to clear the warning; it may be the only
+recoverable copy of a removed package. A matching published name alone does not prove otherwise.
 
 **`Get-ScheduledTask` does not show the task.**
 The task is registered under `\WindowsAutoCleanup\` with a `SYSTEM` principal, and its security descriptor is not readable by a standard user, so an unelevated `Get-ScheduledTask` or `schtasks /query` reports nothing at all. Query it from an elevated shell, or read the Task Scheduler operational event log, which records registration (event 106) and each run (events 100/102/201) regardless of privilege.
 
 **The uninstaller says the task is not ours.** A task with the same name exists but does not carry this project's ownership marker. It is left untouched; remove it yourself if you are sure.
+
+**Repository fixes are not taking effect.** The task runs the deployed snapshot, not your Git
+checkout. Check `scriptRoot`, version and configuration in its newest operational log. Updating the
+repository alone does not update that snapshot or the task's saved switches; redeployment requires
+the installer and the corresponding elevated verification. TEMP cleanup can remove active tools'
+unlocked scratch files, so do not run it during work that depends on those files.
 
 ## Repository files
 

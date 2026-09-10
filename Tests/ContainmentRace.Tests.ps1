@@ -32,26 +32,6 @@ Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAut
 Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.FileSystem.psm1') `
     -Force -DisableNameChecking -ErrorAction Stop
 
-function New-TestJunction {
-    <#
-    .SYNOPSIS
-        Creates a real directory junction, or throws if the OS refused.
-    .DESCRIPTION
-        cmd's mklink /J needs no elevation, unlike a symbolic link, so these cases run identically
-        on a developer shell and on an elevated CI runner.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Link,
-        [Parameter(Mandatory = $true)][string]$Target
-    )
-
-    $cmd = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cmd.exe'
-    & $cmd /c mklink /J "$Link" "$Target" | Out-Null
-    if (-not (Test-Path -LiteralPath $Link)) {
-        throw ('the junction could not be created: {0} -> {1}' -f $Link, $Target)
-    }
-}
-
 function Remove-TestJunction {
     param([Parameter(Mandatory = $true)][string]$Link)
 
@@ -78,36 +58,6 @@ function New-SandboxDirectory {
 
     [void][System.IO.Directory]::CreateDirectory($Path)
     return $Path
-}
-
-function New-EscapeFixture {
-    <#
-    .SYNOPSIS
-        An allow-listed root containing a junction that points at a sentinel outside it.
-    .OUTPUTS
-        Root, Outside, Link, Sentinel, SentinelThroughLink.
-    #>
-    param([Parameter(Mandatory = $true)][string]$Sandbox)
-
-    $root = Join-Path -Path $Sandbox -ChildPath 'allowlisted'
-    $outside = Join-Path -Path $Sandbox -ChildPath 'outside'
-    $link = Join-Path -Path $root -ChildPath 'swapped'
-
-    [void][System.IO.Directory]::CreateDirectory($root)
-    [void][System.IO.Directory]::CreateDirectory($outside)
-
-    $sentinel = Join-Path -Path $outside -ChildPath 'SENTINEL.dll'
-    [System.IO.File]::WriteAllText($sentinel, 'must survive')
-
-    New-TestJunction -Link $link -Target $outside
-
-    return [PSCustomObject]@{
-        Root = $root
-        Outside = $outside
-        Link = $link
-        Sentinel = $sentinel
-        SentinelThroughLink = (Join-Path -Path $link -ChildPath 'SENTINEL.dll')
-    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -149,7 +99,7 @@ Test-Case 'A swap after the path was captured kills a sentinel unguarded, and is
         # the swap
         [System.IO.File]::Delete($captured)
         [System.IO.Directory]::Delete($spool, $false)
-        New-TestJunction -Link $spool -Target $outside
+        [void](New-TestJunction -Link $spool -Target $outside)
 
         [System.IO.File]::Delete($captured)
         Assert-False ([System.IO.File]::Exists($sentinel)) `
@@ -176,7 +126,7 @@ Test-Case 'A swap after the path was captured kills a sentinel unguarded, and is
 
         [System.IO.File]::Delete($captured)
         [System.IO.Directory]::Delete($spool, $false)
-        New-TestJunction -Link $spool -Target $outside
+        [void](New-TestJunction -Link $spool -Target $outside)
 
         $stats = New-WacDeletionStats
         Remove-WacLeaf -Path $captured -RootPath $root -Stats $stats
@@ -382,7 +332,7 @@ Test-Case 'Delayed deletion is never used, because no check made now can bind th
         # ...and here is the swap an attacker has until the next restart to perform.
         [System.IO.File]::Delete($locked)
         [System.IO.Directory]::Delete($spool, $false)
-        New-TestJunction -Link $spool -Target $outside
+        [void](New-TestJunction -Link $spool -Target $outside)
 
         # Same string. Different file. Outside the root. Nothing re-checks it at boot.
         Assert-Equal 'MUST SURVIVE' ([System.IO.File]::ReadAllText($locked)) `
@@ -411,7 +361,7 @@ Test-Case 'An ordinary reparse-point root is a skip and never a refusal' {
         [System.IO.File]::WriteAllText((Join-Path -Path $outside -ChildPath 'cached.dat'), 'must survive')
 
         $link = Join-Path -Path $sandbox -ChildPath 'Temporary Internet Files'
-        New-TestJunction -Link $link -Target $outside
+        [void](New-TestJunction -Link $link -Target $outside)
 
         $tree = Remove-WacTree -Category 'Internet cache (Temporary Internet Files)' -Path $link
         Assert-False $tree.Attempted
@@ -459,7 +409,7 @@ Test-Case 'A reparse LEAF reached through a swapped ancestor is refused, not unl
         # What the sweep believes it is deleting: a junction inside the allow-listed root.
         $ownTarget = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'ownTarget')
         $ownLink = Join-Path -Path $real -ChildPath 'link'
-        New-TestJunction -Link $ownLink -Target $ownTarget
+        [void](New-TestJunction -Link $ownLink -Target $ownTarget)
 
         # What an ancestor swap would substitute: a junction the tool has no business touching,
         # pointing at a sentinel that must survive.
@@ -468,12 +418,12 @@ Test-Case 'A reparse LEAF reached through a swapped ancestor is refused, not unl
         $sentinel = Join-Path -Path $outsideTarget -ChildPath 'sentinel.txt'
         [System.IO.File]::WriteAllText($sentinel, 'must survive')
         $decoyLink = Join-Path -Path $decoy -ChildPath 'link'
-        New-TestJunction -Link $decoyLink -Target $outsideTarget
+        [void](New-TestJunction -Link $decoyLink -Target $outsideTarget)
 
         # The swap. 'root\real' now resolves to 'decoy', so 'root\real\link' names decoy\link.
         Remove-TestJunction -Link $ownLink
         [System.IO.Directory]::Delete($real, $true)
-        New-TestJunction -Link $real -Target $decoy
+        [void](New-TestJunction -Link $real -Target $decoy)
 
         $stats = New-WacDeletionStats
         Remove-WacLeaf -Path (Join-Path -Path $real -ChildPath 'link') -RootPath $root -Stats $stats -IsReparsePoint
@@ -506,7 +456,7 @@ Test-Case 'An ordinary reparse leaf inside its real parent is still deleted as a
         [System.IO.File]::WriteAllText($keep, 'untouched')
 
         $link = Join-Path -Path $root -ChildPath 'link'
-        New-TestJunction -Link $link -Target $target
+        [void](New-TestJunction -Link $link -Target $target)
 
         $stats = New-WacDeletionStats
         Remove-WacLeaf -Path $link -RootPath $root -Stats $stats -IsReparsePoint

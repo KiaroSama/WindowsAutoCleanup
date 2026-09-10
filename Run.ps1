@@ -500,7 +500,7 @@ try {
     # refusal costs nothing because nothing has happened yet. They are asked again in the footer for
     # what changes during the run.
     $preflight = Get-WacRunLevelOutcome -Current 'Succeeded'
-    if ($script:OutcomeRank[$preflight] -gt 0) {
+    if (-not (Test-WacOutcomeIsClean -Outcome $preflight)) {
         Write-WacLog -Level CRITICAL -Component 'Run' -Message 'A pre-cleanup check refused this run; nothing on this machine was mutated.' -Data @{ outcome = $preflight }
         exit (Write-WacRunVerdict -Outcome $preflight)
     }
