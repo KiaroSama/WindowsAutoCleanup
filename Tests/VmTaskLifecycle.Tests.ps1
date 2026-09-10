@@ -93,7 +93,7 @@ function Invoke-VmTaskLifecycle {
         [void]$steps.Add([PSCustomObject]@{ Step = 'legacy removed'; Ok = [bool]$legacyRemoval.Verified; Detail = [string]$legacyRemoval.Reason })
 
         # 2. The current registration, read back, started for real, then removed and proven gone.
-        $arguments = Get-WacTaskActionArgument -RunScript $runScript
+        $arguments = Get-WacTaskActionArgument -RunScript $runScript -ResetWindowsUpdateBase:$false
         $current = New-ScheduledTask `
             -Action (New-ScheduledTaskAction -Execute $taskHost -Argument $arguments -WorkingDirectory $deploymentRoot) `
             -Trigger (New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddHours(3))) `
@@ -159,6 +159,26 @@ Test-Case 'The live task-lifecycle check exists, is armed only in a disposable V
     }
     Assert-Equal 0 @(Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue).Count `
         'the lifecycle left its probe task registered'
+}
+
+Test-Case 'the live VM action explicitly keeps ResetBase disabled' {
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $PSCommandPath, [ref]$tokens, [ref]$errors)
+    Assert-Equal 0 @($errors).Count 'the VM harness must parse'
+    $calls = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq 'Get-WacTaskActionArgument'
+            }, $true))
+    Assert-Equal 1 $calls.Count 'the VM action builder changed; review the safety check'
+    $runScript = 'C:\WacVerification\Run.ps1'
+    # Execute only the harness's pure argument-builder expression, never its scheduler operations.
+    $arguments = & ([scriptblock]::Create($calls[0].Extent.Text))
+    Assert-True ($arguments.Contains($runScript)) 'the fixture script path was not used'
+    Assert-True ($arguments.Contains('-ResetWindowsUpdateBase:$false')) `
+        'the real VM task would execute the excluded ResetBase operation'
 }
 
 Complete-TestRun
