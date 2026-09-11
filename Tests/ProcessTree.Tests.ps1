@@ -407,6 +407,18 @@ function Test-TreeSurvivesUselessTaskkill {
             'the child survived, so termination reached the root and nothing below it'
         Assert-True ($tree.Parent.WaitForExit(20000)) 'the parent survived'
 
+        if (-not $verdict.Proven) {
+            $unproven = foreach ($identity in @($verdict.Survivor)) {
+                $processInfo = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f $identity) -ErrorAction SilentlyContinue
+                if ($processInfo) {
+                    $processInfo | Select-Object ProcessId,ParentProcessId,Name,CreationDate
+                } else { [PSCustomObject]@{ ProcessId = $identity; NoCurrentProcess = $true } }
+            }
+            Write-Host ('      termination diagnostic: ' + ([PSCustomObject]@{
+                Verdict = $verdict; ExpectedParent = $tree.Parent.Id; ExpectedChild = $tree.Child.Id
+                CurrentUnproven = @($unproven)
+            } | ConvertTo-Json -Depth 5 -Compress))
+        }
         Assert-True $verdict.Proven ('the tree kill did not report proof: ' + $verdict.Reason)
         Assert-Equal 0 (@($verdict.Survivor).Count) `
             ('the verdict named survivors: ' + (@($verdict.Survivor) -join ','))

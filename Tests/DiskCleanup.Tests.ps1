@@ -270,18 +270,18 @@ Test-Case 'the sage id is zero padded to four digits' {
     }
 }
 
-Test-Case 'only the documented value 2 is written, and Offline Pages Files never is' {
+Test-Case 'selected handlers are enabled and every other existing handler is explicitly disabled' {
     $key = New-ScratchVolumeCacheKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath 'VolumeCaches')
     try {
         $enabled = Enable-WacDiskCleanupCategory -SageId 9999 -KeyPath $key `
             -Category @('Temporary Files', 'Thumbnail Cache', 'Offline Pages Files', 'No Such Handler')
 
-        Assert-Equal 2 $enabled.Touched 'only existing, non-skipped handlers may be written'
+        Assert-Equal 4 $enabled.Touched 'all existing handlers require an explicit selection'
         Assert-Equal 0 $enabled.Failed
         Assert-Equal 2 (Get-StateFlagValue -KeyPath $key -Handler 'Temporary Files' -ValueName 'StateFlags9999')
         Assert-Equal 2 (Get-StateFlagValue -KeyPath $key -Handler 'Thumbnail Cache' -ValueName 'StateFlags9999')
-        Assert-Equal $null (Get-StateFlagValue -KeyPath $key -Handler 'Offline Pages Files' -ValueName 'StateFlags9999') 'Offline Pages Files was written'
-        Assert-Equal $null (Get-StateFlagValue -KeyPath $key -Handler 'Not A Real Handler' -ValueName 'StateFlags9999') 'an unrequested handler was written'
+        Assert-Equal 0 (Get-StateFlagValue -KeyPath $key -Handler 'Offline Pages Files' -ValueName 'StateFlags9999') 'Offline Pages Files was not disabled'
+        Assert-Equal 0 (Get-StateFlagValue -KeyPath $key -Handler 'Not A Real Handler' -ValueName 'StateFlags9999') 'absence does not override a handler default'
     }
     finally {
         Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -306,7 +306,7 @@ Test-Case 'a handler write failure is counted, not swallowed' {
             $enabled = Enable-WacDiskCleanupCategory -SageId 9999 -KeyPath $key -Category @('Temporary Files', 'Thumbnail Cache')
 
             Assert-Equal 0 $enabled.Touched
-            Assert-Equal 2 $enabled.Failed 'a write that threw was reported as a success'
+            Assert-Equal 4 $enabled.Failed 'a write that threw was reported as a success'
         }
         finally {
             Remove-ModuleFunction -Module $script:StepModule -Name 'New-ItemProperty'

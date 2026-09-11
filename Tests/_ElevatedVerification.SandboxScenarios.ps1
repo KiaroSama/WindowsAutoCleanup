@@ -107,24 +107,19 @@ function Invoke-Exit5Scenario {
 function Invoke-Exit3Scenario {
     <#
     .SYNOPSIS
-        Two overlapping elevated runs: the second must exit 3 and mutate nothing.
+        A contended elevated run exits 3; after release, an uncontended control can clean.
     .DESCRIPTION
-        The deterministic signal that the FIRST run really owns the mutex is its own log. Run.ps1
-        calls Clear-WacDeliveryOptimizationCache immediately after Enter-WacSingleInstance returns a
-        mutex, and that step always writes a [DeliveryOptimization] result line (succeeded, skipped
-        or failed). So a [DeliveryOptimization] line in the first child's log proves the mutex was
-        held; polling for it with a deadline is a real signal, not a sleep.
-
-        Probing the mutex directly was rejected: WaitOne(0) from this process would acquire the lock
-        whenever the child had not taken it yet, and the child does not retry - it would exit 3 and
-        the scenario would prove the opposite of what it claims.
+        This harness deliberately owns a real, run-unique kernel mutex until the contender exits.
+        A log line only proved a previous child HAD the lock; a fast cleanup could finish between
+        observing that line and starting the contender. Holding the production mutex primitive
+        removes that race without slowing the application or mocking its contention check.
 
         The second sandbox's bait check needs the same treatment as EXIT5's for the same reason:
         'Defender cleanup files' stays ENABLED so that a second child which failed to exit 3 and
         swept its targets would delete it. With every category skipped the file survived either way
         and the "mutated nothing" evidence line asserted nothing about the mutex at all. Both
-        children share one command line, so the first child sweeps ITS OWN sandbox copy - which is
-        exactly what EXIT2 already does, inside the sandbox and nowhere else.
+        runs share one command line. After release, the control must exit 0 and delete its OWN bait:
+        this proves both that the lock was released and that the bait would otherwise be deleted.
     #>
     param([Parameter(Mandatory = $true)][int]$TimeoutMs)
 
@@ -136,6 +131,7 @@ function Invoke-Exit3Scenario {
     $secondSandbox = ''
     $firstChild = $null
     $secondChild = $null
+    $heldMutex = $null
 
     try {
         $skip = @(Get-NonSandboxCategory -Keep 'Defender cleanup files')
@@ -146,31 +142,15 @@ function Invoke-Exit3Scenario {
             $mutexName = New-VerificationMutexName
             $firstSandbox = New-VerificationSandbox -Prefix 'wac-exit3-first'
             $secondSandbox = New-VerificationSandbox -Prefix 'wac-exit3-second'
-            [void](New-SandboxBait -Sandbox $firstSandbox)
+            $firstBait = Join-Path -Path (New-SandboxBait -Sandbox $firstSandbox) -ChildPath 'bait.txt'
             $secondBait = Join-Path -Path (New-SandboxBait -Sandbox $secondSandbox) -ChildPath 'bait.txt'
 
             $commandLine = Get-RunChildCommandLine -MutexName $mutexName -SkipCategory $skip
 
-            $firstChild = Start-VerificationChild -CommandLine $commandLine `
-                -Environment (Get-SandboxEnvironment -Sandbox $firstSandbox)
-
-            # Bound the wait for the lock at the wall timeout as well, so a first run that dies
-            # during start-up cannot park this harness here.
-            $sandboxForSignal = $firstSandbox
-            $held = Wait-ForSignal -TimeoutMs ([Math]::Min($TimeoutMs, 300000)) -Condition {
-                @(Get-MatchingLine -Text (Get-SandboxLogText -Sandbox $sandboxForSignal) -Needle '[DeliveryOptimization]').Count -gt 0
-            }
-
-            if (-not $held) {
-                [void]$problem.Add('the first run never logged a post-mutex line, so it was never proven to hold the lock')
-            }
-            elseif ($firstChild.Process.HasExited) {
-                [void]$problem.Add('the first run had already finished, so the second could not overlap it')
-            }
-            else {
-                $holdLines = @(Get-MatchingLine -Text (Get-SandboxLogText -Sandbox $firstSandbox) -Needle '[DeliveryOptimization]')
-                [void]$evidence.Add(('first run holds the lock: {0}' -f $holdLines[0]))
-
+            $heldMutex = Enter-WacSingleInstance -Name $mutexName
+            if (-not $heldMutex) { throw 'The fixture could not acquire its unique kernel mutex.' }
+            try {
+                [void]$evidence.Add('the fixture acquired the real kernel mutex before starting the contender')
                 $secondChild = Start-VerificationChild -CommandLine $commandLine `
                     -Environment (Get-SandboxEnvironment -Sandbox $secondSandbox)
                 $secondResult = Wait-VerificationChild -Child $secondChild -TimeoutMs $TimeoutMs
@@ -201,16 +181,28 @@ function Invoke-Exit3Scenario {
                     [void]$evidence.Add(('locked-out run mutated nothing: {0} intact' -f $secondBait))
                 }
             }
+            finally {
+                Exit-WacSingleInstance -Mutex $heldMutex
+                $heldMutex = $null
+            }
 
+            $firstChild = Start-VerificationChild -CommandLine $commandLine `
+                -Environment (Get-SandboxEnvironment -Sandbox $firstSandbox)
             $firstResult = Wait-VerificationChild -Child $firstChild -TimeoutMs $TimeoutMs
             if (-not $firstResult.Exited) {
                 [void]$problem.Add('the first child did not finish inside its wall timeout and its tree was terminated')
             }
-            if ($firstResult.ExitCode -eq 3) {
-                [void]$problem.Add('the FIRST run also exited 3, so it never owned the lock and the scenario proved nothing')
+            if ($firstResult.ExitCode -ne 0) {
+                [void]$problem.Add(('the uncontended control did not succeed after release: {0}' -f $firstResult.ExitCode))
             }
             else {
-                [void]$evidence.Add(('the lock owner did not exit 3: it exited {0}' -f $firstResult.ExitCode))
+                [void]$evidence.Add('the uncontended control acquired the released lock and exited 0')
+            }
+            if (Test-Path -LiteralPath $firstBait -PathType Leaf) {
+                [void]$problem.Add('the uncontended control left its bait, so the non-mutation check had no positive control')
+            }
+            else {
+                [void]$evidence.Add('the uncontended control deleted its own bait')
             }
         }
     }
@@ -220,6 +212,7 @@ function Invoke-Exit3Scenario {
     finally {
         Stop-VerificationChild -Child $secondChild
         Stop-VerificationChild -Child $firstChild
+        Exit-WacSingleInstance -Mutex $heldMutex
         foreach ($path in @($secondSandbox, $firstSandbox)) {
             if (-not (Remove-VerificationSandbox -Path $path)) {
                 [void]$problem.Add(('the sandbox could not be removed: {0}' -f $path))
@@ -229,7 +222,7 @@ function Invoke-Exit3Scenario {
 
     $watch.Stop()
     return (New-ScenarioRecord -Name 'EXIT3' -ExpectedExitCode 3 `
-        -Expected 'the second overlapping run exits 3, mutates nothing, and the lock owner does not' `
+        -Expected 'the contended run exits 3 without mutation; after release, the control exits 0 and deletes its bait' `
         -ActualExitCode $exitCode -Evidence @($evidence.ToArray()) -Problem @($problem.ToArray()) `
         -DurationMs ([int]$watch.Elapsed.TotalMilliseconds))
 }

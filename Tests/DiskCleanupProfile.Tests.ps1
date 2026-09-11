@@ -514,10 +514,17 @@ Test-Case 'a handler nobody selected is switched off for the run and put back ex
 }
 
 Test-Case 'an unverifiable profile is never launched, and a restore fault is reported handler by handler' {
-    # Two registry-write faults, one table. Row 1 is a profile write that reports success and does
-    # nothing - what an enabled-but-not-really selection looks like from inside the step; row 2 is
-    # the restore of one pre-existing value failing. Both end non-success.
+    # Silent selection-write failures in either direction and a failed restore must not be success.
     $scenario = @(
+        @{ Name = 'an absent unselected value that could retain a handler default'
+           Shadow = {
+               param([Parameter(Mandatory = $true)][string]$LiteralPath, [Parameter(Mandatory = $true)][string]$Name,
+                   $PropertyType, $Value, [switch]$Force)
+               if ($LiteralPath -match 'Offline Pages Files') { return }
+               return (Microsoft.PowerShell.Management\New-ItemProperty -LiteralPath $LiteralPath -Name $Name -PropertyType $PropertyType -Value $Value -Force:$Force -ErrorAction Stop)
+           }
+           Key = 'AbsentOff'; Ran = 0; Detail = 'did not read back as the exact requested selection'
+           After = @{ 'Temporary Files' = '<absent>'; 'Thumbnail Cache' = '7'; 'Not A Real Handler' = '2'; 'Offline Pages Files' = '<absent>' } },
         @{ Name = 'a profile write that changed nothing'
            Shadow = {
                param([Parameter(Mandatory = $true)][string]$LiteralPath, [Parameter(Mandatory = $true)][string]$Name,

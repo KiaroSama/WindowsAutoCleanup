@@ -28,7 +28,7 @@ $script:VolumeCacheRegistryTimeoutMs = 1000 * 30
 
 $script:VolumeCacheKeyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
 
-# The 'Offline Pages Files' handler has no StateFlags value, so it is never written.
+# Never select Offline Pages Files; it still receives an explicit off value.
 $script:DiskCleanupSkipHandler = @('Offline Pages Files')
 
 $script:DiskCleanupCategory = @(
@@ -263,20 +263,19 @@ function Restore-WacDiskCleanupStateFlag {
 function Enable-WacDiskCleanupCategory {
     <#
     .SYNOPSIS
-        Writes the EXACT sage profile: the requested handlers on, and every other handler that
-        carries a value for this sage id explicitly off.
+        Writes the EXACT sage profile: requested handlers on and every other handler explicitly off.
     .DESCRIPTION
         Only 0 (off) and 2 (on) are documented values, so nothing else is ever written. The
-        'Offline Pages Files' handler is never ENABLED because it has no StateFlags value of its
-        own; it is still disabled like any other handler if it turns out to carry one.
+        'Offline Pages Files' handler is never ENABLED; it is disabled like every other unrequested
+        handler, including when the borrowed profile has no existing value.
 
         Turning the requested handlers on is NOT enough. The sage id is a fixed number this project
         borrows, and a machine where someone once ran cleanmgr /sageset with that same number
         already carries enabled values on handlers nobody here selected - /sagerun would run those
-        too, and putting the profile back afterwards does not undo what they deleted. Every handler
-        that is not requested and DOES carry a value is therefore written to 0. One that carries no
-        value at all is already unselected, so leaving it alone keeps this the smallest write that
-        still produces the exact selection.
+        too, and putting the profile back afterwards does not undo what they deleted. Absence does
+        not override a handler's default selection. A controlled native Sandbox run stalled with
+        absent unrequested values, completed with explicit zeros, then stalled again after restore.
+        Every unrequested handler therefore gets DWORD 0, verified before launch and restored after.
 
         A write that fails is COUNTED, not merely logged: a half-written profile means cleanmgr
         would run against a selection nobody chose.
@@ -309,22 +308,13 @@ function Enable-WacDiskCleanupCategory {
         return [PSCustomObject]@{ Touched = 0; Failed = 1; Enabled = @() }
     }
 
+    if (@($handlers | Where-Object { $requested.ContainsKey([string](Split-Path -Leaf $_.Name)) }).Count -eq 0) {
+        return [PSCustomObject]@{ Touched = 0; Failed = 0; Enabled = @() }
+    }
+
     foreach ($handler in $handlers) {
         $name = [string](Split-Path -Leaf $handler.Name)
         $wanted = $requested.ContainsKey($name)
-
-        if (-not $wanted) {
-            # An unrequested handler with no value is already off, and writing a 0 over nothing
-            # would only add a value someone else's profile never had.
-            $present = $false
-            try { $present = (-not (Get-WacRegistryValueFact -KeyPath ([string]$handler.PSPath) -ValueName $valueName).WasAbsent) }
-            catch {
-                $failed++
-                Write-WacLog -Level WARNING -Component 'DiskCleanup' -Message 'A StateFlags value could not be read, so the profile cannot be made exact.' -Data @{ handler = $name; error = $_.Exception.Message }
-                continue
-            }
-            if (-not $present) { continue }
-        }
 
         $value = 0
         if ($wanted) { $value = 2 }
@@ -352,11 +342,11 @@ function Test-WacDiskCleanupProfileExact {
         handlers this run never touched that make the difference: one of them carrying an enabled
         value from an old cleanmgr /sageset with the same number is precisely what /sagerun would
         run anyway. cleanmgr is started only once every handler has been read back and value 2 was
-        found on the expected ones and on nothing else.
+        found on the expected ones, with explicit DWORD 0 on every other handler.
 
         Enabled is DWORD 2 and nothing else. That is the only documented "run this handler" value,
-        and Enable-WacDiskCleanupCategory writes a DWORD over any other kind it finds, so anything
-        that is not a DWORD 2 here is either off or a write that did not take.
+        and disabled is DWORD 0. Missing values, wrong kinds and other numbers are not proof of an
+        explicit selection, so they fail the read-back even for unrequested handlers.
     .OUTPUTS
         Ok, Reason and Enabled (the handler names found switched on).
     #>
@@ -394,7 +384,11 @@ function Test-WacDiskCleanupProfileExact {
 
         $isOn = ((-not $fact.WasAbsent) -and $fact.Kind -eq [Microsoft.Win32.RegistryValueKind]::DWord -and ([int]$fact.Value) -eq 2)
         if ($isOn) { [void]$on.Add($name) }
-        if ($isOn -ne $wanted.ContainsKey($name)) { [void]$wrong.Add($name) }
+        $expectedValue = 0
+        if ($wanted.ContainsKey($name)) { $expectedValue = 2 }
+        if ($fact.WasAbsent -or $fact.Kind -ne [Microsoft.Win32.RegistryValueKind]::DWord -or ([int]$fact.Value) -ne $expectedValue) {
+            [void]$wrong.Add($name)
+        }
     }
 
     $result.Enabled = @($on.ToArray())
