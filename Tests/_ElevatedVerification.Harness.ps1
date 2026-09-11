@@ -159,9 +159,8 @@ function Get-SandboxLogText {
     .SYNOPSIS
         The concatenated text of every run log the child wrote inside its sandbox.
     .DESCRIPTION
-        FileShare ReadWrite|Delete is load-bearing: the EXIT3 scenario reads the FIRST child's log
-        while that child still holds the StreamWriter open, and a plain ReadAllText would fail with
-        "the process cannot access the file".
+        FileShare ReadWrite|Delete permits diagnostics while a child still holds its StreamWriter
+        open; a plain ReadAllText can fail with "the process cannot access the file".
 
         A file that still cannot be read after the bounded retry THROWS rather than being skipped.
         Every "the log must NOT contain X" assertion in this harness is only meaningful over a log
@@ -437,27 +436,6 @@ function Stop-VerificationChild {
     }
 
     try { $Child.Process.Dispose() } catch { $null = $_ }
-}
-
-function Wait-ForSignal {
-    <#
-    .SYNOPSIS
-        Polls a deterministic condition until a deadline. Never a blind sleep: the loop exits the
-        moment the condition holds, and reports failure the moment the deadline passes.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][scriptblock]$Condition,
-        [Parameter(Mandatory = $true)][int]$TimeoutMs
-    )
-
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($true) {
-        $signalled = $false
-        try { $signalled = [bool](& $Condition) } catch { $signalled = $false }
-        if ($signalled) { return $true }
-        if ($watch.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $false }
-        Start-Sleep -Milliseconds 200
-    }
 }
 
 # ------------------------------------------------------------------------------------------------

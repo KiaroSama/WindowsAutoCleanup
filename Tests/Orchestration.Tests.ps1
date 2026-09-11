@@ -358,4 +358,28 @@ Test-Case 'The run log adopts the pre-import bootstrap log' {
     Assert-True ($bound.IndexOf('BootstrapLogPath', [System.StringComparison]::Ordinal) -ge 0) `
     ('the bootstrap log is never handed to Core, so an import failure stays orphaned: ' + $bound)
 }
+Test-Case 'the elevated contention fixture owns the lock until its contender exits' {
+    $path = Join-Path $PSScriptRoot '_ElevatedVerification.SandboxScenarios.ps1'
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+    Assert-Equal 0 @($errors).Count 'the elevated scenarios must parse'
+    $scenario = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Invoke-Exit3Scenario'
+    }, $true)
+    Assert-True ($null -ne $scenario) 'the live EXIT3 scenario is missing'
+    $calls = @($scenario.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -in @('Enter-WacSingleInstance', 'Exit-WacSingleInstance',
+            'Start-VerificationChild', 'Wait-VerificationChild')
+    }, $true) | ForEach-Object { $_.GetCommandName() })
+    # Structural guard complements the live VM case: a historical log line cannot keep a lock held.
+    $expected = 'Enter-WacSingleInstance,Start-VerificationChild,Wait-VerificationChild,' +
+        'Exit-WacSingleInstance,Start-VerificationChild,Wait-VerificationChild,Exit-WacSingleInstance'
+    Assert-Equal $expected ($calls -join ',') 'contention must be held through the wait, then tested after release'
+}
+
 Complete-TestRun

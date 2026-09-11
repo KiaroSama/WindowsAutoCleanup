@@ -47,7 +47,7 @@
     measured on this project's two hosts, Windows PowerShell 5.1 refuses to start at all with a
     redirected SystemRoot ("Internal Windows PowerShell error. Loading managed Windows PowerShell
     failed with error 8009001d") and PowerShell 7 starts but loses CIM. So the EXIT2 scenario, and
-    the first run of the EXIT3 scenario, do perform the real DISM component-store cleanup (WITHOUT
+    the uncontended control of the EXIT3 scenario, do perform the real DISM component-store cleanup (WITHOUT
     /ResetBase), the real pnpclean driver-package handler and the real Delivery Optimization cache
     purge. All three are supported, non-destructive maintenance operations, and the harness never
     kills them: the -BudgetMinutes budget handed to every child is DERIVED from -TimeoutSeconds so
@@ -210,7 +210,7 @@ Write-Host ''
 Write-Host ('WindowsAutoCleanup elevated verification - host {0}, scenarios {1}' -f $script:HostExe, ($selected -join ', '))
 Write-Host ('Sandbox root {0}; child budget {1} min (derived); wall timeout {2}s per child.' -f `
     $script:SandboxRoot, $script:ChildBudgetMinutes, $TimeoutSeconds)
-Write-Host 'The EXIT2 scenario and the first EXIT3 run execute the real DISM component cleanup'
+Write-Host 'The EXIT2 scenario and the uncontended EXIT3 control execute the real DISM component cleanup'
 Write-Host '(without /ResetBase), pnpclean and the Delivery Optimization purge; see the .DESCRIPTION.'
 if ($machineSelected.Count -gt 0) {
     Write-Host ''
