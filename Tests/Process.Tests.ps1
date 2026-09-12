@@ -249,6 +249,11 @@ Test-Case 'Invoke-WacProcess does not report a deadline kill it could not prove'
             [PSCustomObject]@{} | Add-Member -MemberType ScriptMethod -Name WriteLine `
                 -Value { param($text) [void]$lines.Add([string]$text) }.GetNewClosure() -PassThru)
 
+        # The snapshot-walk verdict only runs when the tool was NOT owned from creation, so this
+        # case selects the fallback explicitly. An owned timeout is one TerminateJobObject call and
+        # cannot reach this code at all - that path is proved in OwnedProcess.Tests.ps1.
+        Set-WacOwnedProcessLauncher -Launcher { return $null }
+
         Set-WacProcessHandleOpener -Opener {
             param($processId)
             $null = $processId
@@ -270,6 +275,7 @@ Test-Case 'Invoke-WacProcess does not report a deadline kill it could not prove'
     }
     finally {
         Set-WacProcessHandleOpener -Opener $null
+        Set-WacOwnedProcessLauncher -Launcher $null
         Reset-WacTestLog
     }
 }

@@ -442,6 +442,20 @@ function Initialize-WacRun {
     # its last millisecond inside a cleanup step has nothing left to write its own verdict with.
     $armFrom = if ($null -eq $StartUtc) { (Get-Date).ToUniversalTime() } else { [datetime]$StartUtc }
     $script:DeadlineUtc = $armFrom.AddMinutes($BudgetMinutes).AddSeconds(-$ShutdownMarginSeconds)
+
+    # The margin is subtracted from the deadline, so the wall clock reserves it - but nothing used to
+    # stop recovery work from spending MORE than it (ledger WAC-06R): every -IgnoreRunBudget call got
+    # its own full timeout and N of them added up without limit. The reserve is now that same margin
+    # expressed as an allowance rollbacks draw down, so the two halves finally describe one number.
+    # Zero margin still leaves the default reserve: a run with no margin configured must not lose the
+    # ability to undo what it started.
+    if ($ShutdownMarginSeconds -gt 0) { Reset-WacShutdownReserve -ReserveMs ($ShutdownMarginSeconds * 1000) }
+    else { Reset-WacShutdownReserve }
+
+    # A new run starts with no outstanding mutation. The flag is per RUN, not per process:
+    # a suite that drove the abandoned path must not close the door on the next run in the
+    # same host.
+    Reset-WacAbandonedMutator
     $script:LogDegraded = $false
     $script:LogOpened = $false
     $script:LogFailedWrites = 0
@@ -737,42 +751,4 @@ function Remove-WacOldLog {
     }
 
     return $removed
-}
-
-# ---------------------------------------------------------------------------------------------
-# Deadline
-# ---------------------------------------------------------------------------------------------
-
-function Set-WacDeadline {
-    param([Parameter(Mandatory = $true)][datetime]$DeadlineUtc)
-    $script:DeadlineUtc = $DeadlineUtc
-}
-
-function Get-WacRemainingMs {
-    <#
-    .SYNOPSIS
-        Milliseconds left in the overall run budget, or [int]::MaxValue when no budget is armed.
-    #>
-    if (-not $script:DeadlineUtc) { return [int]::MaxValue }
-
-    $remaining = ($script:DeadlineUtc - (Get-Date).ToUniversalTime()).TotalMilliseconds
-    if ($remaining -le 0) { return 0 }
-    if ($remaining -ge [int]::MaxValue) { return [int]::MaxValue }
-    return [int]$remaining
-}
-
-function Test-WacDeadlineExpired {
-    return ((Get-WacRemainingMs) -le 0)
-}
-
-function Get-WacStepTimeoutMs {
-    <#
-    .SYNOPSIS
-        A step never gets more time than the run budget still has.
-    #>
-    param([Parameter(Mandatory = $true)][int]$RequestedMs)
-
-    $remaining = Get-WacRemainingMs
-    if ($RequestedMs -lt $remaining) { return $RequestedMs }
-    return $remaining
 }

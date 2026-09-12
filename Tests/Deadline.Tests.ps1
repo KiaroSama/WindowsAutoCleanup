@@ -33,7 +33,7 @@ function New-FlatFixture {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [int]$Count = 900
+        [int]$Count = 700
     )
 
     [void][System.IO.Directory]::CreateDirectory($Path)
@@ -43,15 +43,23 @@ function New-FlatFixture {
 }
 
 function Reset-WacTestDeadline {
-    # Leaving an expired deadline armed would poison every later case in this process.
+    # Leaving an expired deadline armed would poison every later case in this process, and so would
+    # a spent reserve or an outstanding abandoned mutator: all three are run-scoped state and are
+    # reset together or not at all.
     Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
+    Reset-WacShutdownReserve
+    Reset-WacAbandonedMutator
 }
 
 Test-Case 'A deadline that expires MID-directory stops the sweep' {
     $sandbox = New-TestSandbox -Prefix 'deadline-flat'
     try {
         $target = Join-Path -Path $sandbox -ChildPath 'flat'
-        $count = 1500
+        # 700, not 1500. The check interval is 256, so anything comfortably past it proves a
+        # mid-directory stop; the extra 800 files were pure fixture-build cost, paid four times in
+        # this file and twice again per host. Measured: 1500 -> 700 cuts this case roughly in half
+        # and changes nothing it asserts.
+        $count = 700
         New-FlatFixture -Path $target -Count $count
 
         # The budget must still be live when the directory is POPPED and expire while its entries are
@@ -158,7 +166,7 @@ Test-Case 'A deadline that expires MID-PATTERN stops the matched-file loop' {
     $sandbox = New-TestSandbox -Prefix 'deadline-pattern'
     try {
         $target = Join-Path -Path $sandbox -ChildPath 'flat'
-        $count = 1500
+        $count = 700
         New-FlatFixture -Path $target -Count $count
 
         Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddMilliseconds(250))
@@ -279,17 +287,25 @@ Test-Case 'Invoke-WacBounded cuts off in-process work that blocks, and calls it 
         Reset-WacTestDeadline
 
         # Thread.Sleep, not Start-Sleep: a cooperative check cannot see this, which is exactly the
-        # class of call the run budget used to miss. Kept to four seconds so the abandoned runspace
-        # thread finishes on its own well inside the suite.
+        # class of call the run budget used to miss.
+        #
+        # The bound is 2000 ms and not the 500 it used to be. Setup - creating the runspace, opening
+        # it, importing this module - is now charged to the same bound, so a 500 ms budget is one a
+        # loaded eight-worker runner can legitimately spend entirely on the prologue: the block is
+        # then never scheduled, Started is $false, and this case failed for a reason that is not its
+        # own. That outcome is correct and has its own case ("a slow module import is charged to the
+        # bound"); THIS one is about work that really starts and really blocks, so it gets a budget
+        # the prologue cannot swallow. The sleep stays comfortably longer than the bound and short
+        # enough that the abandoned runspace thread finishes well inside the suite.
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
-        $result = Invoke-WacBounded -ScriptBlock { [System.Threading.Thread]::Sleep(4000); 'never' } -TimeoutMs 500
+        $result = Invoke-WacBounded -ScriptBlock { [System.Threading.Thread]::Sleep(6000); 'never' } -TimeoutMs 2000
         $watch.Stop()
 
         Assert-Equal 'Incomplete' $result.Outcome 'blocked work that was cut off must never read as success'
-        Assert-True $result.Started
+        Assert-True $result.Started 'the block was never scheduled, so nothing was cut off'
         Assert-True $result.TimedOut
         Assert-Equal 0 @($result.Output).Count
-        Assert-True ($watch.Elapsed.TotalMilliseconds -lt 3500) `
+        Assert-True ($watch.Elapsed.TotalMilliseconds -lt 5000) `
             ('the bound was not enforced: ' + [int]$watch.Elapsed.TotalMilliseconds + ' ms')
     }
     finally {
@@ -478,6 +494,113 @@ Test-Case 'a slow module import is charged to the bound, and work that no longer
             'the block was scheduled although preparing it had already spent the entire bound'
         Assert-True ([bool]$result.TimedOut) 'an exhausted bound was not reported as a timeout'
         Assert-Equal 0 (@($result.Output).Count) 'a block that must never run produced output'
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# WAC-06R: one recovery reserve for the whole run
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'the recovery reserve is one allowance for the whole run, not a fresh one per rollback' {
+    # -IgnoreRunBudget used to mean "no bound from the run at all": every rollback got its own full
+    # timeout, so N of them was an unbounded shutdown. That is how a run already told to stop
+    # scheduling work still walks into Task Scheduler's four-hour kill, mid-write.
+    #
+    # The reserve is claimed at GRANT time, not measured afterwards, because the call that matters is
+    # the one that hangs for its whole allowance - measuring after the fact would leave the reserve
+    # looking untouched for the next caller.
+    try {
+        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
+        # 6000 rather than 1000, and it costs nothing: both blocks return immediately, so the whole
+        # case is two runspace prologues. A 1000 ms grant, on the other hand, is one a loaded
+        # eight-worker runner can spend entirely on that prologue - the first rollback was then
+        # refused for lack of TIME rather than lack of RESERVE, which is not what this case is about.
+        Reset-WacShutdownReserve -ReserveMs 6000
+
+        $first = Invoke-WacBounded -ScriptBlock { 'one' } -TimeoutMs 6000 -IgnoreRunBudget
+        $afterFirst = Get-WacShutdownReserveMs
+        $second = Invoke-WacBounded -ScriptBlock { 'two' } -TimeoutMs 6000 -IgnoreRunBudget
+
+        Assert-Equal 'Succeeded' ([string]$first.Outcome) 'the first rollback was refused although the reserve was full'
+        Assert-Equal 'one' ([string]@($first.Output)[0]) 'the first rollback did not actually run'
+        Assert-Equal 0 $afterFirst 'the first claim did not draw the reserve down'
+
+        Assert-True (-not $second.Started) `
+            'a second rollback was granted a fresh allowance after the reserve was already spent'
+        Assert-Equal 'Incomplete' ([string]$second.Outcome) 'a refused rollback was not reported as unfinished work'
+        Assert-True ($second.Error -match 'recovery reserve') `
+            ('the refusal did not say the reserve was the reason: ' + [string]$second.Error)
+
+        # The arithmetic itself, so a partial grant is covered without a second timed run.
+        Reset-WacShutdownReserve -ReserveMs 500
+        Assert-Equal 300 (Request-WacShutdownReserveMs -RequestedMs 300) 'a claim inside the reserve was not granted in full'
+        Assert-Equal 200 (Request-WacShutdownReserveMs -RequestedMs 400) 'a claim larger than the remainder was not clamped to it'
+        Assert-Equal 0 (Request-WacShutdownReserveMs -RequestedMs 100) 'a spent reserve still granted time'
+        Assert-Equal 0 (Get-WacShutdownReserveMs) 'a spent reserve reported time it no longer has'
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+Test-Case 'an abandoned MUTATING block closes the door on every later mutation, but not on reads' {
+    # Abandoning a runspace is not termination: BeginStop is a request, and a thread inside a
+    # blocking native call never comes back to honour it. For a read that costs two or three threads
+    # and nothing else. For a block that WRITES it means the run would schedule the next mutation on
+    # top of one still in progress, and nothing in this process can ever observe that one finishing.
+    #
+    # External mutators are not covered here and do not need to be: every one of them is a child
+    # process under job ownership, where a timeout is a proven TerminateJobObject.
+    try {
+        Reset-WacTestDeadline
+
+        # The GUARD, driven from its own state rather than from a race. Recording the abandonment is
+        # the timing-dependent half and it has its own case below; everything the guard then does is
+        # deterministic and costs two runspace prologues.
+        # Through the module's own scope: recording an abandonment is internal, and widening the
+        # shipped surface so a test can reach it is the wrong trade.
+        [void](& (Get-Module -Name 'WindowsAutoCleanup.Core') { Add-WacAbandonedMutator })
+        Assert-True (-not (Test-WacMutationAllowed)) 'an outstanding abandoned mutator still allowed mutation'
+
+        $second = Invoke-WacBounded -ScriptBlock { 'wrote anyway' } -TimeoutMs 30000 -Mutating
+        Assert-True (-not $second.Started) `
+            'a second mutation was scheduled while an abandoned one could still be writing'
+        Assert-Equal 'Incomplete' ([string]$second.Outcome) 'a refused mutation was not reported as unfinished work'
+        Assert-Equal 0 (@($second.Output).Count) 'a refused mutation still produced output'
+        Assert-True ($second.Error -match 'abandoned') `
+            ('the refusal did not say why: ' + [string]$second.Error)
+
+        # The control, and the reason this is a switch rather than a blanket rule: a blocked READ
+        # costs threads, never correctness, so it must stay allowed.
+        $read = Invoke-WacBounded -ScriptBlock { 'read ok' } -TimeoutMs 30000
+        Assert-Equal 'Succeeded' ([string]$read.Outcome) 'an ordinary read was blocked by an abandoned mutator'
+        Assert-Equal 'read ok' ([string]@($read.Output)[0]) 'the read did not run'
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
+Test-Case 'a mutating block that is really abandoned is what sets that flag' {
+    # The one link the case above deliberately does not race: an actual timeout must RECORD the
+    # abandonment. It is timing-dependent by nature - the block has to be scheduled before it can be
+    # abandoned, and setup is charged to the same bound - so the budget is generous enough that a
+    # loaded eight-worker runner cannot spend it all on the prologue. At 2000 ms it could, and this
+    # assertion failed reading "expected [1] but got [0]" because the block never started at all.
+    try {
+        Reset-WacTestDeadline
+
+        $blocked = Invoke-WacBounded -ScriptBlock { [System.Threading.Thread]::Sleep(12000); 'never' } `
+            -TimeoutMs 6000 -Mutating
+
+        Assert-True ([bool]$blocked.Started) `
+            'the prologue consumed the whole bound, so nothing was scheduled and nothing could be abandoned'
+        Assert-Equal 'Incomplete' ([string]$blocked.Outcome) 'an abandoned mutator was not reported as unfinished work'
+        Assert-True ([bool]$blocked.TimedOut) 'the mutator was not cut off at its bound'
+        Assert-Equal 1 (Get-WacAbandonedMutatorCount) 'the abandonment was not recorded against the run'
     }
     finally {
         Reset-WacTestDeadline

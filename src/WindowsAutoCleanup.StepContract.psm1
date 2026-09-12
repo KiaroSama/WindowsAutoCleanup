@@ -168,7 +168,8 @@ function Invoke-WacStepBounded {
         [Parameter(Mandatory = $true)][int]$TimeoutMs,
         [AllowEmptyCollection()][object[]]$ArgumentList = @(),
         [string]$Component = 'Steps',
-        [switch]$IgnoreRunBudget
+        [switch]$IgnoreRunBudget,
+        [switch]$Mutating
     )
 
     if ($script:BoundedInvoker) {
@@ -176,7 +177,7 @@ function Invoke-WacStepBounded {
     }
 
     return (Invoke-WacBounded -ScriptBlock $ScriptBlock -TimeoutMs $TimeoutMs -ArgumentList $ArgumentList `
-        -ImportModule @($script:StepsModulePath) -Component $Component -IgnoreRunBudget:$IgnoreRunBudget)
+        -ImportModule @($script:StepsModulePath) -Component $Component -IgnoreRunBudget:$IgnoreRunBudget -Mutating:$Mutating)
 }
 
 # ------------------------------------------------------------------------------------------------

@@ -127,6 +127,12 @@ Test-Case 'a failure after the tool started reports Started true and never fabri
     $originalLog = & $script:CoreModule { (Get-Command Write-WacLog).ScriptBlock }
 
     try {
+        # This case is about the FALLBACK path's catch block, which only runs when ownership was
+        # unavailable. Pinning the launcher to $null is what selects that path deliberately instead
+        # of letting the case pass or fail on whether this machine happens to support job objects.
+        # The owned path's own lifecycle verdicts are covered in OwnedProcess.Tests.ps1.
+        Set-WacOwnedProcessLauncher -Launcher { return $null }
+
         & $replace 'Write-WacLog' {
             param(
                 [Parameter(Mandatory = $true)][string]$Level,
@@ -156,6 +162,7 @@ Test-Case 'a failure after the tool started reports Started true and never fabri
     }
     finally {
         & $replace 'Write-WacLog' $originalLog
+        Set-WacOwnedProcessLauncher -Launcher $null
     }
 }
 
