@@ -60,6 +60,27 @@ function New-SandboxDirectory {
     return $Path
 }
 
+function New-TestHardLink {
+    <#
+    .SYNOPSIS
+        Creates a real hard link and returns its path, or throws if the OS refused.
+    .DESCRIPTION
+        cmd's mklink /H needs no elevation, so this runs the same on a developer shell and on an
+        elevated runner. Local to this suite for the reason New-SandboxDirectory is: a suite only
+        ever sees its own file.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Link,
+        [Parameter(Mandatory = $true)][string]$Target
+    )
+
+    $output = & cmd.exe /c mklink /H "$Link" "$Target" 2>&1
+    if (-not [System.IO.File]::Exists($Link)) {
+        throw ('mklink /H refused to create {0}: {1}' -f $Link, ($output -join ' '))
+    }
+    return $Link
+}
+
 # ---------------------------------------------------------------------------------------------
 # The lexical checks alone are not containment
 # ---------------------------------------------------------------------------------------------
@@ -469,6 +490,147 @@ Test-Case 'An ordinary reparse leaf inside its real parent is still deleted as a
     finally {
         $link = Join-Path -Path $sandbox -ChildPath 'root\link'
         if (Test-Path -LiteralPath $link) { Remove-TestJunction -Link $link }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+
+# ---------------------------------------------------------------------------------------------
+# The attribute fallback was outside the bound delete (WAC-01)
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'A swap between the delete refusal and the attribute retry leaves the outside file alone' {
+    <#
+        Remove-WacLeaf used to answer a Denied bound delete by clearing ReadOnly/Hidden/System
+        through the PATHNAME. By then DeleteBoundLeaf's proved parent and leaf handles are both
+        closed, so an ancestor replaced in between redirected that attribute WRITE onto a different
+        object - and the delete that followed refusing again proves nothing about the write that
+        already landed. The damage is metadata rather than deletion, which is exactly why it
+        survived review: every counter still read clean.
+
+        The swap is driven from the delete seam rather than from a second thread, so the ordering is
+        exact instead of probabilistic: the override IS the moment between the refusal and whatever
+        the caller decides to do next.
+    #>
+
+    # 1. UNGUARDED. The helper on its own, over the same fixture, after the same swap. Without this
+    #    the guarded half below would also pass over a fixture that was never lethal.
+    $control = New-TestSandbox -Prefix 'race-attr-control'
+    try {
+        $spool = New-SandboxDirectory -Path (Join-Path -Path $control -ChildPath 'allowlisted\spool')
+        $outside = New-SandboxDirectory -Path (Join-Path -Path $control -ChildPath 'outside')
+
+        $captured = Join-Path -Path $spool -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($captured, 'inside the root')
+        # The same LEAF name on both sides, so a redirected ancestor lands exactly on the sentinel.
+        $sentinel = Join-Path -Path $outside -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($sentinel, 'MUST SURVIVE')
+        [System.IO.File]::SetAttributes($sentinel, [System.IO.FileAttributes]::ReadOnly)
+
+        [System.IO.File]::Delete($captured)
+        [System.IO.Directory]::Delete($spool, $false)
+        [void](New-TestJunction -Link $spool -Target $outside)
+
+        [void](Clear-WacBlockingAttribute -LongPath (Get-WacLongPath -Path $captured))
+        Assert-Equal 0 ([int]([System.IO.File]::GetAttributes($sentinel) -band [System.IO.FileAttributes]::ReadOnly)) `
+            'the fixture is not lethal, so nothing below proves the deletion path stopped using it'
+    }
+    finally {
+        Remove-TestJunction -Link (Join-Path -Path $control -ChildPath 'allowlisted\spool')
+        Remove-TestSandbox -Path $control
+    }
+
+    # 2. GUARDED. Same fixture, same swap, performed from inside the deletion path at the exact
+    #    instant the old code reached for that helper.
+    $sandbox = New-TestSandbox -Prefix 'race-attr-guarded'
+    try {
+        $root = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'allowlisted')
+        $spool = New-SandboxDirectory -Path (Join-Path -Path $root -ChildPath 'spool')
+        $outside = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'outside')
+
+        $victim = Join-Path -Path $spool -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($victim, 'inside the root')
+        $sentinel = Join-Path -Path $outside -ChildPath 'victim.tmp'
+        [System.IO.File]::WriteAllText($sentinel, 'MUST SURVIVE')
+        [System.IO.File]::SetAttributes(
+            $sentinel, ([System.IO.FileAttributes]::ReadOnly -bor [System.IO.FileAttributes]::Hidden))
+
+        $swap = [PSCustomObject]@{ Calls = 0; Victim = $victim; Spool = $spool; Outside = $outside }
+        $stats = New-WacDeletionStats
+        Set-WacBoundDeleteOverride -ScriptBlock {
+            param($longPath, $expected, $openReparsePoint, $win32, $ntStatus)
+            [void]$longPath; [void]$expected; [void]$openReparsePoint
+
+            # Refuse the way a read-only leaf really does, and swap the ancestor in the same breath.
+            $swap.Calls++
+            if ($swap.Calls -eq 1) {
+                [System.IO.File]::Delete($swap.Victim)
+                [System.IO.Directory]::Delete($swap.Spool, $false)
+                [void](& cmd.exe /c mklink /J "$($swap.Spool)" "$($swap.Outside)")
+            }
+
+            $win32.Value = 0
+            $ntStatus.Value = [int]0xC0000121
+            return 3
+        }.GetNewClosure()
+        try { Remove-WacLeaf -Path $victim -RootPath $root -Stats $stats }
+        finally { Set-WacBoundDeleteOverride -ScriptBlock $null }
+
+        Assert-True ($swap.Calls -ge 1) 'the swap hook never fired, so the case proved nothing'
+        Assert-Equal 'MUST SURVIVE' ([System.IO.File]::ReadAllText($sentinel)) 'the outside file was rewritten'
+        $attributes = [System.IO.File]::GetAttributes($sentinel)
+        Assert-True (([int]$attributes -band [int][System.IO.FileAttributes]::ReadOnly) -ne 0) `
+            ('the outside file lost ReadOnly to a redirected attribute write; attributes are ' + $attributes)
+        Assert-True (([int]$attributes -band [int][System.IO.FileAttributes]::Hidden) -ne 0) `
+            ('the outside file lost Hidden to a redirected attribute write; attributes are ' + $attributes)
+
+        # The refusal still has to land somewhere an exit code can see. Denied is a skip rather than
+        # a security refusal: nothing escaped, the object simply stays.
+        Assert-Equal 1 ([int]$stats.SkippedDenied) 'the refusal was not accounted for'
+        Assert-Equal 0 ([int]$stats.FilesDeleted)
+        Assert-Equal 0 ([int]$stats.RefusedIdentity)
+    }
+    finally {
+        Set-WacBoundDeleteOverride -ScriptBlock $null
+        Remove-TestJunction -Link (Join-Path -Path $sandbox -ChildPath 'allowlisted\spool')
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A read-only hard link is unlinked without rewriting the file its outside name shares' {
+    <#
+        A hard link carries no reparse attribute and resolves to a perfectly ordinary path, so every
+        link check in this file misses it. Attributes belong to the FILE rather than to the
+        directory entry, so clearing ReadOnly through an allow-listed hard link changed that file
+        under its outside names too - no race required, and nothing left behind to detect it.
+
+        What must happen instead: the one directory entry inside the allow-list goes, and the name
+        outside keeps both its bytes and its attributes.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'race-hardlink'
+    try {
+        $root = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'allowlisted')
+        $outside = New-SandboxDirectory -Path (Join-Path -Path $sandbox -ChildPath 'outside')
+
+        $sentinel = Join-Path -Path $outside -ChildPath 'sentinel.dat'
+        [System.IO.File]::WriteAllText($sentinel, 'MUST SURVIVE')
+        $link = New-TestHardLink -Link (Join-Path -Path $root -ChildPath 'linked.tmp') -Target $sentinel
+        # Set it AFTER the link exists: the attribute is shared either way, and a read-only source
+        # is one more thing for mklink to refuse.
+        [System.IO.File]::SetAttributes($sentinel, [System.IO.FileAttributes]::ReadOnly)
+
+        $result = Remove-WacTree -Category 'hardlink' -Path $root
+
+        Assert-True $result.Attempted
+        Assert-False ([System.IO.File]::Exists($link)) `
+            ('the allow-listed link survived; skipDenied=' + $result.SkippedDenied + ' failed=' + $result.Failed)
+        Assert-True ([System.IO.File]::Exists($sentinel)) 'the outside name was unlinked as well'
+        Assert-Equal 'MUST SURVIVE' ([System.IO.File]::ReadAllText($sentinel)) 'the outside file was rewritten'
+        Assert-True (([int][System.IO.File]::GetAttributes($sentinel) -band [int][System.IO.FileAttributes]::ReadOnly) -ne 0) `
+            'the outside name lost ReadOnly to an attribute write made through the allow-listed link'
+        Assert-Equal 0 ([int]$result.Refused) 'an ordinary hard link is not a security refusal'
+    }
+    finally {
         Remove-TestSandbox -Path $sandbox
     }
 }

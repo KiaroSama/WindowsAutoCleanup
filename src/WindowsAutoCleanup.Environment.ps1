@@ -135,7 +135,19 @@ function Get-WacUserProfilePath {
         is the fallback for hosts where the WMI class is unavailable; there the documented recipe is
         to skip the well-known SIDs S-1-5-18/19/20 and any '.bak' key, then confirm the profile with
         ntuser.dat/ntuser.man. The undocumented per-SID Flags/State values are never consulted.
+
+        A returned list answers "which profiles are these" and cannot answer "was that all of them",
+        and the two are different facts: a machine with no other profiles and a machine whose
+        profiles could not be enumerated both hand back an empty array. Callers that need the second
+        fact pass -Gap and read what was appended to it.
+    .PARAMETER Gap
+        Optional collector. One record per discovery source that could not be FINISHED is appended,
+        so an unreadable source cannot be mistaken for an absent one. Paths that are deliberately
+        excluded - a well-known service SID, a '.bak' entry, an off-drive or reparse-point profile -
+        are not gaps: those are answers, not missing answers.
     #>
+    param([AllowNull()][System.Collections.Generic.List[object]]$Gap)
+
     $results = New-Object 'System.Collections.Generic.List[string]'
 
     $addCandidate = {
@@ -151,6 +163,7 @@ function Get-WacUserProfilePath {
     }
 
     $wmiWorked = $false
+    $cimError = ''
     try {
         $profiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)
         $wmiWorked = $true
@@ -160,10 +173,17 @@ function Get-WacUserProfilePath {
         }
     }
     catch {
-        Write-WacLog -Level DEBUG -Component 'Profiles' -Message 'Win32_UserProfile is unavailable; falling back to the ProfileList registry key.' -Data @{ error = $_.Exception.Message }
+        $cimError = [string]$_.Exception.Message
+        Write-WacLog -Level DEBUG -Component 'Profiles' -Message 'Win32_UserProfile is unavailable; falling back to the ProfileList registry key.' -Data @{ error = $cimError }
     }
 
     if ($wmiWorked -and $results.Count -gt 0) { return @($results.ToArray()) }
+
+    # Below this line the registry key is the AUTHORITATIVE source only when the CIM query did not
+    # finish. A healthy fallback recovering an unavailable provider is a complete discovery and must
+    # not be reported as a gap; conversely, a CIM query that completed has already answered which
+    # profiles exist, so a failure in this confirmation pass cannot un-answer it.
+    $fallbackIsAuthoritative = (-not $wmiWorked)
 
     $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
     $wellKnown = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')
@@ -173,20 +193,47 @@ function Get-WacUserProfilePath {
     }
     catch {
         Write-WacLog -Level WARNING -Component 'Profiles' -Message 'Could not read the ProfileList registry key; no user profiles will be cleaned.' -Data @{ error = $_.Exception.Message }
+        if ($fallbackIsAuthoritative -and $null -ne $Gap) {
+            [void]$Gap.Add([PSCustomObject]@{
+                Source = 'UserProfile'
+                Scope  = 'ProfileList'
+                Reason = ('neither Win32_UserProfile ({0}) nor the ProfileList registry key ({1}) could be enumerated' -f $cimError, $_.Exception.Message)
+            })
+        }
         return @($results.ToArray())
     }
 
     foreach ($subKey in $subKeys) {
         $sid = Split-Path -Leaf $subKey.Name
         if ($sid.EndsWith('.bak', [System.StringComparison]::OrdinalIgnoreCase)) {
+            # Deliberately excluded rather than unreadable: a '.bak' key is the documented marker of
+            # a profile Windows itself renamed, so skipping it is an answer and not a missing one.
             Write-WacLog -Level WARNING -Component 'Profiles' -Message 'ProfileList holds a .bak entry; that profile is skipped.' -Data @{ sid = $sid }
             continue
         }
         if ($wellKnown -contains $sid) { continue }
 
-        $imagePath = $null
-        try { $imagePath = [string](Get-ItemProperty -LiteralPath $subKey.PSPath -Name 'ProfileImagePath' -ErrorAction Stop).ProfileImagePath }
-        catch { continue }
+        # No -Name: asking for one value makes "this key cannot be read" and "this key has no such
+        # value" the same exception, and only the first is a gap. A ProfileList entry without a
+        # ProfileImagePath is malformed, which the IsNullOrWhiteSpace check below already answers.
+        $entry = $null
+        try { $entry = Get-ItemProperty -LiteralPath $subKey.PSPath -ErrorAction Stop }
+        catch {
+            Write-WacLog -Level WARNING -Component 'Profiles' -Message 'A ProfileList entry could not be read; that profile was not examined.' -Data @{ sid = $sid; error = $_.Exception.Message }
+            if ($fallbackIsAuthoritative -and $null -ne $Gap) {
+                [void]$Gap.Add([PSCustomObject]@{
+                    Source = 'UserProfile'
+                    Scope  = $sid
+                    Reason = ('the ProfileList entry could not be read ({0})' -f $_.Exception.Message)
+                })
+            }
+            continue
+        }
+
+        $imagePath = ''
+        if ($null -ne $entry -and (@($entry.PSObject.Properties.Name) -ccontains 'ProfileImagePath')) {
+            $imagePath = [string]$entry.ProfileImagePath
+        }
 
         if ([string]::IsNullOrWhiteSpace($imagePath)) { continue }
         & $addCandidate ([Environment]::ExpandEnvironmentVariables($imagePath)) $true

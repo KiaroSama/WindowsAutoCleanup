@@ -54,6 +54,84 @@ $script:OperationLockName = 'Global\WindowsAutoCleanup'
 
 function Get-WacOperationLockName { return $script:OperationLockName }
 
+# The rollback transaction (ledger B2-3). Rollback used to work out what to undo by looking at the
+# filesystem, where the absence of a .previous directory meant "this was a first install, so remove
+# the root". That inference is wrong in precisely the case that matters: when the second move of a
+# switch fails, the switch's own catch moves the original back OUT of .previous, so the outer
+# rollback then saw no .previous, deleted the machine's ORIGINAL installation and reported success.
+# A failed FIRST move arrived at the same place with nothing moved at all.
+#
+# The record is written before the first move and updated after every one of them, so
+# Restore-WacDeploymentPrevious acts on what happened rather than on what is missing. It is
+# per-process state deliberately: it describes a swap this process is in the middle of, and a swap
+# that outlived its process is reconciled from disk by Resolve-WacDeploymentRecoverySlot instead.
+$script:DeploymentTransaction = $null
+
+function Move-WacDeploymentSlot {
+    <#
+    .SYNOPSIS
+        Renames one deployment slot directory onto another slot path.
+    .DESCRIPTION
+        Every slot rename in this module goes through here, so the transaction record and the
+        directory that actually moved cannot drift apart, and so one specific move can be made to
+        fail without disturbing the rest of the lifecycle.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$From,
+        [Parameter(Mandatory = $true)][string]$To
+    )
+
+    [System.IO.Directory]::Move($From, $To)
+}
+
+function Resolve-WacDeploymentRecoverySlot {
+    <#
+    .SYNOPSIS
+        Reconciles a .previous slot an earlier run left behind, BEFORE a new stage would clear it.
+    .DESCRIPTION
+        Clearing .previous unconditionally is safe only while it holds a superseded copy. An install
+        interrupted between the two moves, or a rollback that stopped half way, leaves the machine's
+        ONLY installation there - and clearing it to make room for another attempt threw that
+        original away.
+
+        The deployment root is the evidence. Nothing there: .previous is the original and it goes
+        back where it belongs. Our deployment there: .previous is the superseded copy and it goes.
+        Something there that cannot be proven ours: neither is touched and staging refuses, because
+        that is the one shape in which guessing can cost the operator both trees.
+    .OUTPUTS
+        Action (None, Restored or Discarded) and Reason.
+    #>
+    param([Parameter(Mandatory = $true)]$Slots)
+
+    $result = [PSCustomObject]@{ Action = 'None'; Reason = 'There was no recovery slot to reconcile.' }
+
+    if (-not (Test-Path -LiteralPath $Slots.Previous -PathType Container)) { return $result }
+
+    if (-not (Test-Path -LiteralPath $Slots.Root -PathType Container)) {
+        Move-WacDeploymentSlot -From $Slots.Previous -To $Slots.Root
+        $result.Action = 'Restored'
+        $result.Reason = 'The deployment root was empty, so the recovery slot held the only installation on this machine and was put back.'
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'An interrupted run left the only deployment in the recovery slot; it was restored before staging.' -Data @{
+            previous = $Slots.Previous; root = $Slots.Root
+        }
+        return $result
+    }
+
+    $live = Get-WacDeploymentOwnership -DeploymentRoot $Slots.Root
+    if (-not $live.IsOurs) {
+        throw ("A recovery slot from an earlier run is still present and what stands at the deployment root cannot be proven ours, so neither was touched: {0} ({1})" -f $Slots.Previous, [string]$live.Reason)
+    }
+
+    $cleared = Remove-WacDeployment -Path $Slots.Previous
+    if (-not $cleared.Removed) {
+        throw ("A leftover deployment slot could not be cleared: {0} ({1})" -f $Slots.Previous, [string]$cleared.Reason)
+    }
+
+    $result.Action = 'Discarded'
+    $result.Reason = 'The recovery slot held a superseded copy while our deployment is live, so it was discarded.'
+    return $result
+}
+
 function New-WacDeploymentStage {
     <#
     .SYNOPSIS
@@ -88,11 +166,15 @@ function New-WacDeploymentStage {
     if (-not (Test-Path -LiteralPath $sourceRun -PathType Leaf)) { throw ("Run.ps1 was not found in {0}." -f $source) }
     if (-not (Test-Path -LiteralPath $sourceSrc -PathType Container)) { throw ("The src directory was not found in {0}." -f $source) }
 
-    foreach ($slot in @($slots.Staging, $slots.Previous)) {
-        $cleared = Remove-WacDeployment -Path $slot
-        if (-not $cleared.Removed) {
-            throw ("A leftover deployment slot could not be cleared: {0} ({1})" -f $slot, $cleared.Reason)
-        }
+    # The recovery slot is reconciled BEFORE anything is cleared or copied: it can hold the only
+    # installation this machine has left, and preparing another attempt must never be what destroys
+    # it. The staging slot carries no such risk - it only ever holds a build in progress - so it is
+    # still cleared unconditionally.
+    [void](Resolve-WacDeploymentRecoverySlot -Slots $slots)
+
+    $cleared = Remove-WacDeployment -Path $slots.Staging
+    if (-not $cleared.Removed) {
+        throw ("A leftover deployment slot could not be cleared: {0} ({1})" -f $slots.Staging, $cleared.Reason)
     }
 
     Write-WacLog -Level INFO -Component 'Deploy' -Message 'Staging the deployment.' -Data @{ source = $source; staging = $slots.Staging }
@@ -130,11 +212,17 @@ function New-WacDeploymentStage {
 function Switch-WacDeploymentStage {
     <#
     .SYNOPSIS
-        Atomically swaps the staged tree into the deployment root.
+        Atomically swaps the staged tree into the deployment root, under a recorded transaction.
     .DESCRIPTION
         Move-old-aside / move-staging-in, with the old tree restored if the second move fails. With
         -KeepPrevious the old tree is LEFT in the .previous slot so the caller can roll back after a
         later step - registering the task, or asserting what it registered - fails.
+
+        $script:DeploymentTransaction is written BEFORE the first move and updated after each one,
+        because the directories left behind afterwards do not say what happened: .previous is absent
+        both when there never was an original and when the catch below has already put one back, and
+        rollback used to treat those two opposite states identically. The record also carries what
+        the original WAS, so a restored tree can be checked against it rather than merely counted.
     .OUTPUTS
         DeploymentRoot, RunScript, FileCount, PreviousKept.
     #>
@@ -147,35 +235,79 @@ function Switch-WacDeploymentStage {
         throw ("There is no staged deployment to switch into place: {0}" -f $slots.Staging)
     }
 
-    $movedAside = $false
-    if (Test-Path -LiteralPath $slots.Root -PathType Container) {
-        [System.IO.Directory]::Move($slots.Root, $slots.Previous)
-        $movedAside = $true
+    $transaction = [PSCustomObject]@{
+        Root = $slots.Root
+        Previous = $slots.Previous
+        HadOriginal = [bool](Test-Path -LiteralPath $slots.Root -PathType Container)
+        OriginalKind = $null
+        OriginalVersion = $null
+        OriginalTampered = $false
+        OriginalMovedAside = $false
+        ReplacementLive = $false
+        ReplacementManifestHash = $null
+        OriginalRestored = $false
+        RestoreVerdict = $null
+    }
+
+    if ($transaction.HadOriginal) {
+        # Read while the original is still at the root. After the swap nothing at this path
+        # describes it any more, and a rollback that cannot say what it put back has not proven it.
+        $original = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
+        $transaction.OriginalKind = [string]$original.Kind
+        $transaction.OriginalVersion = [string]$original.Version
+        $transaction.OriginalTampered = [bool]$original.Tampered
+    }
+
+    $script:DeploymentTransaction = $transaction
+
+    if ($transaction.HadOriginal) {
+        Move-WacDeploymentSlot -From $slots.Root -To $slots.Previous
+        $transaction.OriginalMovedAside = $true
     }
 
     try {
-        [System.IO.Directory]::Move($slots.Staging, $slots.Root)
+        Move-WacDeploymentSlot -From $slots.Staging -To $slots.Root
+        $transaction.ReplacementLive = $true
+
+        # What proves a tree at the deployment root is the one THIS transaction put there. Its name,
+        # its layout and its project id do not: the original carries all three. The manifest hashes
+        # every staged file and the moment it was written, so it identifies one particular build.
+        $transaction.ReplacementManifestHash = Get-WacDeploymentFileHash -Path (Get-WacDeploymentManifestPath -DeploymentRoot $slots.Root)
     }
     catch {
-        if ($movedAside) {
-            try { [System.IO.Directory]::Move($slots.Previous, $slots.Root) }
+        # Captured before the nested catch below can rebind $_ in this same scope.
+        $failure = $_
+        if ($transaction.OriginalMovedAside) {
+            try {
+                Move-WacDeploymentSlot -From $slots.Previous -To $slots.Root
+                $transaction.OriginalMovedAside = $false
+                $transaction.OriginalRestored = $true
+            }
             catch { Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'The previous deployment could not be restored.' -Data @{ previous = $slots.Previous; root = $slots.Root } }
         }
-        throw ("The staging directory could not be swapped into place: {0}" -f $_.Exception.Message)
+        throw ("The staging directory could not be swapped into place: {0}" -f $failure.Exception.Message)
     }
 
     $keptPrevious = $false
-    if ($movedAside) {
-        if ($KeepPrevious) {
-            $keptPrevious = $true
-        }
-        else {
+    if ($KeepPrevious) {
+        $keptPrevious = [bool]$transaction.OriginalMovedAside
+    }
+    else {
+        if ($transaction.OriginalMovedAside) {
             $discarded = Remove-WacDeployment -Path $slots.Previous
-            if (-not $discarded.Removed) {
+            if ($discarded.Removed) {
+                $transaction.OriginalMovedAside = $false
+            }
+            else {
                 # The new deployment is already live, so this is untidy rather than fatal.
                 Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The previous deployment could not be deleted.' -Data @{ path = $slots.Previous; reason = $discarded.Reason }
             }
         }
+
+        # Without -KeepPrevious the caller has said it will not roll back, and the original has just
+        # been discarded, so there is nothing left to restore. Forgetting the transaction is what
+        # stops a rollback that arrives anyway from deleting a live deployment it cannot replace.
+        $script:DeploymentTransaction = $null
     }
 
     # Throwing here is deliberate and the caller must be inside its rollback try: a deployment whose
@@ -198,14 +330,69 @@ function Switch-WacDeploymentStage {
     }
 }
 
+function Remove-WacDeploymentReplacement {
+    <#
+    .SYNOPSIS
+        Removes the tree a switch put live, but only once it is PROVEN to be that tree and only once
+        what it replaced can still be put back.
+    .OUTPUTS
+        Removed and Reason.
+    #>
+    param([Parameter(Mandatory = $true)]$Transaction)
+
+    $result = [PSCustomObject]@{ Removed = $false; Reason = $null }
+
+    if (-not (Test-Path -LiteralPath $Transaction.Root -PathType Container)) {
+        $Transaction.ReplacementLive = $false
+        $result.Removed = $true
+        $result.Reason = 'Nothing stands at the deployment root.'
+        return $result
+    }
+
+    $live = Get-WacDeploymentFileHash -Path (Get-WacDeploymentManifestPath -DeploymentRoot $Transaction.Root)
+    if ([string]::IsNullOrWhiteSpace([string]$Transaction.ReplacementManifestHash) -or
+        [string]::IsNullOrWhiteSpace([string]$live) -or
+        -not [string]::Equals([string]$live, [string]$Transaction.ReplacementManifestHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $result.Reason = 'What stands at the deployment root is not the tree this run switched into place, so it was left exactly as found.'
+        Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'Rollback refused to delete a deployment it cannot prove this run installed.' -Data @{ root = $Transaction.Root }
+        return $result
+    }
+
+    # Proven before the delete, never after it. Removing the replacement first and only then finding
+    # there is nothing to put back is how a rollback leaves a machine with no deployment at all.
+    if ($Transaction.HadOriginal -and -not (Test-Path -LiteralPath $Transaction.Previous -PathType Container)) {
+        $result.Reason = 'The deployment this run replaced is no longer in the recovery slot, so removing what replaced it would leave this machine with nothing installed.'
+        Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'Rollback kept the new deployment because the one it replaced could not be found.' -Data @{ root = $Transaction.Root; previous = $Transaction.Previous }
+        return $result
+    }
+
+    $removed = Remove-WacDeployment -Path $Transaction.Root
+    if (-not $removed.Removed) {
+        $result.Reason = ('The new deployment could not be removed, so the previous one was not restored: {0}' -f [string]$removed.Reason)
+        return $result
+    }
+
+    $Transaction.ReplacementLive = $false
+    $result.Removed = $true
+    return $result
+}
+
 function Restore-WacDeploymentPrevious {
     <#
     .SYNOPSIS
-        Undoes a switch: discards the new deployment and puts the kept previous tree back.
+        Undoes the switch this process recorded: discards the replacement it put live and puts the
+        original back. Idempotent.
     .DESCRIPTION
-        Only ever called after Switch-WacDeploymentStage -KeepPrevious, so the tree it deletes is the
-        one this run just wrote. When there was no previous deployment the root is simply removed,
-        which is the correct rollback of a first install.
+        The ONE owner of deployment rollback, and it reads the transaction Switch-WacDeploymentStage
+        recorded before its first move. It infers nothing from the presence or absence of .previous,
+        because that absence has two opposite meanings - there was no original, or the switch has
+        already put the original back - and acting on the wrong one deletes the machine's
+        installation and calls it a successful rollback.
+
+        Every refusal keeps what is on disk. A tree that cannot be proven to be this run's
+        replacement, an original that is no longer in the recovery slot, a removal that failed: each
+        leaves the live deployment alone and says why. A second call after a successful one changes
+        nothing, so the installer may roll back once per failure without counting.
     .OUTPUTS
         Restored, HadPrevious, Reason.
     #>
@@ -214,35 +401,80 @@ function Restore-WacDeploymentPrevious {
 
     $result = [PSCustomObject]@{ Restored = $false; HadPrevious = $false; Reason = $null }
 
-    $slots = Get-WacDeploymentSlotPath
-    if (-not $slots) {
-        $result.Reason = 'The deployment root could not be resolved.'
-        return $result
-    }
-
-    $result.HadPrevious = Test-Path -LiteralPath $slots.Previous -PathType Container
-
-    $removed = Remove-WacDeployment -Path $slots.Root
-    if (-not $removed.Removed) {
-        $result.Reason = ('The new deployment could not be removed, so the previous one was not restored: {0}' -f [string]$removed.Reason)
-        return $result
-    }
-
-    if (-not $result.HadPrevious) {
+    $transaction = $script:DeploymentTransaction
+    if (-not $transaction) {
         $result.Restored = $true
-        $result.Reason = 'There was no previous deployment; the new one was removed.'
+        $result.Reason = 'No deployment switch is in flight, so there was nothing to undo and nothing was removed.'
+        return $result
+    }
+
+    $result.HadPrevious = [bool]$transaction.HadOriginal
+
+    # OriginalRestored means the tree is back where it belongs; RestoreVerdict carries the reason it
+    # is nonetheless not a clean rollback. A second call cannot improve either, so it repeats the
+    # same answer rather than starting over on a machine that is already in its final state.
+    if ($transaction.OriginalRestored) {
+        $result.Restored = [string]::IsNullOrEmpty([string]$transaction.RestoreVerdict)
+        $result.Reason = if ($result.Restored) { 'The switch had already been undone, so nothing was changed.' }
+            else { [string]$transaction.RestoreVerdict }
+        return $result
+    }
+
+    if (-not $transaction.ReplacementLive -and -not $transaction.OriginalMovedAside) {
+        $transaction.OriginalRestored = $true
+        $result.Restored = $true
+        $result.Reason = 'The switch failed before anything moved, so the deployment was never changed.'
+        return $result
+    }
+
+    if ($transaction.ReplacementLive) {
+        $removal = Remove-WacDeploymentReplacement -Transaction $transaction
+        if (-not $removal.Removed) {
+            $result.Reason = [string]$removal.Reason
+            return $result
+        }
+    }
+
+    if (-not $transaction.HadOriginal) {
+        $transaction.OriginalRestored = $true
+        $result.Restored = $true
+        $result.Reason = 'There was no previous deployment; the one this run installed was removed.'
         return $result
     }
 
     try {
-        [System.IO.Directory]::Move($slots.Previous, $slots.Root)
-        $result.Restored = $true
-        $result.Reason = 'The previous deployment was restored.'
+        Move-WacDeploymentSlot -From $transaction.Previous -To $transaction.Root
+        $transaction.OriginalMovedAside = $false
     }
     catch {
         $result.Reason = ('The previous deployment could not be restored: {0}' -f $_.Exception.Message)
+        return $result
     }
 
+    # Identity and content, not merely a directory at the right path. The tree that comes back has
+    # to read as the same KIND of deployment, carry the same version, and not have stopped matching
+    # its own manifest between the two moves.
+    $back = Get-WacDeploymentOwnership -DeploymentRoot $transaction.Root
+    $transaction.OriginalRestored = $true
+    if (-not [string]::Equals([string]$back.Kind, [string]$transaction.OriginalKind, [System.StringComparison]::Ordinal)) {
+        $transaction.RestoreVerdict = ('The tree put back at the deployment root reads as {0} where the one this run replaced was {1}: {2}' -f
+            [string]$back.Kind, [string]$transaction.OriginalKind, [string]$back.Reason)
+    }
+    elseif (-not [string]::Equals([string]$back.Version, [string]$transaction.OriginalVersion, [System.StringComparison]::Ordinal)) {
+        $transaction.RestoreVerdict = ('The tree put back at the deployment root is version {0} where the one this run replaced was version {1}.' -f
+            [string]$back.Version, [string]$transaction.OriginalVersion)
+    }
+    elseif ($back.Tampered -and -not $transaction.OriginalTampered) {
+        $transaction.RestoreVerdict = ('The tree put back at the deployment root no longer matches its own manifest: {0}' -f [string]$back.Reason)
+    }
+
+    if ($transaction.RestoreVerdict) {
+        $result.Reason = [string]$transaction.RestoreVerdict
+        return $result
+    }
+
+    $result.Restored = $true
+    $result.Reason = ('The previous deployment was restored and verified: {0}' -f [string]$back.Reason)
     return $result
 }
 
@@ -250,12 +482,19 @@ function Remove-WacDeploymentPrevious {
     <#
     .SYNOPSIS
         Discards the kept previous deployment once the new one is registered and verified.
+    .DESCRIPTION
+        This is the commit point, so the transaction ends here whether or not the old tree could be
+        deleted. Leaving it recorded would let a rollback arriving afterwards delete the deployment
+        this run has just proven good.
     #>
     [CmdletBinding()]
     param()
 
     $slots = Get-WacDeploymentSlotPath
     if (-not $slots) { return $false }
+
+    $script:DeploymentTransaction = $null
+
     if (-not (Test-Path -LiteralPath $slots.Previous)) { return $true }
 
     $discarded = Remove-WacDeployment -Path $slots.Previous

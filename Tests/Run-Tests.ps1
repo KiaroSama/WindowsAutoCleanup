@@ -230,10 +230,22 @@ if ($env:HOOKMAKER_MAX_TEST_WORKERS) {
 $workRoot = [System.IO.Path]::GetFullPath((Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('wac-run-{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 12))))
 [void][System.IO.Directory]::CreateDirectory($workRoot)
 
+# A suite's IDENTITY is its path relative to Tests\, never its bare file name. -Recurse can discover
+# two suites sharing a name in different subdirectories, and a name-keyed identity gives those two
+# the SAME capture file names and the same manifest line: their output would collide in one pair of
+# redirect files, and Sort-Object -Unique would fold them into a single manifest entry, so the CI
+# guard would accept a run in which only one of the pair actually executed. $suiteRoot is the literal
+# prefix Get-ChildItem built every FullName from, which is why plain Substring is exact here.
+$suiteRoot = $PSScriptRoot.TrimEnd('\') + '\'
+
 $pending = New-Object 'System.Collections.Generic.Queue[object]'
 foreach ($kind in $hostKinds) {
     foreach ($suite in $suites) {
-        $pending.Enqueue([PSCustomObject]@{ Suite = $suite; HostKind = $kind })
+        $pending.Enqueue([PSCustomObject]@{
+            Suite    = $suite
+            HostKind = $kind
+            Relative = $suite.FullName.Substring($suiteRoot.Length)
+        })
     }
 }
 
@@ -245,6 +257,10 @@ $running = New-Object 'System.Collections.Generic.List[object]'
 $results = New-Object 'System.Collections.Generic.List[object]'
 $executed = New-Object 'System.Collections.Generic.List[string]'
 $leaked = 0
+# Prefixes the capture file names. A relative path cannot be one - it contains the separator - and
+# any flattening of it back into a legal file name can collide again, so the number is what actually
+# guarantees that no two runs ever share a redirect file.
+$capture = 0
 
 # A child of the other host kind must not inherit this process's PSModulePath: Windows PowerShell
 # cannot load its own Microsoft.PowerShell.Security out of PowerShell 7's module directories, and
@@ -258,9 +274,10 @@ try {
 
         while ($running.Count -lt $workers -and $pending.Count -gt 0) {
             $item = $pending.Dequeue()
-            $stem = '{0}.{1}' -f $item.Suite.BaseName, $item.HostKind
+            $capture++
+            $stem = '{0:d4}.{1}.{2}' -f $capture, $item.Suite.BaseName, $item.HostKind
             $job = [PSCustomObject]@{
-                Name         = $item.Suite.Name
+                Name         = $item.Relative
                 HostKind     = $item.HostKind
                 OutFile      = Join-Path -Path $workRoot -ChildPath ('{0}.out' -f $stem)
                 ErrFile      = Join-Path -Path $workRoot -ChildPath ('{0}.err' -f $stem)
@@ -279,7 +296,6 @@ try {
                 -RedirectStandardOutput $job.OutFile -RedirectStandardError $job.ErrFile
 
             [void]$running.Add($job)
-            [void]$executed.Add($item.Suite.Name)
         }
 
         Start-Sleep -Milliseconds 200
@@ -316,6 +332,15 @@ try {
             $stillRunning = $false
             try { $stillRunning = -not $job.Process.HasExited } catch { $stillRunning = $false }
             if ($stillRunning) { $leaked++ }
+
+            # Recorded HERE rather than at launch, and keyed by path PLUS host. Two reasons, both
+            # load-bearing: a manifest written at launch proves only that a run was STARTED, so a
+            # suite that vanished mid-flight would still certify itself as covered; and a name-only
+            # or host-less entry lets a suite that ran on one host stand in for the host where it
+            # never ran. The status travels with the entry so the guard reports evidence, not just
+            # presence.
+            $status = if ($timeoutReason) { 'timeout-{0}' -f $timeoutReason } else { 'exit={0}' -f $exitCode }
+            [void]$executed.Add(('{0}|{1}|{2}' -f $job.Name, $job.HostKind, $status))
 
             [void]$results.Add([PSCustomObject]@{
                 Name       = $job.Name

@@ -73,14 +73,26 @@ function ConvertTo-WacPowerShellLiteral {
     .SYNOPSIS
         Wraps a value as a single-quoted PowerShell string literal.
     .DESCRIPTION
-        A single-quoted literal is inert - PowerShell expands nothing inside it - so doubling an
-        embedded quote is the whole escape rule. Everything interpolated into a -Command payload goes
-        through here, so a value containing a quote cannot terminate the literal and become code.
+        A single-quoted literal is inert - PowerShell expands nothing inside it - so escaping the
+        characters that CLOSE it is the whole rule. Everything interpolated into a -Command payload
+        goes through here, so a value must never terminate the literal and become code.
+
+        The escape is delegated to CodeGeneration::EscapeSingleQuotedStringContent rather than
+        hand-written, because the parser closes a single-quoted literal on MORE than the ASCII
+        apostrophe: U+2018 and U+2019 terminate it too. The previous `-replace "'", "''"` doubled
+        only the ASCII one, so an ordinary path was enough to break the boundary - measured on both
+        hosts, `C:\O<U+2019>Neil\Run.ps1` encoded to 'C:\O<U+2019>Neil\Run.ps1' and the parser
+        answered "The string is missing the terminator". Office and OneDrive autocorrect an ASCII
+        apostrophe into U+2019 inside user and folder names, so this was reachable without any
+        crafted input, and crafted input could close the literal and append code.
+
+        The API ships with both supported hosts (verified on Windows PowerShell 5.1 and PowerShell 7)
+        and is the same one PowerShell itself uses when it renders a literal.
     #>
     param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Value)
 
     if ($null -eq $Value) { return "''" }
-    return ("'" + ($Value -replace "'", "''") + "'")
+    return ("'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Value) + "'")
 }
 
 function Get-WacRelaunchCommand {
@@ -230,6 +242,11 @@ function Invoke-WacProcess {
 
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $process = $null
+    # Set once, immediately after a successful Start, and never cleared. The catch below reads it to
+    # tell "never ran" apart from "ran, and we lost track of it"; those need opposite answers and the
+    # exception itself cannot distinguish them.
+    $started = $false
+    $processId = 0
 
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -248,6 +265,12 @@ function Invoke-WacProcess {
 
         $process = [System.Diagnostics.Process]::Start($psi)
         if (-not $process) { throw 'Process.Start returned no process.' }
+
+        # The first statements after a proven start, so nothing between here and the reads below can
+        # leave the catch unable to tell that a real process exists. The id is captured too, because
+        # reading $process.Id later is itself one of the calls that can throw.
+        $started = $true
+        $processId = [int]$process.Id
 
         # ReadToEndAsync avoids the classic full-pipe deadlock without needing event handlers.
         $outTask = $process.StandardOutput.ReadToEndAsync()
@@ -306,16 +329,60 @@ function Invoke-WacProcess {
     }
     catch {
         $stopwatch.Stop()
-        Write-WacLog -Level WARNING -Component $Component -Message 'External tool failed to start.' -Data @{
-            tool = $FilePath; error = $_.Exception.Message
+
+        # PRE-START and POST-START are different claims and this catch covers both. It used to
+        # answer Started=$false and TerminationProven=$true for either, so an exception raised
+        # AFTER Process.Start succeeded - a failed output read, a failed wait, an unreadable exit
+        # code, a failed termination - reported that the tool never ran and that nothing was left
+        # alive. Both were fabrications: the process had started and might still be running, and
+        # nothing had been terminated. Downstream that mattered, because opt-in driver pruning
+        # reads Started to decide it may delete the backup directory and the pending marker, and a
+        # destructive pnputil delete may already have executed.
+        if (-not $started) {
+            Write-WacLog -Level WARNING -Component $Component -Message 'External tool failed to start.' -Data @{
+                tool = $FilePath; error = $_.Exception.Message
+            }
+            return [PSCustomObject]@{
+                ExitCode = $null; TimedOut = $false; StandardOutput = ''; StandardError = [string]$_.Exception.Message
+                DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds; Started = $false
+                TerminationProven = $true
+            }
         }
+
+        # It really started. Terminate what this run owns, and report the proof HONESTLY rather than
+        # asserting it: an unproven kill leaves TerminationProven false so the caller treats the work
+        # as unfinished instead of benign.
+        $terminationProven = $false
+        $survivors = ''
+        try {
+            $stopped = Stop-WacProcessTree -ProcessId $processId
+            $terminationProven = [bool]$stopped.Proven
+            $survivors = (@($stopped.Survivor) -join ',')
+        }
+        catch {
+            $terminationProven = $false
+        }
+
+        Write-WacLog -Level CRITICAL -Component $Component -Message 'The external tool started, then failed before its result was known; its effects cannot be ruled out.' -Data @{
+            tool = $FilePath; pid = $processId; error = $_.Exception.Message
+            terminationProven = $terminationProven; survivors = $survivors
+        }
+
         return [PSCustomObject]@{
-            ExitCode = $null; TimedOut = $false; StandardOutput = ''; StandardError = [string]$_.Exception.Message
-            DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds; Started = $false
-            TerminationProven = $true
+            ExitCode = $null
+            # NOT a deadline: this is an unknown outcome, and calling it a timeout would let a caller
+            # treat it as the one failure shape it already has a benign story for.
+            TimedOut = $false
+            StandardOutput = ''
+            StandardError = [string]$_.Exception.Message
+            DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds
+            Started = $true
+            TerminationProven = $terminationProven
         }
     }
     finally {
+        # Dispose releases the WRAPPER. It has never terminated anything, so it is not cleanup for a
+        # process this run started and may have lost track of - that is what the catch above does.
         if ($process) { try { $process.Dispose() } catch { $null = $_ } }
     }
 }

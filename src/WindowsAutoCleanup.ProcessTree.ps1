@@ -84,6 +84,9 @@ public static class WacProcessTree
     private static extern bool CloseHandle(IntPtr hObject);
 
     private const uint TH32CS_SNAPPROCESS = 0x00000002;
+    // The ONLY Process32NextW failure that means the walk finished rather than broke. See the check
+    // after the enumeration loop in GetDescendantIds.
+    private const int ERROR_NO_MORE_FILES = 18;
 
     // Every id reachable from rootId through the parent-process-id relation, nearest generation
     // first. One snapshot answers for the whole machine, so a deep tree costs one call rather than
@@ -115,6 +118,15 @@ public static class WacProcessTree
                 parents.Add((int)entry.th32ParentProcessID);
             }
             while (Process32NextW(snapshot, ref entry));
+
+            // Process32NextW returns false for TWO different reasons and this loop used to treat
+            // them as one: ERROR_NO_MORE_FILES means the walk finished, anything else means it was
+            // CUT SHORT. A truncated snapshot silently became a complete one, so descendants past
+            // the break were never enumerated and "no more children" was reported over a tree the
+            // walk had stopped reading. Returning null puts it back on the one path the caller
+            // already handles correctly - "nobody knows", which keeps the verdict unproven - rather
+            // than on the empty-array path that means "this process has no children".
+            if (Marshal.GetLastWin32Error() != ERROR_NO_MORE_FILES) { return null; }
 
             List<int> found = new List<int>();
             List<int> frontier = new List<int>();

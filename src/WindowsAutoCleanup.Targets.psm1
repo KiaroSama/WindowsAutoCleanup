@@ -46,6 +46,12 @@ $script:TargetsModulePath = $PSCommandPath
 # A ceiling, not an expected duration: a healthy machine builds the list in well under a second.
 $script:TargetBuildTimeoutMs = 1000 * 60 * 2
 
+# Discovery evidence from the last Get-WacCleanupTarget call in THIS module instance, read back
+# through Get-WacTargetDiscoveryGap. Module state rather than an out-parameter on the builder,
+# because the builder runs inside the runspace Get-WacCleanupTargetSet bounds and the test rig
+# replaces the builder itself: a reader the rig does not shadow keeps both shapes working.
+$script:DiscoveryGap = @()
+
 # Per-user cache directories, relative to a profile root. Order is the cleanup order.
 $script:UserCacheTarget = @(
     @{ Category = 'User TEMP contents';                        Path = 'AppData\Local\Temp' }
@@ -136,18 +142,39 @@ function Get-WacEdgeProfilePath {
         Chromium names user profiles 'Default' and 'Profile <n>'. Every other directory under
         User Data ('BrowserMetrics', 'Ad Blocking', 'Application Guard', ...) is component-shared
         state, so matching the profile scheme keeps cleanup off data that is not a per-user cache.
+
+        An empty result used to mean two different things. A User Data root that is absent or is not
+        a directory at all genuinely has no profiles; a root that EXISTS and could not be enumerated
+        has profiles nobody counted, and turning that into "no profiles" is how a failed discovery
+        becomes a clean, empty success. Only the second one is appended to -Gap.
+    .PARAMETER Gap
+        Optional collector for discovery that could not be finished; see Get-WacCleanupTargetSet.
     #>
-    param([Parameter(Mandatory = $true)][string]$UserDataPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$UserDataPath,
+        [AllowNull()][System.Collections.Generic.List[object]]$Gap
+    )
 
     $found = New-Object 'System.Collections.Generic.List[string]'
 
+    # Absent, or a file where a directory was expected: an answer, not a missing answer. Test-Path
+    # also answers false for a path an unprivileged caller cannot reach at all, which is the known
+    # ceiling of asking the cheap question; the enumeration below is where a readable-but-denied
+    # directory is caught.
     if (-not (Test-Path -LiteralPath $UserDataPath -PathType Container)) { return @() }
 
     try {
         $children = @(Get-ChildItem -LiteralPath $UserDataPath -Directory -Force -ErrorAction Stop)
     }
     catch {
-        Write-WacLog -Level DEBUG -Component 'Targets' -Message 'Could not enumerate an Edge User Data directory.' -Data @{ path = $UserDataPath; error = $_.Exception.Message }
+        Write-WacLog -Level WARNING -Component 'Targets' -Message 'An existing Edge User Data directory could not be enumerated, so its profiles were not discovered.' -Data @{ path = $UserDataPath; error = $_.Exception.Message }
+        if ($null -ne $Gap) {
+            [void]$Gap.Add([PSCustomObject]@{
+                Source = 'EdgeProfile'
+                Scope  = $UserDataPath
+                Reason = ('the User Data directory exists but could not be enumerated ({0})' -f $_.Exception.Message)
+            })
+        }
         return @()
     }
 
@@ -168,10 +195,18 @@ function Get-WacCleanupTarget {
         Category names the caller wants disabled for this run. Matching is case-insensitive.
     .OUTPUTS
         Objects with Mode ('Directory' or 'Pattern'), Category, Path, DeleteRoot and Pattern.
+
+        Discovery that could not be finished is recorded separately and read back through
+        Get-WacTargetDiscoveryGap; it deliberately does not travel in the returned list, because
+        this list is the allow-list of what may be DELETED and nothing else belongs in it.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param([AllowEmptyCollection()][string[]]$SkipCategory = @())
+
+    # Cleared first: evidence from a previous call must never be read as this one's.
+    $script:DiscoveryGap = @()
+    $gap = New-Object 'System.Collections.Generic.List[object]'
 
     $targets = New-Object 'System.Collections.Generic.List[object]'
     $seen = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
@@ -188,7 +223,7 @@ function Get-WacCleanupTarget {
     # Under SYSTEM this resolves to the Windows Temp directory again; the de-duplicator collapses it.
     Add-WacTarget @common -Mode Directory -Category 'Current user TEMP contents' -Path $env:TEMP
 
-    foreach ($userProfilePath in (Get-WacUserProfilePath)) {
+    foreach ($userProfilePath in (Get-WacUserProfilePath -Gap $gap)) {
         foreach ($entry in $script:UserCacheTarget) {
             Add-WacTarget @common -Mode Directory -Category $entry.Category -Path (Join-Path -Path $userProfilePath -ChildPath $entry.Path)
         }
@@ -201,7 +236,7 @@ function Get-WacCleanupTarget {
             -Pattern @('thumbcache_*.db', 'iconcache_*.db')
 
         $edgeUserData = Join-Path -Path $userProfilePath -ChildPath 'AppData\Local\Microsoft\Edge\User Data'
-        foreach ($edgeProfilePath in (Get-WacEdgeProfilePath -UserDataPath $edgeUserData)) {
+        foreach ($edgeProfilePath in (Get-WacEdgeProfilePath -UserDataPath $edgeUserData -Gap $gap)) {
             foreach ($sub in $script:EdgeCacheSubPath) {
                 $candidate = Join-Path -Path $edgeProfilePath -ChildPath $sub
                 if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
@@ -245,7 +280,24 @@ function Get-WacCleanupTarget {
     # The only entry whose root is removed as well: an emptied Windows.old is worthless.
     Add-WacTarget @common -Mode Directory -Category 'Windows.old folder' -Path (Join-Path -Path $driveRoot -ChildPath 'Windows.old') -DeleteRoot
 
+    $script:DiscoveryGap = @($gap.ToArray())
     return @($targets.ToArray())
+}
+
+function Get-WacTargetDiscoveryGap {
+    <#
+    .SYNOPSIS
+        The discovery sources the last Get-WacCleanupTarget call in this module instance could not
+        finish - one record with Source, Scope and Reason each.
+    .DESCRIPTION
+        Read by Get-WacCleanupTargetSet from INSIDE the runspace it bounds, which is the only place
+        the builder's module state exists. An empty list means every source answered, not that
+        nobody asked: the builder clears this before it starts.
+    #>
+    [OutputType([object[]])]
+    param()
+
+    return @($script:DiscoveryGap)
 }
 
 function Get-WacCleanupTargetSet {
@@ -262,8 +314,20 @@ function Get-WacCleanupTargetSet {
         and an allow-list that was never finished look identical to a caller, and the second one
         must not be reported as "nothing to clean". An expired or exceeded bound returns Incomplete
         with an empty Target, which the shared contract maps to a non-zero exit code.
+
+        A bound that was never exceeded is not the same fact as a discovery that finished, and this
+        used to promote any normally returned list straight to Succeeded. Three things are therefore
+        reconciled before the outcome is settled: the bound's own verdict, the error stream of the
+        runspace (a non-terminating error leaves Outcome Succeeded with HadErrors set), and the
+        builder's structured record of the sources it could not finish. Any of the three makes the
+        step Incomplete.
+
+        The targets that WERE discovered are still returned when discovery was partial. Nothing in
+        the list is less safe to delete because another source went unread, and refusing to clean a
+        machine over an unreadable profile would be the blanket refusal this project does not make;
+        the allow-list is never widened to compensate either.
     .OUTPUTS
-        Outcome (Succeeded | Incomplete | Failed), Target, Detail, DurationMs.
+        Outcome (Succeeded | Incomplete | Failed), Target, Gap, Detail, DurationMs.
     #>
     [CmdletBinding()]
     param([AllowEmptyCollection()][string[]]$SkipCategory = @())
@@ -273,14 +337,49 @@ function Get-WacCleanupTargetSet {
     $bounded = Invoke-WacBounded -Component 'Targets' -TimeoutMs $script:TargetBuildTimeoutMs `
         -ImportModule @($script:TargetsModulePath) -ArgumentList @(, [string[]]@($SkipCategory)) -ScriptBlock {
             param($SkipCategory)
-            @(Get-WacCleanupTarget -SkipCategory ([string[]]@($SkipCategory)))
+            # The gap reader has to be called HERE. The builder's module state lives in this
+            # runspace and dies with it, so a caller outside the bound can never read it.
+            $built = @(Get-WacCleanupTarget -SkipCategory ([string[]]@($SkipCategory)))
+            [PSCustomObject]@{ Target = $built; Gap = @(Get-WacTargetDiscoveryGap) }
         }
 
+    $outcome = [string]$bounded.Outcome
     $target = @()
+    $gap = @()
     $detail = ''
+
     if ($bounded.Outcome -ceq 'Succeeded') {
-        $target = @($bounded.Output)
-        $detail = 'The allow-list holds {0} target(s).' -f $target.Count
+        $survey = @($bounded.Output)[0]
+        if ($null -eq $survey) {
+            $outcome = 'Incomplete'
+            $detail = 'The cleanup allow-list builder returned nothing at all.'
+        }
+        else {
+            $target = @($survey.Target)
+            $gap = @($survey.Gap)
+            $detail = 'The allow-list holds {0} target(s).' -f $target.Count
+        }
+
+        if ($bounded.HadErrors) {
+            # A worker error that was written to the error stream instead of thrown still means the
+            # list may be short, and the bound alone reports that as a clean run.
+            $outcome = 'Incomplete'
+            $detail = '{0} The builder reported a non-terminating error: {1}' -f $detail, $bounded.Error
+            Write-WacLog -Level WARNING -Component 'Targets' -Message 'The cleanup allow-list builder reported a non-terminating error, so the list may be short.' -Data @{ error = $bounded.Error }
+        }
+
+        if ($gap.Count -gt 0) {
+            $outcome = 'Incomplete'
+            $summary = (@($gap | ForEach-Object { '{0}:{1} ({2})' -f $_.Source, $_.Scope, $_.Reason }) -join '; ')
+            $detail = '{0} {1} discovery source(s) could not be finished, so this is not proof that nothing else is eligible: {2}' -f $detail, $gap.Count, $summary
+            # The durable record: this runs in the caller's process, where the run's log writer is,
+            # rather than in the runspace the builder was bounded in.
+            foreach ($entry in $gap) {
+                Write-WacLog -Level WARNING -Component 'Targets' -Message 'A cleanup discovery source could not be finished.' -Data @{
+                    source = [string]$entry.Source; scope = [string]$entry.Scope; reason = [string]$entry.Reason
+                }
+            }
+        }
     }
     else {
         $detail = 'The cleanup allow-list could not be built: {0}' -f $bounded.Error
@@ -290,11 +389,13 @@ function Get-WacCleanupTargetSet {
     }
 
     return [PSCustomObject]@{
-        Outcome    = $bounded.Outcome
+        Outcome    = $outcome
         Target     = $target
-        Detail     = $detail
+        Gap        = $gap
+        Detail     = $detail.Trim()
         DurationMs = [int]$bounded.DurationMs
     }
 }
 
-Export-ModuleMember -Function @('Get-WacCleanupTarget', 'Get-WacCleanupTargetSet', 'Get-WacEdgeProfilePath', 'Add-WacTarget')
+Export-ModuleMember -Function @('Get-WacCleanupTarget', 'Get-WacCleanupTargetSet', 'Get-WacEdgeProfilePath',
+    'Get-WacTargetDiscoveryGap', 'Add-WacTarget')

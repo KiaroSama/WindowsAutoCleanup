@@ -148,6 +148,107 @@ Test-Case 'An exhausted budget yields a zero timeout and an expired verdict' {
     }
 }
 
+Test-Case 'A deadline that expires MID-PATTERN stops the matched-file loop' {
+    <#
+        Remove-WacFilesByPattern looked at the clock once per PATTERN and then materialised
+        GetFiles, so one pattern over one large directory ran to completion however long it took.
+        Same defect as the per-directory check the sweep used to have, in the function a
+        per-directory check was never going to cover, and the fixture is the same flat shape.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'deadline-pattern'
+    try {
+        $target = Join-Path -Path $sandbox -ChildPath 'flat'
+        $count = 1500
+        New-FlatFixture -Path $target -Count $count
+
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddMilliseconds(250))
+        $result = Remove-WacFilesByPattern -Category 'patexpire' -Path $target -Pattern @('*.tmp')
+
+        Assert-True $result.Attempted
+        # skipDeadline is what the run report raises to the Incomplete outcome. Without it this
+        # target reads as an ordinary clean success that merely happened to delete fewer files.
+        Assert-True ($result.SkippedDeadline -ge 1) 'the matched-file loop never noticed the deadline pass'
+        Assert-True ([int]$result.FilesDeleted -lt $count) `
+            ('every matched file was deleted past the deadline ({0} of {1})' -f $result.FilesDeleted, $count)
+        Assert-True ((@(Get-ChildItem -LiteralPath $target -File).Count) -gt 0) `
+            'the pattern emptied the whole directory past its deadline'
+    }
+    finally {
+        Reset-WacTestDeadline
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A live deadline lets the same pattern target finish' {
+    # The control. Without it, "always stop early" would satisfy the case above.
+    $sandbox = New-TestSandbox -Prefix 'deadline-pattern-live'
+    try {
+        $target = Join-Path -Path $sandbox -ChildPath 'flat'
+        New-FlatFixture -Path $target -Count 400
+
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(10))
+        $result = Remove-WacFilesByPattern -Category 'patlive' -Path $target -Pattern @('*.tmp')
+
+        Assert-True $result.Attempted
+        Assert-Equal 400 ([int]$result.FilesDeleted) 'the pattern stopped even though the budget was live'
+        Assert-Equal 0 ([int]$result.SkippedDeadline)
+        Assert-Equal 0 (@(Get-ChildItem -LiteralPath $target -File).Count)
+    }
+    finally {
+        Reset-WacTestDeadline
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'An expired budget stops the FINAL root deletion, even with the tree already empty' {
+    <#
+        Both directory passes break out on expiry, so -DeleteRoot used to fire on a tree that had
+        just been abandoned: one more mutation, performed entirely past the budget, at the single
+        point where "it is almost done anyway" is most tempting to wave through.
+
+        The budget is expired from the delete seam rather than by waiting, so the case is exact
+        rather than timing-dependent: the tree is provably EMPTY and the clock provably out, which
+        is the only state in which the old code would really have removed the root.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'deadline-deleteroot'
+    try {
+        $target = Join-Path -Path $sandbox -ChildPath 'target'
+        [void][System.IO.Directory]::CreateDirectory($target)
+        [System.IO.File]::WriteAllText((Join-Path -Path $target -ChildPath 'only.tmp'), 'x')
+
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(10))
+        Set-WacBoundDeleteOverride -ScriptBlock {
+            param($longPath, $expected, $openReparsePoint, $win32, $ntStatus)
+            [void]$expected; [void]$openReparsePoint
+            $win32.Value = 0
+            $ntStatus.Value = 0
+
+            # The real removal, so the tree genuinely empties; only the syscall is stubbed.
+            if ([System.IO.Directory]::Exists($longPath)) { [System.IO.Directory]::Delete($longPath, $false) }
+            else { [System.IO.File]::Delete($longPath) }
+
+            # ...and the budget runs out the instant the last child is gone.
+            Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddMinutes(-1))
+            return 0
+        }
+
+        try { $result = Remove-WacTree -Category 'rootexpire' -Path $target -DeleteRoot }
+        finally { Set-WacBoundDeleteOverride -ScriptBlock $null }
+
+        Assert-True $result.Attempted
+        Assert-Equal 1 ([int]$result.FilesDeleted) 'the child was not swept before the budget expired'
+        Assert-True ($result.SkippedDeadline -ge 1) 'the root deletion was not accounted to the deadline'
+        Assert-Equal 0 ([int]$result.DirectoriesDeleted) 'the root was removed past the run deadline'
+        Assert-Equal 0 ([int]$result.SkippedOutOfRoot) 'the root deletion was refused for the wrong reason'
+        Assert-True (Test-Path -LiteralPath $target) 'the root was removed past the run deadline'
+    }
+    finally {
+        Set-WacBoundDeleteOverride -ScriptBlock $null
+        Reset-WacTestDeadline
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 # ---------------------------------------------------------------------------------------------
 # In-process work (ledger B2-6 part B)
 # ---------------------------------------------------------------------------------------------

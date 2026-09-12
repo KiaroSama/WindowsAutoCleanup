@@ -108,12 +108,96 @@ function Resolve-ConflictingTask {
     return $result
 }
 
+function Test-CapturedTaskDefinition {
+    <#
+    .SYNOPSIS
+        Compares the task a rollback read back against the definition it re-registered.
+    .DESCRIPTION
+        A task with the right name is not the task that was removed, and until now that name was the
+        whole of the proof. Register-ScheduledTask can land a definition the scheduler normalised or
+        partly rejected, and a same-name task something else created between the removal and the
+        rollback reads back exactly as convincingly. What the machine lost when this run unregistered
+        its task was the ACTION - the program, the arguments and the working directory that run as
+        SYSTEM - so that is what has to be back, and Hidden with it when the capture declares one.
+
+        Read through local-name() XPath rather than the XML adapter's dotted properties, for two
+        reasons: Export-ScheduledTask emits a default namespace, and under Set-StrictMode -Version
+        2.0 a missing element is a terminating error rather than $null.
+    .OUTPUTS
+        Match ([bool]) and Reason.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Xml,
+        [Parameter(Mandatory = $true)]$Task
+    )
+
+    $result = [PSCustomObject]@{ Match = $false; Reason = $null }
+
+    $document = New-Object System.Xml.XmlDocument
+    try { $document.LoadXml($Xml) }
+    catch {
+        $result.Reason = ('the captured definition is not readable XML: {0}' -f $_.Exception.Message)
+        return $result
+    }
+
+    $expected = @($document.SelectNodes("//*[local-name()='Actions']/*[local-name()='Exec']"))
+    if ($expected.Count -eq 0) {
+        $result.Reason = 'the captured definition declares no program to run, so nothing about the restored task can be checked against it'
+        return $result
+    }
+
+    $actual = @()
+    try { $actual = @($Task.Actions) } catch { $actual = @() }
+    if ($actual.Count -ne $expected.Count) {
+        $result.Reason = ('the restored task has {0} action(s) where the captured definition declares {1}' -f $actual.Count, $expected.Count)
+        return $result
+    }
+
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        foreach ($field in @('Command|Execute', 'Arguments|Arguments', 'WorkingDirectory|WorkingDirectory')) {
+            $element = $field.Split('|')[0]
+            $property = $field.Split('|')[1]
+
+            $node = $expected[$index].SelectSingleNode(("*[local-name()='{0}']" -f $element))
+            $want = ''
+            if ($node) { $want = ([string]$node.InnerText).Trim() }
+            $have = ''
+            try { $have = ([string]$actual[$index].$property).Trim() } catch { $have = '' }
+
+            if (-not [string]::Equals($want, $have, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $result.Reason = ("action {0}'s {1} is '{2}' where the captured definition says '{3}'" -f ($index + 1), $element, $have, $want)
+                return $result
+            }
+        }
+    }
+
+    # Only the settings the capture actually declares. A scheduler default that the export omitted
+    # reads back as a concrete value, so demanding equality on an absent element would fail a
+    # rollback that in fact put the task back exactly as it was.
+    $hidden = $document.SelectSingleNode("//*[local-name()='Settings']/*[local-name()='Hidden']")
+    if ($hidden) {
+        $wantHidden = [string]::Equals(([string]$hidden.InnerText).Trim(), 'true', [System.StringComparison]::OrdinalIgnoreCase)
+        $haveHidden = $false
+        try { $haveHidden = [bool]$Task.Settings.Hidden } catch { $haveHidden = $false }
+        if ($wantHidden -ne $haveHidden) {
+            $result.Reason = ('the restored task is {0} where the captured definition says {1}' -f
+                $(if ($haveHidden) { 'hidden' } else { 'visible' }), $(if ($wantHidden) { 'hidden' } else { 'visible' }))
+            return $result
+        }
+    }
+
+    $result.Match = $true
+    $result.Reason = ('all {0} captured action(s) are back unchanged' -f $expected.Count)
+    return $result
+}
+
 function Restore-CapturedTask {
     <#
     .SYNOPSIS
         Re-registers one task definition Resolve-ConflictingTask captured, and reads it back.
     .OUTPUTS
-        [bool] $true only when the task is registered again AND the scheduler confirms it.
+        [bool] $true only when the task is registered again AND the scheduler confirms it is the
+        task that was captured, not merely that something with that name exists.
     #>
     param([Parameter(Mandatory = $true)]$Definition)
 
@@ -149,7 +233,17 @@ function Restore-CapturedTask {
         return $false
     }
 
-    Write-InstallerMessage -Level WARNING -Message 'Rollback: the task this run removed was re-registered and verified.' -Data @{ task = $label }
+    $semantics = Test-CapturedTaskDefinition -Xml $xml -Task $back[0]
+    if (-not $semantics.Match) {
+        Write-InstallerMessage -Level CRITICAL -Message 'Rollback re-registered the task this run removed but what came back is not the task that was captured; re-create it by hand.' -Data @{
+            task = $label; reason = [string]$semantics.Reason
+        }
+        return $false
+    }
+
+    Write-InstallerMessage -Level WARNING -Message 'Rollback: the task this run removed was re-registered and verified.' -Data @{
+        task = $label; proof = [string]$semantics.Reason
+    }
     return $true
 }
 

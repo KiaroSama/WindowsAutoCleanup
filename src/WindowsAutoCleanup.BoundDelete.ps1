@@ -79,8 +79,10 @@ function Get-WacBoundDeleteKind {
           missing parent          Win32 2              (NTSTATUS 0)
           leaf locked by a writer NTSTATUS 0xC0000043  (win32 0)
           non-empty directory     NTSTATUS 0xC0000101  on the disposition
-          read-only file          NTSTATUS 0xC0000121  on the disposition, which is why that maps to
-                                  Denied and earns the attribute-clearing retry, not a failure.
+          read-only file          NTSTATUS 0xC0000121  on the disposition. DeleteBoundLeaf answers
+                                  that one itself, on the handle it already proved, by retrying with
+                                  FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE; it only reaches this
+                                  classifier - as Denied, never a failure - when that is refused too.
     #>
     param(
         [Parameter(Mandatory = $true)][int]$Code,
