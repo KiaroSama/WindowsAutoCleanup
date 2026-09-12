@@ -515,11 +515,6 @@ function Invoke-DriversScenario {
         # deleted, and a refusal has to name which one did not.
         $refusal = New-Object 'System.Collections.Generic.List[string]'
 
-        $skip = @(Get-NonSandboxCategory -Keep '')
-        if ($skip.Count -lt 10) {
-            [void]$refusal.Add(('only {0} allow-list categories could be disabled' -f $skip.Count))
-        }
-
         $backupRoot = [string](Get-WacNormalizedPath -Path (Get-WacDriverBackupRoot))
         if (-not $backupRoot) {
             [void]$refusal.Add('the path Get-WacDriverBackupRoot names could not be normalised')
@@ -557,8 +552,12 @@ function Invoke-DriversScenario {
             [void]$evidence.Add(('the backup root answers IsTrusted={0} writers=[{1}] {2}' -f `
                 [bool]$rootTrust.IsTrusted, (@($rootTrust.Writers) -join ', '), [string]$rootTrust.Reason))
 
-            $commandLine = Get-RunChildCommandLine -MutexName (New-VerificationMutexName) `
-                -SkipCategory $skip -PruneSupersededDrivers
+            # The allow-list this child gets is the injected sandbox fixture, so the only cleanup
+            # targets it can name are inside the sandbox and the driver step is the one thing here
+            # that touches the machine. That is stronger than the deny-list this used to pass, which
+            # could only disable categories the parent was able to name.
+            $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
+                -MutexName (New-VerificationMutexName) -PruneSupersededDrivers
             $child = Start-VerificationChild -CommandLine $commandLine `
                 -Environment (Get-SandboxEnvironment -Sandbox $sandbox)
             $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs
@@ -677,13 +676,9 @@ function Invoke-CleanmgrScenario {
     $child = $null
 
     try {
-        $skip = @(Get-NonSandboxCategory -Keep '')
         $before = Get-VolumeCacheStateFlag -SageId $script:VerificationSageId
 
-        if ($skip.Count -lt 10) {
-            [void]$problem.Add(('refusing to start: only {0} allow-list categories could be disabled' -f $skip.Count))
-        }
-        elseif ($before.Count -eq 0) {
+        if ($before.Count -eq 0) {
             [void]$problem.Add('refusing to start: no VolumeCaches handler could be read, so a restore could not be proven either way')
         }
         else {
@@ -692,8 +687,10 @@ function Invoke-CleanmgrScenario {
                 $script:VerificationSageId, $before.Count, $absent.Count))
 
             $sandbox = New-VerificationSandbox -Prefix 'wac-cleanmgr'
-            $commandLine = Get-RunChildCommandLine -MutexName (New-VerificationMutexName) `
-                -SkipCategory $skip -EnableLegacyDiskCleanup
+            # The injected sandbox fixture is this child's whole allow-list, so cleanmgr's own
+            # handlers are the only thing here that reaches the machine.
+            $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
+                -MutexName (New-VerificationMutexName) -EnableLegacyDiskCleanup
             $child = Start-VerificationChild -CommandLine $commandLine `
                 -Environment (Get-SandboxEnvironment -Sandbox $sandbox)
             $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs

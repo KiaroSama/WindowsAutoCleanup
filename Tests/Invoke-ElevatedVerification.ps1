@@ -15,22 +15,31 @@
 
     There are two classes of scenario and the summary keeps them apart.
 
-    SANDBOXED - EXIT5, EXIT3, EXIT2. Each runs the REAL Run.ps1 as a bounded child process whose
+    EVERY scenario, sandboxed or machine-changing, launches a disposable scratch COPY of this
+    repository from inside its own sandbox, with the allow-list builder replaced by
+    Tests\_SandboxTargetFixture.psm1. That fixture names an explicit set of paths built from that one
+    sandbox, proves the whole set is inside it before the child's deletion loop starts, and proves
+    each entry again immediately before it is used. The shipped tree is never edited and learns
+    nothing about any of this. It replaces a deny-list that could not work: disabling categories by
+    name requires the parent to be able to NAME every category the child will build, and both
+    'Microsoft Edge cache' and 'Windows Explorer thumbnail cache' are built outside the table that
+    list was read from - while the parent's profile discovery is not the child's in the first place.
+
+    SANDBOXED - EXIT5, EXIT3, EXIT2. Each runs Run.ps1 as a bounded child process whose
     %ProgramData%, %LOCALAPPDATA%, %TEMP% and %TMP% are redirected into a disposable sandbox under
     %ProgramData%\WindowsAutoCleanup\Verification\Sandbox - NOT under %TEMP%, because an elevated
     child refuses a state directory that is not machine-trusted and a per-user temp directory is
     not one. The harness proves that root is trusted before it starts anything. So the
     run log, the machine state directory and every cleanup target derived from those roots land
-    inside the sandbox instead of on the operator's machine. Every allow-list category except the
-    single sandbox-confined one the scenario needs is disabled with -SkipCategory, the Recycle Bin
-    with -SkipRecycleBin, and both destructive opt-ins are off.
+    inside the sandbox instead of on the operator's machine. The Recycle Bin is skipped with
+    -SkipRecycleBin and both destructive opt-ins are off.
 
     MACHINE-CHANGING - DRIVERS, CLEANMGR. These exist to test the two opt-in steps, so by definition
     they change the machine: DRIVERS exports and then deletes superseded oem<n>.inf driver packages,
     and CLEANMGR runs cleanmgr /sagerun, which enumerates EVERY drive in the computer. They run only
     when asked for by name or through -Scenario All; -Scenario Sandboxed runs the first three alone.
-    They still redirect the same roots, still disable EVERY allow-list category, and still skip the
-    Recycle Bin, so the only machine state either one may change is the state its own step owns.
+    They redirect the same roots, get the same sandbox-only allow-list, and still skip the Recycle
+    Bin, so the only machine state either one may change is the state its own step owns.
 
     DRIVERS is the one scenario whose evidence lives OUTSIDE the sandbox. Its exports go where the
     shipped Get-WacDriverBackupRoot says - %SystemRoot%\Logs\WindowsAutoCleanup\DriverBackup, which
@@ -96,6 +105,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+$script:TestsRoot = $PSScriptRoot
 $script:SrcRoot = Join-Path -Path $script:RepoRoot -ChildPath 'src'
 $script:RunPath = Join-Path -Path $script:RepoRoot -ChildPath 'Run.ps1'
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)

@@ -23,15 +23,17 @@ function Invoke-Exit5Scenario {
         be redirected without breaking the host: measured, both shipped hosts start normally with
         SystemDrive=Z: while neither survives a redirected SystemRoot.
 
-        'Defender cleanup files' is the ONE category deliberately left enabled, and that is what
-        makes the bait assertion mean anything. Every entry of that category is built purely from
-        %ProgramData% (Targets.psm1), which this harness has already redirected into the sandbox, so
-        keeping it on cannot reach the operator's machine - but a child that failed to see the
-        redirected SystemDrive, ran past the exit-5 gate and swept its targets WOULD delete the
-        bait. Skipping every category, as this scenario used to, made the check unfalsifiable: no
-        cleanup target covering the bait directory could ever be constructed, so the file survived
-        whether or not the redirect took effect. Every other category stays disabled, which is what
-        keeps a run that got past the gate confined to the sandbox.
+        The bait assertion is what makes the gate falsifiable, and it means something only because
+        the injected fixture really does name the bait directory: a child that failed to see the
+        redirected SystemDrive, ran past the exit-5 gate and swept its targets WOULD delete it.
+        Skipping every category, as this scenario used to, made the check unfalsifiable - no cleanup
+        target covering the bait could ever be constructed, so the file survived whether or not the
+        redirect took effect.
+
+        What keeps a run that got past the gate confined is no longer a list of disabled category
+        names. It is the fixture in the scratch copy: every target it can name is built from this
+        sandbox, the whole set is proven contained before the child's deletion loop starts, and each
+        entry is proven again immediately before it is used.
     #>
     param([Parameter(Mandatory = $true)][int]$TimeoutMs)
 
@@ -43,44 +45,39 @@ function Invoke-Exit5Scenario {
     $child = $null
 
     try {
-        $skip = @(Get-NonSandboxCategory -Keep 'Defender cleanup files')
-        if ($skip.Count -lt 10) {
-            [void]$problem.Add(('refusing to start: only {0} allow-list categories could be disabled' -f $skip.Count))
+        $sandbox = New-VerificationSandbox -Prefix 'wac-exit5'
+        $baitFile = Join-Path -Path (New-SandboxBait -Sandbox $sandbox) -ChildPath 'bait.txt'
+
+        $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
+            -MutexName (New-VerificationMutexName)
+        $table = Get-SandboxEnvironment -Sandbox $sandbox -Extra @{ SystemDrive = 'Z:' }
+
+        $child = Start-VerificationChild -CommandLine $commandLine -Environment $table
+        $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs
+        $exitCode = $result.ExitCode
+
+        if (-not $result.Exited) {
+            [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
+        }
+        if ($result.ExitCode -ne 5) {
+            [void]$problem.Add(('expected exit 5, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
+        }
+
+        $text = Get-SandboxLogText -Sandbox $sandbox
+        [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $text `
+            -Needle '[CRITICAL] [Run] The online system drive is not C:')
+
+        foreach ($forbidden in @('[Result] Target complete.', '[Summary]')) {
+            if (@(Get-MatchingLine -Text $text -Needle $forbidden).Count -gt 0) {
+                [void]$problem.Add(('the run reached "{0}" even though the system drive is unsupported' -f $forbidden))
+            }
+        }
+
+        if (-not (Test-Path -LiteralPath $baitFile -PathType Leaf)) {
+            [void]$problem.Add('the bait file inside the redirected allow-list directory was deleted')
         }
         else {
-            $sandbox = New-VerificationSandbox -Prefix 'wac-exit5'
-            $baitFile = Join-Path -Path (New-SandboxBait -Sandbox $sandbox) -ChildPath 'bait.txt'
-
-            $commandLine = Get-RunChildCommandLine -MutexName (New-VerificationMutexName) -SkipCategory $skip
-            $table = Get-SandboxEnvironment -Sandbox $sandbox -Extra @{ SystemDrive = 'Z:' }
-
-            $child = Start-VerificationChild -CommandLine $commandLine -Environment $table
-            $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs
-            $exitCode = $result.ExitCode
-
-            if (-not $result.Exited) {
-                [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
-            }
-            if ($result.ExitCode -ne 5) {
-                [void]$problem.Add(('expected exit 5, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
-            }
-
-            $text = Get-SandboxLogText -Sandbox $sandbox
-            [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $text `
-                -Needle '[CRITICAL] [Run] The online system drive is not C:')
-
-            foreach ($forbidden in @('[Result] Target complete.', '[Summary]')) {
-                if (@(Get-MatchingLine -Text $text -Needle $forbidden).Count -gt 0) {
-                    [void]$problem.Add(('the run reached "{0}" even though the system drive is unsupported' -f $forbidden))
-                }
-            }
-
-            if (-not (Test-Path -LiteralPath $baitFile -PathType Leaf)) {
-                [void]$problem.Add('the bait file inside the redirected allow-list directory was deleted')
-            }
-            else {
-                [void]$evidence.Add(('bait intact: {0}' -f $baitFile))
-            }
+            [void]$evidence.Add(('bait intact: {0}' -f $baitFile))
         }
     }
     catch {
@@ -114,12 +111,13 @@ function Invoke-Exit3Scenario {
         observing that line and starting the contender. Holding the production mutex primitive
         removes that race without slowing the application or mocking its contention check.
 
-        The second sandbox's bait check needs the same treatment as EXIT5's for the same reason:
-        'Defender cleanup files' stays ENABLED so that a second child which failed to exit 3 and
-        swept its targets would delete it. With every category skipped the file survived either way
-        and the "mutated nothing" evidence line asserted nothing about the mutex at all. Both
-        runs share one command line. After release, the control must exit 0 and delete its OWN bait:
-        this proves both that the lock was released and that the bait would otherwise be deleted.
+        The second sandbox's bait check needs the same treatment as EXIT5's for the same reason: the
+        injected fixture names the bait directory, so a second child which failed to exit 3 and swept
+        its targets would delete it. With every category skipped the file survived either way and the
+        "mutated nothing" evidence line asserted nothing about the mutex at all. Each run gets its
+        own scratch copy, because each fixture is pinned to the sandbox of the child that loads it.
+        After release, the control must exit 0 and delete its OWN bait: this proves both that the
+        lock was released and that the bait would otherwise be deleted.
     #>
     param([Parameter(Mandatory = $true)][int]$TimeoutMs)
 
@@ -134,76 +132,75 @@ function Invoke-Exit3Scenario {
     $heldMutex = $null
 
     try {
-        $skip = @(Get-NonSandboxCategory -Keep 'Defender cleanup files')
-        if ($skip.Count -lt 10) {
-            [void]$problem.Add(('refusing to start: only {0} allow-list categories could be disabled' -f $skip.Count))
+        $mutexName = New-VerificationMutexName
+        $firstSandbox = New-VerificationSandbox -Prefix 'wac-exit3-first'
+        $secondSandbox = New-VerificationSandbox -Prefix 'wac-exit3-second'
+        $firstBait = Join-Path -Path (New-SandboxBait -Sandbox $firstSandbox) -ChildPath 'bait.txt'
+        $secondBait = Join-Path -Path (New-SandboxBait -Sandbox $secondSandbox) -ChildPath 'bait.txt'
+
+        # One command line, but a scratch tree each: the fixture in a child's copy is pinned to the
+        # sandbox whose environment that child is given, and the two runs use different sandboxes.
+        $firstCommandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $firstSandbox) `
+            -MutexName $mutexName
+        $secondCommandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $secondSandbox) `
+            -MutexName $mutexName
+
+        $heldMutex = Enter-WacSingleInstance -Name $mutexName
+        if (-not $heldMutex) { throw 'The fixture could not acquire its unique kernel mutex.' }
+        try {
+            [void]$evidence.Add('the fixture acquired the real kernel mutex before starting the contender')
+            $secondChild = Start-VerificationChild -CommandLine $secondCommandLine `
+                -Environment (Get-SandboxEnvironment -Sandbox $secondSandbox)
+            $secondResult = Wait-VerificationChild -Child $secondChild -TimeoutMs $TimeoutMs
+            $exitCode = $secondResult.ExitCode
+
+            if (-not $secondResult.Exited) {
+                [void]$problem.Add('the second child did not finish inside its wall timeout and its tree was terminated')
+            }
+            if ($secondResult.ExitCode -ne 3) {
+                [void]$problem.Add(('expected the second run to exit 3, got {0}. stderr: {1}' -f `
+                    (Get-RunExitDetail -ExitCode $secondResult.ExitCode), $secondResult.ErrorText.Trim()))
+            }
+
+            $secondText = Get-SandboxLogText -Sandbox $secondSandbox
+            [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $secondText `
+                -Needle 'already holds the machine-wide lock')
+
+            foreach ($forbidden in @('[Result] Target complete.', '[Summary]')) {
+                if (@(Get-MatchingLine -Text $secondText -Needle $forbidden).Count -gt 0) {
+                    [void]$problem.Add(('the locked-out run reached "{0}" instead of exiting without mutating anything' -f $forbidden))
+                }
+            }
+
+            if (-not (Test-Path -LiteralPath $secondBait -PathType Leaf)) {
+                [void]$problem.Add('the locked-out run deleted the bait file, so it mutated state before exiting')
+            }
+            else {
+                [void]$evidence.Add(('locked-out run mutated nothing: {0} intact' -f $secondBait))
+            }
+        }
+        finally {
+            Exit-WacSingleInstance -Mutex $heldMutex
+            $heldMutex = $null
+        }
+
+        $firstChild = Start-VerificationChild -CommandLine $firstCommandLine `
+            -Environment (Get-SandboxEnvironment -Sandbox $firstSandbox)
+        $firstResult = Wait-VerificationChild -Child $firstChild -TimeoutMs $TimeoutMs
+        if (-not $firstResult.Exited) {
+            [void]$problem.Add('the first child did not finish inside its wall timeout and its tree was terminated')
+        }
+        if ($firstResult.ExitCode -ne 0) {
+            [void]$problem.Add(('the uncontended control did not succeed after release: {0}' -f $firstResult.ExitCode))
         }
         else {
-            $mutexName = New-VerificationMutexName
-            $firstSandbox = New-VerificationSandbox -Prefix 'wac-exit3-first'
-            $secondSandbox = New-VerificationSandbox -Prefix 'wac-exit3-second'
-            $firstBait = Join-Path -Path (New-SandboxBait -Sandbox $firstSandbox) -ChildPath 'bait.txt'
-            $secondBait = Join-Path -Path (New-SandboxBait -Sandbox $secondSandbox) -ChildPath 'bait.txt'
-
-            $commandLine = Get-RunChildCommandLine -MutexName $mutexName -SkipCategory $skip
-
-            $heldMutex = Enter-WacSingleInstance -Name $mutexName
-            if (-not $heldMutex) { throw 'The fixture could not acquire its unique kernel mutex.' }
-            try {
-                [void]$evidence.Add('the fixture acquired the real kernel mutex before starting the contender')
-                $secondChild = Start-VerificationChild -CommandLine $commandLine `
-                    -Environment (Get-SandboxEnvironment -Sandbox $secondSandbox)
-                $secondResult = Wait-VerificationChild -Child $secondChild -TimeoutMs $TimeoutMs
-                $exitCode = $secondResult.ExitCode
-
-                if (-not $secondResult.Exited) {
-                    [void]$problem.Add('the second child did not finish inside its wall timeout and its tree was terminated')
-                }
-                if ($secondResult.ExitCode -ne 3) {
-                    [void]$problem.Add(('expected the second run to exit 3, got {0}. stderr: {1}' -f `
-                        (Get-RunExitDetail -ExitCode $secondResult.ExitCode), $secondResult.ErrorText.Trim()))
-                }
-
-                $secondText = Get-SandboxLogText -Sandbox $secondSandbox
-                [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $secondText `
-                    -Needle 'already holds the machine-wide lock')
-
-                foreach ($forbidden in @('[Result] Target complete.', '[Summary]')) {
-                    if (@(Get-MatchingLine -Text $secondText -Needle $forbidden).Count -gt 0) {
-                        [void]$problem.Add(('the locked-out run reached "{0}" instead of exiting without mutating anything' -f $forbidden))
-                    }
-                }
-
-                if (-not (Test-Path -LiteralPath $secondBait -PathType Leaf)) {
-                    [void]$problem.Add('the locked-out run deleted the bait file, so it mutated state before exiting')
-                }
-                else {
-                    [void]$evidence.Add(('locked-out run mutated nothing: {0} intact' -f $secondBait))
-                }
-            }
-            finally {
-                Exit-WacSingleInstance -Mutex $heldMutex
-                $heldMutex = $null
-            }
-
-            $firstChild = Start-VerificationChild -CommandLine $commandLine `
-                -Environment (Get-SandboxEnvironment -Sandbox $firstSandbox)
-            $firstResult = Wait-VerificationChild -Child $firstChild -TimeoutMs $TimeoutMs
-            if (-not $firstResult.Exited) {
-                [void]$problem.Add('the first child did not finish inside its wall timeout and its tree was terminated')
-            }
-            if ($firstResult.ExitCode -ne 0) {
-                [void]$problem.Add(('the uncontended control did not succeed after release: {0}' -f $firstResult.ExitCode))
-            }
-            else {
-                [void]$evidence.Add('the uncontended control acquired the released lock and exited 0')
-            }
-            if (Test-Path -LiteralPath $firstBait -PathType Leaf) {
-                [void]$problem.Add('the uncontended control left its bait, so the non-mutation check had no positive control')
-            }
-            else {
-                [void]$evidence.Add('the uncontended control deleted its own bait')
-            }
+            [void]$evidence.Add('the uncontended control acquired the released lock and exited 0')
+        }
+        if (Test-Path -LiteralPath $firstBait -PathType Leaf) {
+            [void]$problem.Add('the uncontended control left its bait, so the non-mutation check had no positive control')
+        }
+        else {
+            [void]$evidence.Add('the uncontended control deleted its own bait')
         }
     }
     catch {
@@ -276,111 +273,106 @@ function Invoke-Exit2Scenario {
     $handle = $null
 
     try {
-        $skip = @(Get-NonSandboxCategory -Keep 'Defender cleanup files')
-        if ($skip.Count -lt 10) {
-            [void]$problem.Add(('refusing to start: only {0} allow-list categories could be disabled' -f $skip.Count))
+        $sandbox = New-VerificationSandbox -Prefix 'wac-exit2'
+        $target = New-SandboxBait -Sandbox $sandbox
+
+        # bait.txt proves the sweep really ran; the locked subdirectory produces the failure.
+        $deletable = Join-Path -Path $target -ChildPath 'bait.txt'
+        $lockedDirectory = Join-Path -Path $target -ChildPath 'locked'
+        $survivor = Join-Path -Path $lockedDirectory -ChildPath 'inside.txt'
+        [void][System.IO.Directory]::CreateDirectory($lockedDirectory)
+        [System.IO.File]::WriteAllText($survivor, 'inside', $script:Utf8NoBom)
+
+        $handle = [WacVerificationLock]::Open($lockedDirectory)
+
+        $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
+            -MutexName (New-VerificationMutexName)
+        $child = Start-VerificationChild -CommandLine $commandLine `
+            -Environment (Get-SandboxEnvironment -Sandbox $sandbox)
+        $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs
+        $exitCode = $result.ExitCode
+
+        if (-not $result.Exited) {
+            [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
+        }
+        if ($result.ExitCode -ne 2) {
+            [void]$problem.Add(('expected exit 2, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
+        }
+
+        $text = Get-SandboxLogText -Sandbox $sandbox
+
+        # EVERY touched target must lie inside the sandbox: a [Result] line for a path outside it
+        # would mean an allow-list entry on the real machine was cleaned for real. That is the
+        # invariant; the count is not. This used to demand exactly one line, which is an
+        # assumption about the MACHINE rather than about containment - 'Defender cleanup files'
+        # has two entries (LocalCopy and Support, Targets.psm1), both built from %ProgramData%
+        # and therefore both redirected into the sandbox, so a guest where the second one exists
+        # legitimately completes two targets. Windows Sandbox happened to have only the first,
+        # and a Hyper-V guest failed the scenario on that difference alone while containment was
+        # intact. Checking every path is strictly stronger than counting lines and carries no
+        # environment assumption.
+        $resultLines = @(Get-MatchingLine -Text $text -Needle '[Result] Target complete.')
+        if ($resultLines.Count -lt 1) {
+            [void]$problem.Add('the log shows no cleaned target at all, so the sweep never ran')
+        }
+        foreach ($line in $resultLines) {
+            [void]$evidence.Add($line)
+            # A SUBSTRING test was wrong in both directions. It accepted a sibling - the sandbox
+            # `...\wac-exit2_ab12` is a substring of `...\wac-exit2_ab12-other`, so a target in
+            # a different directory whose name merely starts with the sandbox's passed - and it
+            # matched the sandbox path wherever it appeared in the line, including inside an
+            # unrelated field. The path is taken from the line's own `path=` field and compared
+            # with the shipped containment rule, which is prefix-safe at the separator.
+            $target = Get-ResultLinePath -Line $line
+            if ([string]::IsNullOrWhiteSpace($target)) {
+                [void]$problem.Add(('a result line carries no readable path, so containment cannot be proven: {0}' -f $line))
+                continue
+            }
+            $normalizedTarget = Get-WacNormalizedPath -Path $target
+            $normalizedSandbox = Get-WacNormalizedPath -Path $sandbox
+            if (-not $normalizedTarget -or -not $normalizedSandbox) {
+                [void]$problem.Add(('a result path could not be normalised, so containment cannot be proven: {0}' -f $line))
+                continue
+            }
+            if (-not (Test-WacIsWithinRoot -ChildPath $normalizedTarget -RootPath $normalizedSandbox)) {
+                [void]$problem.Add(('a target outside the sandbox was cleaned for real: {0}' -f $line))
+            }
+        }
+
+        # The bait target specifically: it is the one the locked subdirectory was planted in, so
+        # it is the one that proves the failure reached the Failed bucket rather than a skip.
+        $baitLines = @($resultLines | Where-Object { $_.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        if ($baitLines.Count -ne 1) {
+            [void]$problem.Add(('expected exactly one result line for the sandbox bait directory {0}, got {1}' -f $target, $baitLines.Count))
+        }
+        elseif (-not (Test-KeyValue -Line $baitLines[0] -Pair 'failed=1')) {
+            [void]$problem.Add('the target result did not report exactly failed=1, so the locked directory never reached the Failed bucket')
+        }
+
+        # The totals line disambiguates: exactly failed=1 proves the exit 2 came from this
+        # deletion and not from an unrelated DISM or pnpclean failure on the operator's machine.
+        # Test-KeyValue rather than a substring test: IndexOf('failed=1') is also satisfied by
+        # failed=10, failed=11 and failed=100, so it only ruled out totals of 2..9.
+        $totalLines = @(Get-MatchingLine -Text $text -Needle '[Summary] Cleanup totals.')
+        if ($totalLines.Count -eq 0) {
+            [void]$problem.Add('the run never reached the summary totals')
         }
         else {
-            $sandbox = New-VerificationSandbox -Prefix 'wac-exit2'
-            $target = New-SandboxBait -Sandbox $sandbox
-
-            # bait.txt proves the sweep really ran; the locked subdirectory produces the failure.
-            $deletable = Join-Path -Path $target -ChildPath 'bait.txt'
-            $lockedDirectory = Join-Path -Path $target -ChildPath 'locked'
-            $survivor = Join-Path -Path $lockedDirectory -ChildPath 'inside.txt'
-            [void][System.IO.Directory]::CreateDirectory($lockedDirectory)
-            [System.IO.File]::WriteAllText($survivor, 'inside', $script:Utf8NoBom)
-
-            $handle = [WacVerificationLock]::Open($lockedDirectory)
-
-            $commandLine = Get-RunChildCommandLine -MutexName (New-VerificationMutexName) -SkipCategory $skip
-            $child = Start-VerificationChild -CommandLine $commandLine `
-                -Environment (Get-SandboxEnvironment -Sandbox $sandbox)
-            $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs
-            $exitCode = $result.ExitCode
-
-            if (-not $result.Exited) {
-                [void]$problem.Add('the child did not finish inside its wall timeout and its tree was terminated')
+            [void]$evidence.Add($totalLines[0])
+            if (-not (Test-KeyValue -Line $totalLines[0] -Pair 'failed=1')) {
+                [void]$problem.Add('the summary totals did not report exactly failed=1')
             }
-            if ($result.ExitCode -ne 2) {
-                [void]$problem.Add(('expected exit 2, got {0}. stderr: {1}' -f (Get-RunExitDetail -ExitCode $result.ExitCode), $result.ErrorText.Trim()))
-            }
+        }
 
-            $text = Get-SandboxLogText -Sandbox $sandbox
+        # The footer records the run's OUTCOME by name now, not a sentence: status=Failed is
+        # what maps to exit 2, and its absence means the 2 came from somewhere else.
+        [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $text -Needle 'status=Failed')
 
-            # EVERY touched target must lie inside the sandbox: a [Result] line for a path outside it
-            # would mean an allow-list entry on the real machine was cleaned for real. That is the
-            # invariant; the count is not. This used to demand exactly one line, which is an
-            # assumption about the MACHINE rather than about containment - 'Defender cleanup files'
-            # has two entries (LocalCopy and Support, Targets.psm1), both built from %ProgramData%
-            # and therefore both redirected into the sandbox, so a guest where the second one exists
-            # legitimately completes two targets. Windows Sandbox happened to have only the first,
-            # and a Hyper-V guest failed the scenario on that difference alone while containment was
-            # intact. Checking every path is strictly stronger than counting lines and carries no
-            # environment assumption.
-            $resultLines = @(Get-MatchingLine -Text $text -Needle '[Result] Target complete.')
-            if ($resultLines.Count -lt 1) {
-                [void]$problem.Add('the log shows no cleaned target at all, so the sweep never ran')
-            }
-            foreach ($line in $resultLines) {
-                [void]$evidence.Add($line)
-                # A SUBSTRING test was wrong in both directions. It accepted a sibling - the sandbox
-                # `...\wac-exit2_ab12` is a substring of `...\wac-exit2_ab12-other`, so a target in
-                # a different directory whose name merely starts with the sandbox's passed - and it
-                # matched the sandbox path wherever it appeared in the line, including inside an
-                # unrelated field. The path is taken from the line's own `path=` field and compared
-                # with the shipped containment rule, which is prefix-safe at the separator.
-                $target = Get-ResultLinePath -Line $line
-                if ([string]::IsNullOrWhiteSpace($target)) {
-                    [void]$problem.Add(('a result line carries no readable path, so containment cannot be proven: {0}' -f $line))
-                    continue
-                }
-                $normalizedTarget = Get-WacNormalizedPath -Path $target
-                $normalizedSandbox = Get-WacNormalizedPath -Path $sandbox
-                if (-not $normalizedTarget -or -not $normalizedSandbox) {
-                    [void]$problem.Add(('a result path could not be normalised, so containment cannot be proven: {0}' -f $line))
-                    continue
-                }
-                if (-not (Test-WacIsWithinRoot -ChildPath $normalizedTarget -RootPath $normalizedSandbox)) {
-                    [void]$problem.Add(('a target outside the sandbox was cleaned for real: {0}' -f $line))
-                }
-            }
-
-            # The bait target specifically: it is the one the locked subdirectory was planted in, so
-            # it is the one that proves the failure reached the Failed bucket rather than a skip.
-            $baitLines = @($resultLines | Where-Object { $_.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
-            if ($baitLines.Count -ne 1) {
-                [void]$problem.Add(('expected exactly one result line for the sandbox bait directory {0}, got {1}' -f $target, $baitLines.Count))
-            }
-            elseif (-not (Test-KeyValue -Line $baitLines[0] -Pair 'failed=1')) {
-                [void]$problem.Add('the target result did not report exactly failed=1, so the locked directory never reached the Failed bucket')
-            }
-
-            # The totals line disambiguates: exactly failed=1 proves the exit 2 came from this
-            # deletion and not from an unrelated DISM or pnpclean failure on the operator's machine.
-            # Test-KeyValue rather than a substring test: IndexOf('failed=1') is also satisfied by
-            # failed=10, failed=11 and failed=100, so it only ruled out totals of 2..9.
-            $totalLines = @(Get-MatchingLine -Text $text -Needle '[Summary] Cleanup totals.')
-            if ($totalLines.Count -eq 0) {
-                [void]$problem.Add('the run never reached the summary totals')
-            }
-            else {
-                [void]$evidence.Add($totalLines[0])
-                if (-not (Test-KeyValue -Line $totalLines[0] -Pair 'failed=1')) {
-                    [void]$problem.Add('the summary totals did not report exactly failed=1')
-                }
-            }
-
-            # The footer records the run's OUTCOME by name now, not a sentence: status=Failed is
-            # what maps to exit 2, and its absence means the 2 came from somewhere else.
-            [void](Add-LogEvidence -Evidence $evidence -Problem $problem -Text $text -Needle 'status=Failed')
-
-            if (Test-Path -LiteralPath $deletable -PathType Leaf) {
-                [void]$problem.Add('the deletable bait file survived, so the sweep never really ran')
-            }
-            if (-not (Test-Path -LiteralPath $survivor -PathType Leaf)) {
-                [void]$problem.Add('the file inside the locked directory was deleted, so the lock did not hold')
-            }
+        if (Test-Path -LiteralPath $deletable -PathType Leaf) {
+            [void]$problem.Add('the deletable bait file survived, so the sweep never really ran')
+        }
+        if (-not (Test-Path -LiteralPath $survivor -PathType Leaf)) {
+            [void]$problem.Add('the file inside the locked directory was deleted, so the lock did not hold')
         }
     }
     catch {
