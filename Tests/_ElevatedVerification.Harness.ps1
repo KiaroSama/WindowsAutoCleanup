@@ -122,6 +122,10 @@ function Get-SandboxEnvironment {
         LOCALAPPDATA = (Join-Path -Path $Sandbox -ChildPath 'LA')
         TEMP         = (Join-Path -Path $Sandbox -ChildPath 'TMP')
         TMP          = (Join-Path -Path $Sandbox -ChildPath 'TMP')
+        # The one directory the injected fixture may build a target inside. It is read ONLY by
+        # Tests\_SandboxTargetFixture.psm1, which exists only in the scratch copy the child runs;
+        # no shipped file reads it, and the fixture refuses to name any target when it is absent.
+        WAC_VERIFY_SANDBOX_ROOT = $Sandbox
     }
     foreach ($key in $Extra.Keys) { $table[$key] = [string]$Extra[$key] }
     return $table
@@ -320,50 +324,61 @@ function Get-ResultLinePath {
     return [string]$match.Groups['bare'].Value
 }
 
-function Get-NonSandboxCategory {
+function New-VerificationScratchTree {
     <#
     .SYNOPSIS
-        Every allow-list category except the one kept, taken from the LIVE allow-list.
+        A disposable COPY of the repository inside the sandbox, with the allow-list builder replaced
+        by the positive sandbox fixture. Returns the Run.ps1 the child must be launched from.
     .DESCRIPTION
-        Enumerated rather than hard-coded so a category added to Targets.psm1 later is disabled by
-        default instead of being cleaned for real the next time this harness runs.
+        This replaces a DENY-LIST that could not work. The harness used to enumerate allow-list
+        categories and disable them with -SkipCategory, which requires the parent to be able to NAME
+        every category the child will build. It cannot. 'Microsoft Edge cache' and
+        'Windows Explorer thumbnail cache' are constructed outside the static per-profile table the
+        deny-list was read from, so neither was ever in it; and the parent's discovery is not the
+        child's, because redirecting TEMP, ProgramData and LOCALAPPDATA leaves the profile paths CIM
+        returns untouched. Measured in a Hyper-V guest: the parent resolved no second profile, handed
+        over a deny-list that denied nothing for it, and the elevated child swept the operator's real
+        %USERPROFILE%\AppData\Local\Temp.
+
+        So the child is given an explicit POSITIVE set instead, and the set is proven contained
+        before it is handed over and again immediately before each delete. The mechanism is a scratch
+        COPY: the shipped tree is never edited, no shipped file learns a test-only switch, and the
+        fixture lives only in a directory that is deleted with the sandbox.
+
+        The copy is shallow on purpose - Run.ps1 plus the files directly under src\, which is the
+        whole module set - so it costs one file copy each and not a directory walk.
     #>
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Keep)
+    param([Parameter(Mandatory = $true)][string]$Sandbox)
 
-    $names = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($target in (Get-WacCleanupTarget)) {
-        if ($target.Category -ieq $Keep) { continue }
-        if ($names.Contains($target.Category)) { continue }
-        [void]$names.Add($target.Category)
-    }
+    $scratch = Join-Path -Path $Sandbox -ChildPath 'SRC'
+    $scratchSrc = Join-Path -Path $scratch -ChildPath 'src'
+    [void][System.IO.Directory]::CreateDirectory($scratchSrc)
 
-    # The live set above is only what THIS process managed to materialise, and that is NOT the same
-    # set the child materialises. Measured in a Hyper-V guest: the harness enumerated 16 categories
-    # including 'Current user TEMP contents' but NOT 'User TEMP contents', because
-    # Get-WacUserProfilePath returned nothing here while it returned C:\Users\<name> in the child.
-    # The per-profile category was therefore absent from the deny-list, survived -SkipCategory, and
-    # the child swept the operator's REAL %USERPROFILE%\AppData\Local\Temp - outside the sandbox,
-    # on a machine the brief forbids running destructive cleanup against. Windows Sandbox had hidden
-    # it because no second profile path existed there.
-    #
-    # So the deny-list is built from what Targets.psm1 DECLARES, not from what one process happens
-    # to resolve. Reading the module's own table is deliberate: an environment-dependent enumeration
-    # is exactly what failed.
-    $module = Get-Module -Name 'WindowsAutoCleanup.Targets'
-    if (-not $module) {
-        throw 'the Targets module is not loaded, so the per-profile categories cannot be denied; refusing to build a partial skip list'
-    }
-    $declared = @(& $module { $script:UserCacheTarget } | ForEach-Object { [string]$_.Category })
-    if ($declared.Count -lt 1) {
-        throw 'the declared per-profile category table is empty or unreadable; refusing to build a partial skip list'
-    }
-    foreach ($name in $declared) {
-        if ($name -ieq $Keep) { continue }
-        if ($names.Contains($name)) { continue }
-        [void]$names.Add($name)
+    Copy-Item -LiteralPath $script:RunPath -Destination (Join-Path -Path $scratch -ChildPath 'Run.ps1') -Force -ErrorAction Stop
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:SrcRoot -File)) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path -Path $scratchSrc -ChildPath $file.Name) -Force -ErrorAction Stop
     }
 
-    return @($names.ToArray())
+    # THE INJECTION. Same module name, same exported surface, an explicit sandbox-only target set.
+    $fixture = Join-Path -Path $script:TestsRoot -ChildPath '_SandboxTargetFixture.psm1'
+    if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
+        throw ('the sandbox target fixture is missing at {0}; refusing to launch a child that would build the real allow-list' -f $fixture)
+    }
+    $injected = Join-Path -Path $scratchSrc -ChildPath 'WindowsAutoCleanup.Targets.psm1'
+    Copy-Item -LiteralPath $fixture -Destination $injected -Force -ErrorAction Stop
+
+    # Proven, not assumed. A copy that silently failed would leave the SHIPPED builder in place and
+    # the child would discover the operator's real profile - the exact failure this exists to stop.
+    $marker = 'WAC_VERIFY_SANDBOX_ROOT'
+    if (([System.IO.File]::ReadAllText($injected)).IndexOf($marker, [System.StringComparison]::Ordinal) -lt 0) {
+        throw ('the allow-list builder in {0} is not the sandbox fixture; refusing to launch the child' -f $injected)
+    }
+
+    $runPath = Join-Path -Path $scratch -ChildPath 'Run.ps1'
+    if (-not (Test-Path -LiteralPath $runPath -PathType Leaf)) {
+        throw ('the scratch copy of Run.ps1 was not created at {0}' -f $runPath)
+    }
+    return $runPath
 }
 
 function Get-RunChildCommandLine {
@@ -374,10 +389,18 @@ function Get-RunChildCommandLine {
         Built through the shipped Get-WacRelaunchArgument, so the child is launched exactly the way
         Run.ps1 launches its own elevated relaunch: -Command rather than -File, because -File cannot
         carry '-Switch:$false' on Windows PowerShell 5.1 and collapses an array into one string.
+    .PARAMETER ScriptPath
+        The Run.ps1 to launch - always the scratch copy from New-VerificationScratchTree, so the
+        child loads the injected fixture rather than the real allow-list builder.
+    .PARAMETER SkipCategory
+        Kept because Run.ps1 takes it, and deliberately no longer load-bearing. Scoping the child by
+        category name is the defect the fixture replaced; containment, not naming, is what confines
+        it now.
     #>
     param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
         [Parameter(Mandatory = $true)][string]$MutexName,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SkipCategory,
+        [AllowEmptyCollection()][string[]]$SkipCategory = @(),
         [switch]$PruneSupersededDrivers,
         [switch]$EnableLegacyDiskCleanup
     )
@@ -397,7 +420,7 @@ function Get-RunChildCommandLine {
         MutexName     = $MutexName
     }
 
-    $vector = Get-WacRelaunchArgument -ScriptPath $script:RunPath -HostSwitch @('-NonInteractive') `
+    $vector = Get-WacRelaunchArgument -ScriptPath $ScriptPath -HostSwitch @('-NonInteractive') `
         -BooleanSwitch $booleanSwitch -PresentSwitch @('Scheduled') -NamedValue $namedValue `
         -ArrayValue @{ SkipCategory = $SkipCategory }
 
