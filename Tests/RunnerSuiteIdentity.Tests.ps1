@@ -185,4 +185,40 @@ Test-Case 'the recorded status is the real outcome, not a constant' {
     }
 }
 
+Test-Case 'a run that had a failure keeps its per-suite captures instead of deleting the only evidence' {
+    # The runner writes one .out/.err pair per suite run and then deleted the whole directory in its
+    # finally block, unconditionally. A suite that went red inside a 104-run parallel pass therefore
+    # left NOTHING saying which assertion, on which host, with what message - which is exactly the
+    # state one unexplainable red run left behind, and why it could never be diagnosed.
+    #
+    # The fixture already contains a deliberately failing suite, so this case costs nothing extra:
+    # it reads the run every other case in this file already shares.
+    $run = Get-SharedRun
+
+    $evidence = @($run.Text -split "`r?`n" | Where-Object { $_ -match '^EVIDENCE ' })
+    Assert-Equal 1 $evidence.Count `
+        ('a run containing a failing suite did not report kept evidence. output: ' + $run.Text)
+
+    $match = [regex]::Match($evidence[0], 'kept at (?<path>.+?)\s*$')
+    Assert-True ($match.Success) ('the evidence line did not name a directory: ' + $evidence[0])
+    $kept = $match.Groups['path'].Value
+
+    try {
+        Assert-True (Test-Path -LiteralPath $kept -PathType Container) `
+            ('the captures were deleted even though a suite failed: ' + $kept)
+
+        $files = @(Get-ChildItem -LiteralPath $kept -Filter '*.out' -File -ErrorAction SilentlyContinue)
+        Assert-True ($files.Count -gt 0) 'the kept directory held no capture files at all'
+
+        $text = (@($files | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n")
+        Assert-True ($text -match 'failed=1') `
+            'the kept captures do not contain the failing suite output, so they are not the evidence'
+    }
+    finally {
+        # Kept on purpose by the runner, so this suite is what removes it: leaving one behind per run
+        # would trade an evidence defect for a residue defect.
+        if ($kept) { Remove-Item -LiteralPath $kept -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Complete-TestRun
