@@ -502,4 +502,172 @@ Test-Case 'off-drive, reparse-point and special profiles are exclusions, never g
     }
 }
 
+
+# ---------------------------------------------------------------------------------------------
+# WAC-07R: unresolved inspection must survive every layer
+# ---------------------------------------------------------------------------------------------
+
+function Clear-ProfileScratchRoot {
+    <#
+    .SYNOPSIS
+        Deletes this process's scratch ProfileList root if it was created. Never throws.
+    #>
+    Remove-Item -LiteralPath $script:ProfileScratchRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Test-Case 'a CIM row that throws AFTER a good row does not early-return a partial list' {
+    # The deterministic control-flow defect. $wmiWorked was set to $true immediately after the query
+    # returned, BEFORE the rows were processed, so a row that threw was caught by the outer handler
+    # with the flag already true - and the `if ($wmiWorked -and $results.Count -gt 0)` early return
+    # handed back the rows read so far as a finished answer. No gap, no fallback, a silently short
+    # profile list. The flag is now set only once every row has been processed.
+    $sandbox = New-TestSandbox -Prefix 'tg-cimrow'
+    try {
+        $fromCim = New-SyntheticProfileDirectory -Path (Join-Path -Path $sandbox -ChildPath 'Users\cimgood')
+        $fromRegistry = New-SyntheticProfileDirectory -Path (Join-Path -Path $sandbox -ChildPath 'Users\registryonly')
+        $scratch = New-ScratchProfileList -KeyPath (Join-Path -Path $script:ProfileScratchRoot -ChildPath 'CimRow') -GoodProfilePath $fromRegistry
+
+        # One usable row, then one whose Special property throws when it is read.
+        $good = [PSCustomObject]@{ Special = $false; LocalPath = $fromCim }
+        $bad = [PSCustomObject]@{ Special = $false; LocalPath = 'C:\Users\unprocessable' }
+        $rows = @($good, $bad)
+
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-CimInstance' -Body ({
+            param([Parameter(Mandatory = $true)][string]$ClassName)
+            $null = $ClassName
+            return $rows
+        }.GetNewClosure())
+
+        # The row is made unprocessable where the work actually happens. It is NOT done by giving
+        # the row a property getter that throws: measured on both hosts, PowerShell swallows an
+        # exception from a property getter and hands back $null, so a "malformed row" in that shape
+        # never raises and would prove nothing. What can raise inside that loop is the acceptance
+        # test the loop calls - with $ErrorActionPreference = 'Stop' any non-terminating error from
+        # the path checks inside it becomes terminating - so that is where the failure is injected.
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Test-WacIsRealUserProfilePath' -Body {
+            param([string]$Path, [switch]$RequireUserHive, $Gap)
+            $null = $RequireUserHive
+            $null = $Gap
+            if ($Path -like '*unprocessable*') {
+                throw (New-Object System.UnauthorizedAccessException('this profile row could not be examined'))
+            }
+            return (Test-Path -LiteralPath $Path -PathType Container)
+        }
+        Set-ProfileListSource -KeyPath $scratch
+
+        $gap = New-Object 'System.Collections.Generic.List[object]'
+        $profiles = @(Get-WacUserProfilePath -Gap $gap)
+
+        # The proof that the early return did not fire: the registry-only profile is present, and it
+        # can only be there if the ProfileList fallback actually ran.
+        Assert-True ($profiles -contains (Get-WacNormalizedPath -Path $fromRegistry)) `
+            ('the partial CIM list was returned as final, so the fallback never ran. got: ' + ($profiles -join ', '))
+
+        # ...and the fallback finished, so the failed row is no longer an open obligation.
+        Assert-Equal 0 $gap.Count ('a healthy fallback supplied the missing evidence, so nothing is unresolved: ' + (Get-GapText -Gap $gap))
+    }
+    finally {
+        Remove-ModuleFunction -Module $script:CoreModule -Name 'Test-WacIsRealUserProfilePath'
+        Clear-ProfileShadow
+        Clear-ProfileScratchRoot
+    }
+}
+
+Test-Case 'a throwing CIM row with a failing fallback is a gap, never a short list' {
+    # The other half: when nothing supplies the missing evidence the obligation must surface.
+    $sandbox = New-TestSandbox -Prefix 'tg-cimrowfail'
+    try {
+        $fromCim = New-SyntheticProfileDirectory -Path (Join-Path -Path $sandbox -ChildPath 'Users\cimgood')
+        $good = [PSCustomObject]@{ Special = $false; LocalPath = $fromCim }
+        $bad = [PSCustomObject]@{ Special = $false; LocalPath = 'C:\Users\unprocessable' }
+        $rows = @($good, $bad)
+
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-CimInstance' -Body ({
+            param([Parameter(Mandatory = $true)][string]$ClassName)
+            $null = $ClassName
+            return $rows
+        }.GetNewClosure())
+
+        # The row is made unprocessable where the work actually happens. It is NOT done by giving
+        # the row a property getter that throws: measured on both hosts, PowerShell swallows an
+        # exception from a property getter and hands back $null, so a "malformed row" in that shape
+        # never raises and would prove nothing. What can raise inside that loop is the acceptance
+        # test the loop calls - with $ErrorActionPreference = 'Stop' any non-terminating error from
+        # the path checks inside it becomes terminating - so that is where the failure is injected.
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Test-WacIsRealUserProfilePath' -Body {
+            param([string]$Path, [switch]$RequireUserHive, $Gap)
+            $null = $RequireUserHive
+            $null = $Gap
+            if ($Path -like '*unprocessable*') {
+                throw (New-Object System.UnauthorizedAccessException('this profile row could not be examined'))
+            }
+            return (Test-Path -LiteralPath $Path -PathType Container)
+        }
+        Set-ProfileListSource -Fail
+
+        $gap = New-Object 'System.Collections.Generic.List[object]'
+        $null = @(Get-WacUserProfilePath -Gap $gap)
+
+        Assert-True ($gap.Count -gt 0) 'a failed row plus a failed fallback produced no gap at all'
+        Assert-True ((Get-GapText -Gap $gap) -match '(?i)row') `
+            ('the gap does not say which source could not be finished: ' + (Get-GapText -Gap $gap))
+    }
+    finally {
+        Remove-ModuleFunction -Module $script:CoreModule -Name 'Test-WacIsRealUserProfilePath'
+        Clear-ProfileShadow
+        Clear-ProfileScratchRoot
+    }
+}
+
+Test-Case 'the presence probe separates absence from a path it could not inspect' {
+    # Directory.Exists answers a boolean to a three-valued question, which is what let an unreadable
+    # profile be filtered out as though it were not there. These are the classifications reachable
+    # without rewriting an ACL - which this suite may not do, being shipped code. The denied case is
+    # covered by the consumer test below, through the same seam the rest of this file uses.
+    $sandbox = New-TestSandbox -Prefix 'tg-presence'
+    $file = Join-Path -Path $sandbox -ChildPath 'plain.txt'
+    Set-Content -LiteralPath $file -Value 'x' -Encoding ASCII
+
+    Assert-Equal 'Present' (Get-WacPathPresence -Path $sandbox) 'an existing directory was not Present'
+    Assert-Equal 'Present' (Get-WacPathPresence -Path $file) 'an existing file was not Present'
+    Assert-Equal 'Absent' (Get-WacPathPresence -Path (Join-Path -Path $sandbox -ChildPath 'nothing-here')) `
+        'a missing child of a readable directory was not Absent'
+    Assert-Equal 'Absent' (Get-WacPathPresence -Path (Join-Path -Path $sandbox -ChildPath 'no\such\parent')) `
+        'a missing parent chain was not Absent'
+    # A file where the parent directory should be: nothing can live under it, so this is proven
+    # absence rather than the IOException-driven Unresolved it would otherwise produce.
+    Assert-Equal 'Absent' (Get-WacPathPresence -Path (Join-Path -Path $file -ChildPath 'child')) `
+        'a path beneath a FILE was not Absent'
+    Assert-Equal 'Absent' (Get-WacPathPresence -Path '') 'an empty path was not Absent'
+}
+
+Test-Case 'a profile directory that cannot be inspected is a gap, not a silent exclusion' {
+    # The consumer half. Before the fix Test-WacIsRealUserProfilePath filtered on a bare
+    # Directory.Exists, so "denied" and "missing" both returned $false and the path left the
+    # allow-list without anyone recording that it had never been examined. Measured on this machine
+    # with a real deny ACE on the parent directory: [IO.File]::Exists answered False for a hive that
+    # exists, while the probe answers Unresolved.
+    $sandbox = New-TestSandbox -Prefix 'tg-unresolved'
+    $denied = Join-Path -Path $sandbox -ChildPath 'Users\denied'
+    try {
+        $target = $denied
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacPathPresence' -Body ({
+            param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path)
+            if ($Path -and $Path.StartsWith($target, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Unresolved' }
+            return 'Absent'
+        }.GetNewClosure())
+
+        $gap = New-Object 'System.Collections.Generic.List[object]'
+        $accepted = Test-WacIsRealUserProfilePath -Path $denied -Gap $gap
+
+        Assert-False $accepted 'an uninspectable profile must not be accepted into the allow-list either'
+        Assert-True ($gap.Count -gt 0) 'an uninspectable profile was dropped silently, exactly as before the fix'
+        Assert-True ((Get-GapText -Gap $gap) -match '(?i)could not be inspected') `
+            ('the gap does not name the reason: ' + (Get-GapText -Gap $gap))
+    }
+    finally {
+        Remove-ModuleFunction -Module $script:CoreModule -Name 'Get-WacPathPresence'
+    }
+}
+
 Complete-TestRun

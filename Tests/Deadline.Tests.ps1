@@ -371,4 +371,117 @@ Test-Case 'Bounded work reaches this module, and a non-terminating error is repo
     }
 }
 
+
+# ---------------------------------------------------------------------------------------------
+# WAC-06R: the phase that starts AFTER expiry must not get a fresh 255-entry allowance
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'the directory phase consults a deadline that expired during the sweep, before deleting anything' {
+    # The counter for this phase restarted at 0 and the clock is only read on every 256th entry, so
+    # a run whose budget expired during the sweep was followed by up to 255 real deletions before
+    # the phase asked once. Fewer than 256 directories is the whole point: with the old code the
+    # modulo never fires, so the phase never asks at all.
+    #
+    # Reaching that state needs care. The sweep consults the deadline once per directory it pops, so
+    # simply expiring the clock early stops the sweep instead and leaves the phase nothing to delete
+    # - a fixture shaped that way passes whether or not the fix is present, which is how the first
+    # version of this case failed to discriminate. The sweep is therefore replaced by one that hands
+    # back real directories without touching the clock, which is exactly the state the defect needs:
+    # a populated work list and an already-expired budget.
+    $sandbox = New-TestSandbox -Prefix 'fs-phase'
+    $module = Get-Module -Name 'WindowsAutoCleanup.FileSystem'
+    try {
+        $root = Join-Path -Path $sandbox -ChildPath 'root'
+        [void][System.IO.Directory]::CreateDirectory($root)
+        $expected = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($index in 1..5) {
+            $directory = Join-Path -Path $root -ChildPath ('dir{0}' -f $index)
+            [void][System.IO.Directory]::CreateDirectory($directory)
+            [void]$expected.Add($directory)
+        }
+
+        $sweepResult = @($expected.ToArray())
+        & $module {
+            param($found)
+            # Invoke-WacTreeSweep is defined IN this module, so Set-Item REPLACES it rather than
+            # shadowing it: without keeping the original, the teardown's Remove-Item would delete a
+            # shipped function out of the loaded module and break every later case in this process.
+            $script:WacSavedSweep = (Get-Item -Path 'function:Invoke-WacTreeSweep').ScriptBlock
+
+            # Deepest-first, deadline-free: the real sweep's contract minus its own clock reads.
+            Set-Item -Path 'function:script:Invoke-WacTreeSweep' -Value ([scriptblock]::Create(
+                'param($Root, $Stats) return @(' + (($found | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ',') + ')'))
+
+            # The entry guard consumes the first answer, so the run is admitted and every later
+            # phase sees an expired budget.
+            $script:WacTestDeadlineCalls = 0
+            Set-Item -Path 'function:script:Test-WacDeadlineExpired' -Value {
+                $script:WacTestDeadlineCalls++
+                return ($script:WacTestDeadlineCalls -gt 1)
+            }
+        } $sweepResult
+
+        $result = Remove-WacTree -Category 'phase' -Path $root
+
+        Assert-True ([bool]$result.Attempted) 'the run was not admitted, so the phase under test never ran'
+        Assert-Equal 0 ([int]$result.DirectoriesDeleted) `
+            'the directory phase deleted after the budget had already expired'
+        Assert-True ([int]$result.SkippedDeadline -gt 0) `
+            'the phase stopped for the deadline without recording that it had'
+
+        foreach ($directory in $expected) {
+            Assert-True (Test-Path -LiteralPath $directory) `
+                ('a directory was removed after the deadline expired: ' + $directory)
+        }
+    }
+    finally {
+        & $module {
+            # The sweep is put BACK, not deleted. Test-WacDeadlineExpired is imported from Core, so
+            # its module-scope copy is a shadow and removing it simply reveals the real one again.
+            if ($script:WacSavedSweep) {
+                Set-Item -Path 'function:script:Invoke-WacTreeSweep' -Value $script:WacSavedSweep
+                Remove-Item -Path 'variable:script:WacSavedSweep' -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -Path 'function:Test-WacDeadlineExpired' -Force -ErrorAction SilentlyContinue
+        }
+        Reset-WacTestDeadline
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# WAC-06R: setup is charged to the same bound as the work
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'a slow module import is charged to the bound, and work that no longer fits is never scheduled' {
+    # Invoke-WacBounded sized its budget, THEN created a runspace, opened it and imported modules -
+    # all synchronous - and only then waited the ORIGINAL number. The real upper bound was therefore
+    # "setup + budget", not "budget", and a module whose own top-level code blocks makes the setup
+    # half arbitrarily large. That is the "delayed module import/open" case: the run deadline exists
+    # to cap total wall time, and an unaccounted prologue defeats it.
+    #
+    # The import sleeps rather than the block, because the block is not what was unbounded. An import
+    # failure would surface as Failed, so Incomplete here also proves the module loaded normally.
+    $sandbox = New-TestSandbox -Prefix 'bounded-import'
+    try {
+        Reset-WacTestDeadline
+        $slow = Join-Path -Path $sandbox -ChildPath 'SlowImport.psm1'
+        [System.IO.File]::WriteAllText(
+            $slow,
+            "[System.Threading.Thread]::Sleep(600)`r`nfunction Get-SlowImportMarker { 'imported' }`r`n",
+            (New-Object 'System.Text.UTF8Encoding' -ArgumentList $false))
+
+        $result = Invoke-WacBounded -ScriptBlock { 'ran anyway' } -TimeoutMs 250 -ImportModule @($slow)
+
+        Assert-Equal 'Incomplete' ([string]$result.Outcome) `
+            ('setup that outlasted the bound did not report unfinished work: ' + [string]$result.Error)
+        Assert-True (-not $result.Started) `
+            'the block was scheduled although preparing it had already spent the entire bound'
+        Assert-True ([bool]$result.TimedOut) 'an exhausted bound was not reported as a timeout'
+        Assert-Equal 0 (@($result.Output).Count) 'a block that must never run produced output'
+    }
+    finally {
+        Reset-WacTestDeadline
+    }
+}
+
 Complete-TestRun

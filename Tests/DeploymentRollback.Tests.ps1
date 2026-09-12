@@ -48,7 +48,7 @@ $script:DeployModule = Get-Module -Name 'WindowsAutoCleanup.Deploy'
 
 $script:InstallerMessage = New-Object 'System.Collections.Generic.List[string]'
 $script:RegisteredTask = New-Object 'System.Collections.Generic.List[object]'
-$script:RegisterDrift = $false
+$script:RegisterDrift = 'none'
 
 function Write-InstallerMessage {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'A stub keeps the signature its production caller binds against; not every parameter has to change its answer.')]
@@ -64,11 +64,20 @@ function Write-InstallerMessage {
 }
 
 function New-StubScheduledTask {
+    <#
+    .SYNOPSIS
+        A stand-in for a registered task, carrying every part the rollback's read-back compares:
+        the action, the principal it runs as, the settings that decide whether it runs, and the
+        schedule it runs on.
+    #>
     param(
         [Parameter(Mandatory = $true)][string]$Execute,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Arguments,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$WorkingDirectory,
-        [bool]$Hidden = $true
+        [bool]$Hidden = $true,
+        [string]$UserId = 'S-1-5-18',
+        [string]$StartBoundary = '2026-01-01T03:00:00',
+        [bool]$Enabled = $true
     )
 
     return [PSCustomObject]@{
@@ -76,7 +85,9 @@ function New-StubScheduledTask {
         TaskPath = '\WindowsAutoCleanup\'
         Description = 'stub'
         Actions = @([PSCustomObject]@{ Execute = $Execute; Arguments = $Arguments; WorkingDirectory = $WorkingDirectory })
-        Settings = [PSCustomObject]@{ Hidden = $Hidden }
+        Principal = [PSCustomObject]@{ UserId = $UserId; LogonType = 'ServiceAccount'; RunLevel = 'Highest' }
+        Settings = [PSCustomObject]@{ Hidden = $Hidden; Enabled = $Enabled }
+        Triggers = @([PSCustomObject]@{ StartBoundary = $StartBoundary; Enabled = $true; DaysInterval = 1 })
     }
 }
 
@@ -113,6 +124,9 @@ function Register-ScheduledTask {
 
     # Registers what the XML actually says, so Restore-CapturedTask's read-back is compared against
     # a task built from the captured definition rather than against a fixture that cannot disagree.
+    # Every DRIFT below is one field of that definition changed on the way in - the scheduler
+    # normalising something, or a different task landing at the same name - and each is a thing the
+    # machine would really have lost.
     $document = New-Object System.Xml.XmlDocument
     $document.LoadXml([string]$Xml)
     $exec = $document.SelectSingleNode("//*[local-name()='Actions']/*[local-name()='Exec']")
@@ -120,10 +134,27 @@ function Register-ScheduledTask {
     $command = [string]$exec.SelectSingleNode("*[local-name()='Command']").InnerText
     $arguments = [string]$exec.SelectSingleNode("*[local-name()='Arguments']").InnerText
     $working = [string]$exec.SelectSingleNode("*[local-name()='WorkingDirectory']").InnerText
-    if ($script:RegisterDrift) { $arguments = $arguments + ' -SomethingElse' }
+
+    $userId = 'S-1-5-18'
+    $startBoundary = '2026-01-01T03:00:00'
+    $enabled = $true
+    $user = $document.SelectSingleNode("//*[local-name()='Principals']/*[local-name()='Principal']/*[local-name()='UserId']")
+    if ($user) { $userId = [string]$user.InnerText }
+    $boundary = $document.SelectSingleNode("//*[local-name()='Triggers']//*[local-name()='StartBoundary']")
+    if ($boundary) { $startBoundary = [string]$boundary.InnerText }
+    $enabledNode = $document.SelectSingleNode("//*[local-name()='Settings']/*[local-name()='Enabled']")
+    if ($enabledNode) { $enabled = [string]::Equals(([string]$enabledNode.InnerText).Trim(), 'true', [System.StringComparison]::OrdinalIgnoreCase) }
+
+    switch ($script:RegisterDrift) {
+        'arguments' { $arguments = $arguments + ' -SomethingElse' }
+        'user' { $userId = 'MACHINE\mobin' }
+        'schedule' { $startBoundary = '2026-01-01T20:00:00' }
+        'enabled' { $enabled = $false }
+    }
 
     $script:RegisteredTask.Clear()
-    [void]$script:RegisteredTask.Add((New-StubScheduledTask -Execute $command -Arguments $arguments -WorkingDirectory $working))
+    [void]$script:RegisteredTask.Add((New-StubScheduledTask -Execute $command -Arguments $arguments -WorkingDirectory $working `
+        -UserId $userId -StartBoundary $startBoundary -Enabled $enabled))
     return [PSCustomObject]@{ TaskName = $TaskName; TaskPath = $TaskPath }
 }
 
@@ -140,10 +171,16 @@ function New-CapturedDefinition {
 
     # The UTF-16 declaration is what Export-ScheduledTask really emits; LoadXml accepts it on both
     # hosts (measured), and a fixture that quietly dropped it would not exercise that.
+    #
+    # The principal and the trigger are here because they are half of what the machine loses when a
+    # task is unregistered: a capture carrying only its action could not tell a restored task from
+    # the same program running as somebody else, at another hour.
     $xml = '<?xml version="1.0" encoding="UTF-16"?>' +
         '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' +
         '<RegistrationInfo><Description>the task this run removed</Description></RegistrationInfo>' +
-        '<Settings><Hidden>true</Hidden></Settings>' +
+        '<Triggers><CalendarTrigger><StartBoundary>2026-01-01T03:00:00</StartBoundary><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>' +
+        '<Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel><LogonType>ServiceAccount</LogonType></Principal></Principals>' +
+        '<Settings><Enabled>true</Enabled><Hidden>true</Hidden></Settings>' +
         ('<Actions Context="Author"><Exec><Command>{0}</Command><Arguments>{1}</Arguments><WorkingDirectory>{2}</WorkingDirectory></Exec></Actions>' -f
             [System.Security.SecurityElement]::Escape($Execute),
             [System.Security.SecurityElement]::Escape($Arguments),
@@ -157,11 +194,16 @@ function New-CapturedDefinition {
 }
 
 function Reset-RollbackFixture {
-    param([switch]$Drift)
+    <#
+    .SYNOPSIS
+        Clears the journal, the stub scheduler and the module's in-flight transaction, and chooses
+        which field the next registration comes back with changed.
+    #>
+    param([ValidateSet('none', 'arguments', 'user', 'schedule', 'enabled')][string]$Drift = 'none')
 
     $script:InstallerMessage.Clear()
     $script:RegisteredTask.Clear()
-    $script:RegisterDrift = [bool]$Drift
+    $script:RegisterDrift = $Drift
     & $script:DeployModule { $script:DeploymentTransaction = $null }
 }
 
@@ -517,7 +559,7 @@ Test-Case 'A registration failure restores the tree AND the exact task definitio
 Test-Case 'A rollback whose restored task is not the one that was captured reports failure' {
     # Restore-CapturedTask used to accept any task registered at that path with that name. What the
     # machine lost was the ACTION, so a definition that came back different is not a restoration.
-    Reset-RollbackFixture -Drift
+    Reset-RollbackFixture -Drift 'arguments'
     Invoke-InDeploymentSandbox -Prefix 'wac02-task-drift' -Body {
         param($sandbox)
 
@@ -539,6 +581,36 @@ Test-Case 'A rollback whose restored task is not the one that was captured repor
         # The deployment half still succeeded and is reported separately: an unrestorable task is
         # not a reason to leave the machine on the half-installed tree.
         Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path $live.RunScript) 'the deployment rollback was abandoned too'
+    }
+}
+
+Test-Case 'A task that came back under another user, at another hour, or disabled is not restored' {
+    # The same refusal as above, for the parts of a task that are not its action (ledger WAC-02R).
+    # Each of these is a machine that still does not have the registration it lost: the cleanup runs
+    # as somebody else, or at a time nobody asked for, or never.
+    foreach ($drift in @('user', 'schedule', 'enabled')) {
+        Reset-RollbackFixture -Drift $drift
+        Invoke-InDeploymentSandbox -Prefix ('wac02r-task-' + $drift) -Body {
+            param($sandbox)
+
+            $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+            $originalHash = Get-WacDeploymentFileHash -Path $live.RunScript
+            $slots = Get-WacDeploymentSlotPath
+
+            [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+            [void](Switch-WacDeploymentStage -KeepPrevious)
+
+            $captured = New-CapturedDefinition -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' `
+                -Arguments ('-NoProfile -Command "& ''{0}'' -Scheduled"' -f $live.RunScript) `
+                -WorkingDirectory $slots.Root
+
+            $ok = Undo-Installation -DeploymentRoot $slots.Root -CapturedTask @($captured)
+            Assert-False $ok 'a task that came back changed was reported as restored'
+            Assert-True ($script:InstallerMessage -join ' / ' -match 'not the task that was captured') ($script:InstallerMessage -join ' / ')
+
+            # And the deployment half is still reported separately and still succeeded.
+            Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path $live.RunScript) 'the deployment rollback was abandoned too'
+        }
     }
 }
 

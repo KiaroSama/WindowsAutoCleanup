@@ -236,7 +236,7 @@ function Invoke-WacProcess {
         Write-WacLog -Level WARNING -Component $Component -Message 'Run budget exhausted before the tool could start.' -Data @{ tool = $FilePath }
         return [PSCustomObject]@{
             ExitCode = $null; TimedOut = $true; StandardOutput = ''; StandardError = ''
-            DurationMs = 0; Started = $false; TerminationProven = $true
+            DurationMs = 0; Started = $false; TerminationProven = $true; OutputComplete = $true
         }
     }
 
@@ -303,11 +303,34 @@ function Invoke-WacProcess {
             [void]$process.WaitForExit(10000)
         }
 
-        [void]$outTask.Wait(5000)
-        [void]$errTask.Wait(5000)
+        # Two FIXED 5-second waits used to sit entirely outside the run budget, so every tool could
+        # add up to ten seconds on top of its own timeout (ledger WAC-06R: output capture belongs in
+        # the accounting). The floor keeps the ordinary case working - a tool that has already
+        # exited hands its pipes over in milliseconds - while an exhausted budget no longer buys
+        # another ten seconds per tool.
+        $readBudgetMs = Get-WacStepTimeoutMs -RequestedMs 5000
+        if ($readBudgetMs -lt 250) { $readBudgetMs = 250 }
 
+        [void]$outTask.Wait($readBudgetMs)
+        [void]$errTask.Wait($readBudgetMs)
+
+        # A pipe reaches EOF only once EVERY write handle on it is closed. So a read that is still
+        # outstanding after the root has exited is not a slow reader - it is positive evidence that
+        # something this run started INHERITED the handle and is still alive. That was the silent
+        # case (ledger WAC-05R): incomplete output became the empty string, which a caller parsing
+        # stdout reads as a real, empty answer - "pnputil found no drivers" rather than "the answer
+        # never arrived" - and a finished root reported TerminationProven anyway.
+        $outputComplete = ($outTask.IsCompleted -and $errTask.IsCompleted)
         $stdout = if ($outTask.IsCompleted) { [string]$outTask.Result } else { '' }
         $stderr = if ($errTask.IsCompleted) { [string]$errTask.Result } else { '' }
+
+        if (-not $outputComplete) {
+            $terminationProven = $false
+            Write-WacLog -Level CRITICAL -Component $Component -Message 'The external tool exited but its output pipe is still held open, so a process it started is still running and its output is incomplete.' -Data @{
+                tool = $FilePath; pid = $process.Id; readBudgetMs = $readBudgetMs
+                stdoutComplete = [bool]$outTask.IsCompleted; stderrComplete = [bool]$errTask.IsCompleted
+            }
+        }
 
         $exitCode = $null
         if (-not $timedOut) {
@@ -322,9 +345,13 @@ function Invoke-WacProcess {
             StandardError = $stderr
             DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds
             Started = $true
-            # $true whenever the tool was not terminated at all. Only a bounded timeout whose tree
-            # could not be proven gone sets it $false.
+            # $true whenever the tool was not terminated at all. A bounded timeout whose tree could
+            # not be proven gone sets it $false, and so does a pipe still held open after the root
+            # exited - that handle belongs to a process this run started.
             TerminationProven = $terminationProven
+            # Whether StandardOutput/StandardError are the tool's WHOLE output. A caller that parses
+            # them must check this before believing an empty or short answer.
+            OutputComplete = $outputComplete
         }
     }
     catch {
@@ -345,7 +372,7 @@ function Invoke-WacProcess {
             return [PSCustomObject]@{
                 ExitCode = $null; TimedOut = $false; StandardOutput = ''; StandardError = [string]$_.Exception.Message
                 DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds; Started = $false
-                TerminationProven = $true
+                TerminationProven = $true; OutputComplete = $true
             }
         }
 
@@ -378,6 +405,8 @@ function Invoke-WacProcess {
             DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds
             Started = $true
             TerminationProven = $terminationProven
+            # The result was never known, so the output cannot be claimed complete either.
+            OutputComplete = $false
         }
     }
     finally {
@@ -486,18 +515,42 @@ function Invoke-WacBounded {
         [void]$shell.AddScript($ScriptBlock.ToString())
         foreach ($argument in $ArgumentList) { [void]$shell.AddArgument($argument) }
 
+        # The budget was measured before the runspace existed. Creating one, opening it and
+        # importing this module is SYNCHRONOUS and costs ~80-100 ms on both hosts - more on a cold
+        # or contended machine, and an arbitrary amount when a module's own top-level code blocks.
+        # Waiting the ORIGINAL budget after that makes this call's real upper bound "setup + budget"
+        # rather than "budget", which is precisely the accounting hole the run deadline exists to
+        # close. Charge the setup to the same budget and reclamp against the live deadline here,
+        # immediately before the work is scheduled, not at the top of the function.
+        $setupMs = [int]$watch.Elapsed.TotalMilliseconds
+        $waitMs = $budgetMs - $setupMs
+        if (-not $IgnoreRunBudget) { $waitMs = Get-WacStepTimeoutMs -RequestedMs $waitMs }
+
+        if ($waitMs -le 0) {
+            # Nothing has been invoked, so there is nothing to abandon: the runspace disposes
+            # normally in the finally block and the machine is untouched.
+            $watch.Stop()
+            Write-WacLog -Level WARNING -Component $Component -Message 'Preparation consumed the whole bound, so the work was never scheduled.' -Data @{ budgetMs = $budgetMs; setupMs = $setupMs }
+            return [PSCustomObject]@{
+                Outcome = 'Incomplete'; Started = $false; TimedOut = $true
+                Output = @(); HadErrors = $false
+                Error = ('Preparing the bounded work used {0} ms of its {1} ms bound, so nothing was started.' -f $setupMs, $budgetMs)
+                DurationMs = [int]$watch.Elapsed.TotalMilliseconds
+            }
+        }
+
         $handle = $shell.BeginInvoke()
 
-        if (-not $handle.AsyncWaitHandle.WaitOne($budgetMs)) {
+        if (-not $handle.AsyncWaitHandle.WaitOne($waitMs)) {
             $abandoned = $true
             try { [void]$shell.BeginStop($null, $null) } catch { $null = $_ }
             $watch.Stop()
 
-            Write-WacLog -Level WARNING -Component $Component -Message 'In-process work exceeded its bound and was abandoned.' -Data @{ budgetMs = $budgetMs }
+            Write-WacLog -Level WARNING -Component $Component -Message 'In-process work exceeded its bound and was abandoned.' -Data @{ budgetMs = $budgetMs; setupMs = $setupMs; waitMs = $waitMs }
             return [PSCustomObject]@{
                 Outcome = 'Incomplete'; Started = $true; TimedOut = $true
                 Output = @(); HadErrors = $false
-                Error = ('The work did not finish within {0} ms.' -f $budgetMs)
+                Error = ('The work did not finish within {0} ms.' -f $waitMs)
                 DurationMs = [int]$watch.Elapsed.TotalMilliseconds
             }
         }

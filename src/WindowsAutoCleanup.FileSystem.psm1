@@ -499,9 +499,17 @@ function Remove-WacTree {
 
     # Pass 1: delete the directories we found, deepest first.
     $retry = New-Object 'System.Collections.Generic.List[string]'
+
+    # The counter restarted at 0 here, and the deadline is only consulted on every 256th entry, so a
+    # sweep that had ALREADY run the budget out was followed by up to 255 more deletions before this
+    # phase asked the question once. The budget is a promise about when mutation stops, and "255
+    # directories after expiry" is not that promise. Asking once on entry costs a single clock read
+    # and makes the phase honour a deadline that expired before it started; the periodic check below
+    # still bounds overshoot within the phase.
     $checked = 0
+    $alreadyExpired = Test-WacDeadlineExpired
     foreach ($directory in $directories) {
-        if ((++$checked % $script:DeadlineCheckInterval) -eq 0 -and (Test-WacDeadlineExpired)) {
+        if ($alreadyExpired -or ((++$checked % $script:DeadlineCheckInterval) -eq 0 -and (Test-WacDeadlineExpired))) {
             $stats.SkippedDeadline++
             break
         }

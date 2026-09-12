@@ -157,10 +157,26 @@ function Get-WacEdgeProfilePath {
 
     $found = New-Object 'System.Collections.Generic.List[string]'
 
-    # Absent, or a file where a directory was expected: an answer, not a missing answer. Test-Path
-    # also answers false for a path an unprivileged caller cannot reach at all, which is the known
-    # ceiling of asking the cheap question; the enumeration below is where a readable-but-denied
-    # directory is caught.
+    # Absent is an answer; unreadable is not. Test-Path answered false for BOTH, and that was the
+    # documented ceiling of this check - a User Data root the running identity cannot reach at all
+    # never reached the enumeration below, so it produced a clean empty result with no gap. The
+    # three-valued probe separates them, so the only empty result that stays silent is a genuine
+    # absence.
+    $presence = Get-WacPathPresence -Path $UserDataPath
+    if ($presence -ceq 'Unresolved') {
+        Write-WacLog -Level WARNING -Component 'Targets' -Message 'An Edge User Data path could not be inspected, so its profiles are neither discovered nor ruled out.' -Data @{ path = $UserDataPath }
+        if ($null -ne $Gap) {
+            [void]$Gap.Add([PSCustomObject]@{
+                Source = 'EdgeProfile'
+                Scope  = $UserDataPath
+                Reason = 'the User Data path could not be inspected, so it is neither enumerated nor proven absent'
+            })
+        }
+        return @()
+    }
+    if ($presence -cne 'Present') { return @() }
+
+    # Present, but possibly a FILE where a directory was expected: still an answer, not a gap.
     if (-not (Test-Path -LiteralPath $UserDataPath -PathType Container)) { return @() }
 
     try {

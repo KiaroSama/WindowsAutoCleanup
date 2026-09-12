@@ -63,6 +63,59 @@ function Test-WacTaskExecuteIsCanonicalHost {
     return $false
 }
 
+function Get-WacLiteralCallTarget {
+    <#
+    .SYNOPSIS
+        The literal string a `& '<path>' ...` payload invokes, or $null. Parses; never executes.
+    .DESCRIPTION
+        The decoder half of ConvertTo-WacPowerShellLiteral. The encoder escapes for the PowerShell
+        parser, so the parser is the only thing guaranteed to agree with it: any hand-written
+        un-escaping is a second implementation of a rule that lives in the engine, and the two drift
+        the moment the engine accepts one more terminator (it already accepts four).
+
+        ParseInput compiles source into an AST and evaluates nothing - no command runs, no variable
+        expands, no scriptblock is invoked - so a foreign task's payload is safe to inspect here.
+
+        Fails closed in every ambiguous case: a payload that will not parse, one with no call
+        operator, or one whose call target is anything other than a plain string literal (a
+        variable, a subexpression, a concatenation) returns $null. The caller treats $null as
+        "unknown", never as "no path".
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Source)
+
+    if ([string]::IsNullOrWhiteSpace($Source)) { return $null }
+
+    $tokens = $null
+    $errors = $null
+    try {
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors)
+    }
+    catch {
+        return $null
+    }
+
+    if ($null -eq $ast) { return $null }
+    # A payload this project generated always parses. One that does not is a shape we do not
+    # understand, and guessing at it is exactly what the regex used to do.
+    if (@($errors).Count -gt 0) { return $null }
+
+    $calls = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst]
+            }, $true) | Where-Object {
+        $_.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand
+    })
+
+    # Exactly one call operator. Two would mean the payload invokes more than one thing, and
+    # nominating either as "the script this task runs" is a guess.
+    if (@($calls).Count -ne 1) { return $null }
+
+    $first = @($calls[0].CommandElements)[0]
+    if ($first -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $null }
+    return [string]$first.Value
+}
+
 function Get-WacTaskScriptPath {
     <#
     .SYNOPSIS
@@ -81,13 +134,26 @@ function Get-WacTaskScriptPath {
 
     if ([string]::IsNullOrWhiteSpace($Arguments)) { return $null }
 
-    # The -Command payload seeds $LASTEXITCODE, then calls the script with the call operator and a
-    # single-quoted literal in which an embedded quote is doubled. Match the call operator wherever
-    # it appears in the payload rather than assuming it comes first, so a future prologue statement
-    # cannot silently break the ownership proof.
-    $command = [regex]::Match($Arguments, "(?i)(?:^|\s)-Command\s+.*?&\s+'(?<path>(?:[^']|'')+)'")
+    # The -Command payload is PowerShell source, so the PARSER decodes it - not a regex. The old
+    # expression matched the literal itself and then collapsed `''` back to `'`, which understood
+    # only the ASCII apostrophe. ConvertTo-WacPowerShellLiteral delegates to
+    # CodeGeneration::EscapeSingleQuotedStringContent, and that doubles every quote the PowerShell
+    # parser accepts as a terminator - U+2018, U+2019 and U+201B as well as the ASCII one. So a
+    # deployment under `C:\O<U+2019>Name\` encoded to `'O<U+2019><U+2019>Name'` and the regex handed
+    # back `O<U+2019><U+2019>Name`, a path that does not exist, while PowerShell executes
+    # `O<U+2019>Name`. The decoded path then normalised to something outside the deployment root, so
+    # a task whose ONLY reference to the tree is that argument stopped looking like a reference and
+    # the uninstaller could delete files the task still runs. Office and OneDrive autocorrect an
+    # ASCII apostrophe into U+2019 inside user and folder names, so this needed no crafted input.
+    #
+    # Parsing is not executing: ParseInput builds an AST and runs nothing, so an injection sentinel
+    # in a foreign task's payload is inspected as data. Whatever the encoder escapes, the parser
+    # un-escapes, by construction - the two can no longer drift apart.
+    $command = [regex]::Match($Arguments, '(?i)(?:^|\s)-Command\s+"(?<payload>[^"]*)"')
     if ($command.Success) {
-        return (Get-WacNormalizedPath -Path ($command.Groups['path'].Value -replace "''", "'"))
+        $target = Get-WacLiteralCallTarget -Source $command.Groups['payload'].Value
+        if ([string]::IsNullOrWhiteSpace($target)) { return $null }
+        return (Get-WacNormalizedPath -Path $target)
     }
 
     $file = [regex]::Match($Arguments, '(?i)(?:^|\s)-File\s+(?:"(?<quoted>[^"]+)"|(?<bare>[^\s"]+))')
@@ -483,11 +549,29 @@ function Test-WacTaskReferencesRoot {
             try { $execute = [string]$action.Execute } catch { $execute = '' }
             try { $working = [string]$action.WorkingDirectory } catch { $working = '' }
 
-            foreach ($candidate in @((Get-WacTaskScriptPath -Arguments $arguments), $execute, $working)) {
+            $scriptPath = Get-WacTaskScriptPath -Arguments $arguments
+
+            foreach ($candidate in @($scriptPath, $execute, $working)) {
                 if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
                 $normalized = Get-WacNormalizedPath -Path ([string]$candidate)
                 if (-not $normalized) { continue }
                 if (Test-WacIsWithinRoot -ChildPath $normalized -RootPath $DeploymentRoot) { return $true }
+            }
+
+            # UNRESOLVED is not "no reference". This asks a different question from ownership:
+            # Test-WacTaskIsOurs must be strict, because a task it accepts gets unregistered, but
+            # this decides whether FILES MAY BE DELETED, and there the safe answer to "I could not
+            # tell" is "keep them". An action that announces a PowerShell script - it carries
+            # -Command or -File - whose path this module could not decode is exactly that case: the
+            # payload may well name the deployment in a shape newer or older than anything here
+            # parses. Reporting $false would have turned "we do not understand this task" into
+            # proof that nothing reaches the tree, and deleted files a live task still runs.
+            #
+            # Narrow on purpose. It fires only when a script-bearing switch is present AND the path
+            # did not decode; an unrelated task with arguments like `/silent /install` names no
+            # script, so it still answers $false and ordinary uninstalls stay clean.
+            if (-not [string]::IsNullOrWhiteSpace($arguments) -and [string]::IsNullOrWhiteSpace([string]$scriptPath)) {
+                if ($arguments -match '(?i)(?:^|\s)-(?:Command|File)\b') { return $true }
             }
         }
     }
