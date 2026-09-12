@@ -55,7 +55,8 @@
     files stay on disk until the process holding them exits, and the next daily run removes them.
 
     Effectiveness model, which is what actually empties a live %TEMP%:
-      * read-only / hidden / system attributes are cleared and the delete retried;
+      * a read-only object is unlinked through the disposition that tolerates the attribute,
+        so nothing is left behind AND nothing shared with its other hard links is rewritten;
       * long paths get the \\?\ prefix so Windows PowerShell 5.1 can reach them at all;
       * directories are deleted deepest-first and retried once after the file sweep, because a
          directory that was non-empty on the first attempt is usually empty by the second.
@@ -165,9 +166,19 @@ function Clear-WacBlockingAttribute {
     .SYNOPSIS
         Strips ReadOnly/Hidden/System so a delete that failed on attributes can succeed.
     .DESCRIPTION
-        This is the single biggest reason a temp sweep leaves files behind: File.Delete throws
-        UnauthorizedAccessException on a read-only file, and the old code counted that as "skipped"
-        without ever trying to clear the attribute.
+        NOT FOR AN ALLOW-LISTED CLEANUP TARGET, and no longer used by one. Both calls here resolve
+        $LongPath from the volume root, which is a fresh, unbound resolution of a name any caller
+        that is defending against an ancestor swap has just spent a handle proving. The cleanup
+        path gave this up entirely: DeleteBoundLeaf tolerates the read-only attribute on the handle
+        it already proved, so it never needs the attribute changed at all.
+
+        What is left is the deployment tree (Remove-WacDeploymentEntry), whose paths sit under the
+        SYSTEM-owned protected deployment root rather than in a user-writable target, and which
+        deletes with File.Delete - an API that has no handle-bound form to move to. The one thing
+        that can be tightened without a containment proof is done below: a reparse point is refused
+        outright, because a write aimed at a link must never be allowed to land on its target.
+
+        A future caller over user-writable content must use the bound delete, not this.
     #>
     param([Parameter(Mandatory = $true)][string]$LongPath)
 
@@ -176,6 +187,10 @@ function Clear-WacBlockingAttribute {
         $blocking = [System.IO.FileAttributes]::ReadOnly -bor
                     [System.IO.FileAttributes]::Hidden -bor
                     [System.IO.FileAttributes]::System
+
+        # A link's attributes are not this tool's to change, and SetAttributes offers no documented
+        # no-follow form, so the target could be what actually gets written.
+        if (([int]$attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
 
         if (([int]$attributes -band [int]$blocking) -eq 0) { return $false }
 
@@ -200,6 +215,11 @@ function Remove-WacLeaf {
         on that handle, opens the leaf RELATIVE to it, and sets the disposition on the leaf handle.
         There is no second resolution of the name for an attacker to win. This paragraph used to
         describe the predecessor - verify, then delete by pathname - and outlived it.
+
+        It is one call and one attempt. There used to be two, because a read-only leaf came back
+        Denied and the second attempt followed a pathname attribute rewrite that nothing had
+        proved; the bound delete absorbs the read-only case itself now, so the retry has no work
+        left to do and the unbound window it opened is gone with it.
     #>
     [CmdletBinding()]
     param(
@@ -238,67 +258,74 @@ function Remove-WacLeaf {
     $longPath = Get-WacLongPath -Path $normalized
     $expected = $normalized
 
-    for ($attempt = 0; $attempt -lt 2; $attempt++) {
-        $win32 = 0
-        $ntStatus = 0
-        $code = Invoke-WacBoundDelete -LongPath $longPath -ExpectedFinalPath $expected `
-            -OpenReparsePoint:$IsReparsePoint -Win32Error ([ref]$win32) -NtStatus ([ref]$ntStatus)
+    $win32 = 0
+    $ntStatus = 0
+    $code = Invoke-WacBoundDelete -LongPath $longPath -ExpectedFinalPath $expected `
+        -OpenReparsePoint:$IsReparsePoint -Win32Error ([ref]$win32) -NtStatus ([ref]$ntStatus)
 
-        if ($code -eq 0) {
-            if ($IsReparsePoint) { $Stats.ReparsePointsDeleted++ }
-            elseif ($IsDirectory) { $Stats.DirectoriesDeleted++ }
-            else {
-                $Stats.FilesDeleted++
-                $Stats.BytesDeleted += $Length
-            }
-            return
+    if ($code -eq 0) {
+        if ($IsReparsePoint) { $Stats.ReparsePointsDeleted++ }
+        elseif ($IsDirectory) { $Stats.DirectoriesDeleted++ }
+        else {
+            $Stats.FilesDeleted++
+            $Stats.BytesDeleted += $Length
         }
+        return
+    }
 
-        $kind = Get-WacBoundDeleteKind -Code $code -Win32Error $win32 -NtStatus $ntStatus
+    $kind = Get-WacBoundDeleteKind -Code $code -Win32Error $win32 -NtStatus $ntStatus
 
-        if ($kind -eq 'NotFound') {
-            # Something else removed it first. That is the desired end state, not a failure.
-            $Stats.SkippedVanished++
-            return
-        }
+    if ($kind -eq 'NotFound') {
+        # Something else removed it first. That is the desired end state, not a failure.
+        $Stats.SkippedVanished++
+        return
+    }
 
-        if ($kind -eq 'Identity') {
-            # An object that simply disappeared between enumeration and deletion also fails to
-            # resolve, and that is the desired end state rather than a redirection attempt. Separate
-            # the two so an ordinary race is not reported - or exit-coded - as a security refusal.
-            if (Test-WacPathVanished -NormalizedPath $normalized) { $Stats.SkippedVanished++ }
-            else { $Stats.RefusedIdentity++ }
-            return
-        }
+    if ($kind -eq 'Identity') {
+        # An object that simply disappeared between enumeration and deletion also fails to
+        # resolve, and that is the desired end state rather than a redirection attempt. Separate
+        # the two so an ordinary race is not reported - or exit-coded - as a security refusal.
+        if (Test-WacPathVanished -NormalizedPath $normalized) { $Stats.SkippedVanished++ }
+        else { $Stats.RefusedIdentity++ }
+        return
+    }
 
-        if ($kind -eq 'Denied') {
-            if ($attempt -eq 0 -and (Clear-WacBlockingAttribute -LongPath $longPath)) { continue }
-            $Stats.SkippedDenied++
-            return
-        }
+    if ($kind -eq 'Denied') {
+        # Denied now only ever means the delete itself could not be performed on the handle that
+        # was proved - a DACL, or a volume that will not honour the read-only-tolerant disposition.
+        # The predecessor answered it by clearing ReadOnly/Hidden/System through the PATHNAME,
+        # after both proved handles had already closed, so an ancestor swapped in between
+        # redirected that WRITE onto a different object; and because attributes belong to the FILE
+        # rather than to the directory entry, doing it through an allow-listed hard link mutated
+        # the file under its outside names as well. DeleteBoundLeaf now retries the disposition
+        # itself with FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE on the handle it has already
+        # proved, so nothing here resolves the name a second time and no metadata is written at
+        # all. Whatever cannot be removed that way is left on disk and counted right here.
+        $Stats.SkippedDenied++
+        return
+    }
 
-        if ($kind -eq 'NotEmpty') {
-            # Children were locked or refused; the retry pass picks the directory up again.
+    if ($kind -eq 'NotEmpty') {
+        # Children were locked or refused; the retry pass picks the directory up again.
+        $Stats.SkippedNotEmpty++
+        return
+    }
+
+    if ($kind -eq 'Busy') {
+        # Open in another process. That used to be queued for deletion at the next boot; it is
+        # not any more - Session Manager resolves the stored NAME hours later, which nothing
+        # checked here can bind. See the module header. It stays until its owner exits.
+        if ($IsDirectory -and -not $IsReparsePoint) {
             $Stats.SkippedNotEmpty++
             return
         }
 
-        if ($kind -eq 'Busy') {
-            # Open in another process. That used to be queued for deletion at the next boot; it is
-            # not any more - Session Manager resolves the stored NAME hours later, which nothing
-            # checked here can bind. See the module header. It stays until its owner exits.
-            if ($IsDirectory -and -not $IsReparsePoint) {
-                $Stats.SkippedNotEmpty++
-                return
-            }
-
-            $Stats.SkippedLocked++
-            return
-        }
-
-        $Stats.Failed++
+        $Stats.SkippedLocked++
         return
     }
+
+    $Stats.Failed++
+    return
 }
 
 function Invoke-WacTreeSweep {
@@ -492,7 +519,13 @@ function Remove-WacTree {
     }
 
     if ($DeleteRoot) {
-        if ((Test-WacIsSafeTargetPath -Path $normalizedRoot) -and -not (Test-WacIsProtectedPath -Path $normalizedRoot)) {
+        # Both passes above can break out on expiry, so finishing the tree off here would be work
+        # done past the budget - and this is the one place where "it is almost done anyway" is most
+        # tempting to wave through. The root is a mutation like any other: it asks the clock first.
+        if (Test-WacDeadlineExpired) {
+            $stats.SkippedDeadline++
+        }
+        elseif ((Test-WacIsSafeTargetPath -Path $normalizedRoot) -and -not (Test-WacIsProtectedPath -Path $normalizedRoot)) {
             Remove-WacLeaf -Path $normalizedRoot -RootPath $normalizedRoot -Stats $stats -IsDirectory
         }
         else {
@@ -554,13 +587,23 @@ function Remove-WacFilesByPattern {
 
     Write-WacLog -Level DEBUG -Component 'FileSystem' -Message 'Cleaning pattern target.' -Data @{ category = $Category; path = $normalizedRoot; patterns = ($Pattern -join ',') }
 
+    # The matched-file loop is bounded exactly like the traversal, and for the same reason: one
+    # pattern over one never-cleaned directory can match more files than the rest of the run
+    # touches, and a check placed per PATTERN cannot see time pass inside a single one of them.
+    # Counting ENTRIES is what makes the bound real. Enumerating lazily rather than materialising
+    # GetFiles puts the enumeration itself inside that bound too, at the cost of the throw moving
+    # from the call into the loop - which is why the body now carries the same catch the sweep does.
+    $counter = 0
+    $expired = $false
+
     foreach ($singlePattern in $Pattern) {
+        if ($expired) { break }
         if (Test-WacDeadlineExpired) { $stats.SkippedDeadline++; break }
 
         $matched = $null
         try {
             $info = New-Object System.IO.DirectoryInfo((Get-WacLongPath -Path $normalizedRoot))
-            $matched = @($info.GetFiles($singlePattern))
+            $matched = $info.EnumerateFiles($singlePattern)
         }
         catch {
             $kind = Get-WacIoFailureKind -ErrorRecord $_
@@ -570,24 +613,39 @@ function Remove-WacFilesByPattern {
             continue
         }
 
-        foreach ($file in $matched) {
-            $filePath = Get-WacNormalizedPath -Path $file.FullName
-            if (-not $filePath) { $stats.SkippedOutOfRoot++; continue }
-            if (-not (Test-WacIsWithinRoot -ChildPath $filePath -RootPath $normalizedRoot)) {
-                $stats.RefusedOutOfRoot++
-                continue
-            }
+        try {
+            foreach ($file in $matched) {
+                if ((++$counter % $script:DeadlineCheckInterval) -eq 0 -and (Test-WacDeadlineExpired)) {
+                    $stats.SkippedDeadline++
+                    $expired = $true
+                    break
+                }
 
-            $attributes = 0
-            try { $attributes = [int]$file.Attributes } catch { $attributes = 0 }
-            if (($attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                Remove-WacLeaf -Path $filePath -RootPath $normalizedRoot -Stats $stats -IsReparsePoint
-                continue
-            }
+                $filePath = Get-WacNormalizedPath -Path $file.FullName
+                if (-not $filePath) { $stats.SkippedOutOfRoot++; continue }
+                if (-not (Test-WacIsWithinRoot -ChildPath $filePath -RootPath $normalizedRoot)) {
+                    $stats.RefusedOutOfRoot++
+                    continue
+                }
 
-            $length = 0L
-            try { $length = [int64]$file.Length } catch { $length = 0L }
-            Remove-WacLeaf -Path $filePath -RootPath $normalizedRoot -Stats $stats -Length $length
+                $attributes = 0
+                try { $attributes = [int]$file.Attributes } catch { $attributes = 0 }
+                if (($attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    Remove-WacLeaf -Path $filePath -RootPath $normalizedRoot -Stats $stats -IsReparsePoint
+                    continue
+                }
+
+                $length = 0L
+                try { $length = [int64]$file.Length } catch { $length = 0L }
+                Remove-WacLeaf -Path $filePath -RootPath $normalizedRoot -Stats $stats -Length $length
+            }
+        }
+        catch {
+            # Lazy enumeration can throw partway through the sequence, not only at creation.
+            $kind = Get-WacIoFailureKind -ErrorRecord $_
+            if ($kind -eq 'Denied') { $stats.SkippedDenied++ }
+            elseif ($kind -eq 'NotFound') { $stats.SkippedVanished++ }
+            else { $stats.Failed++ }
         }
     }
 

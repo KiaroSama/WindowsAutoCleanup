@@ -30,7 +30,34 @@ $script:RepoRoot = Split-Path -Parent $PSScriptRoot
 Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Core.psm1') `
     -Force -DisableNameChecking -ErrorAction Stop
 
-$script:CapturedXml = '<Task><RegistrationInfo><Description>the previous task</Description></RegistrationInfo></Task>'
+function Get-CapturedTaskXml {
+    <#
+    .SYNOPSIS
+        The definition the stub scheduler exports for the task an upgrade removes.
+    .DESCRIPTION
+        A real Export-ScheduledTask carries the ACTION, and the rollback proves the task it put back
+        is the one that was captured rather than merely a task registered under that name. A fixture
+        with no Exec element would exercise none of that, so this mirrors what the stub scheduler
+        hands back on the read-back: the canonical host, the argument builder's output and the
+        deployment root, all derived from the sandbox the scenario runs in.
+
+        One line, no newlines: the journal is line-based.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Sandbox)
+
+    $root = Join-Path -Path $Sandbox -ChildPath 'WindowsAutoCleanup'
+    $arguments = '-NoProfile -Command "& ''{0}'' -Scheduled"' -f (Join-Path -Path $root -ChildPath 'Run.ps1')
+
+    return ('<?xml version="1.0" encoding="UTF-16"?>' +
+        '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' +
+        '<RegistrationInfo><Description>the previous task</Description></RegistrationInfo>' +
+        '<Settings><Hidden>true</Hidden></Settings>' +
+        ('<Actions Context="Author"><Exec><Command>{0}</Command><Arguments>{1}</Arguments><WorkingDirectory>{2}</WorkingDirectory></Exec></Actions>' -f
+            'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+            [System.Security.SecurityElement]::Escape($arguments),
+            [System.Security.SecurityElement]::Escape($root)) +
+        '</Task>')
+}
 
 function Write-TestModule {
     param(
@@ -246,7 +273,7 @@ function Invoke-RollbackScenario {
     $psi.EnvironmentVariables['WAC_RB_CAPTURE'] = $Capture
     $psi.EnvironmentVariables['WAC_RB_REGISTER'] = $Register
     $psi.EnvironmentVariables['WAC_RB_BUDGET'] = ([string]$Budget)
-    $psi.EnvironmentVariables['WAC_RB_XML'] = $script:CapturedXml
+    $psi.EnvironmentVariables['WAC_RB_XML'] = (Get-CapturedTaskXml -Sandbox $Sandbox)
 
     $child = [System.Diagnostics.Process]::Start($psi)
     $exited = $false
@@ -302,7 +329,7 @@ Test-Case 'A registration that fails after the old task was removed restores BOT
         Assert-True (Test-JournalHas -Run $run -Pattern '^Restore-WacDeploymentPrevious$') ($run.Journal -join ' / ')
 
         # The exact definition that was captured, put back through the scheduler and read back.
-        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + $script:CapturedXml))) `
+        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + (Get-CapturedTaskXml -Sandbox $sandbox)))) `
             ($run.Journal -join ' / ')
         Assert-True ($run.Console -match 're-registered and verified') $run.Console
 
@@ -442,7 +469,7 @@ Test-Case 'A conflict phase that removed a task before it refused puts that task
         Assert-False $run.TimedOut 'the installer never finished inside its bound'
         Assert-Equal 1 $run.ExitCode $run.Console
         Assert-True (Test-JournalHas -Run $run -Pattern '^Remove-WacInstalledTask\|Unverified') ($run.Journal -join ' / ')
-        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + $script:CapturedXml))) `
+        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + (Get-CapturedTaskXml -Sandbox $sandbox)))) `
             ('the removed task was not put back: ' + ($run.Journal -join ' / '))
         Assert-False (Test-JournalHas -Run $run -Pattern '^Switch-WacDeploymentStage$') `
             ('a refused conflict phase still swapped the tree into place: ' + ($run.Journal -join ' / '))
@@ -499,7 +526,7 @@ Test-Case 'A budget that runs out after the swap rolls the tree and the task bac
             ('the task was registered with no budget left to read it back: ' + ($run.Journal -join ' / '))
         Assert-True (Test-JournalHas -Run $run -Pattern '^Restore-WacDeploymentPrevious$') `
             ('the live tree was left swapped after the budget expired: ' + ($run.Journal -join ' / '))
-        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + $script:CapturedXml))) `
+        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + (Get-CapturedTaskXml -Sandbox $sandbox)))) `
             ('the task the upgrade removed was not put back: ' + ($run.Journal -join ' / '))
         Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacDeploymentPrevious$') `
             ('the rollback point was discarded on a run that did not commit: ' + ($run.Journal -join ' / '))

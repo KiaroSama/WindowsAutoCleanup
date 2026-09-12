@@ -387,4 +387,180 @@ Test-Case 'a restore that silently did nothing is reported as failed, not restor
     }
 }
 
+# ---------------------------------------------------------------------------------------------
+# WAC-08: "exact" has to mean SET EQUALITY, not "nothing observed looked wrong"
+#
+# Walking the enumerated handlers alone can only ever prove the second. An expected handler that is
+# never enumerated appears in no observed record, so it can never be found wrong, and a profile
+# nobody proved reads back as exact - which is a cleanmgr /sagerun on every drive against a
+# selection this run cannot vouch for.
+# ---------------------------------------------------------------------------------------------
+
+function New-HandlerKey {
+    <#
+    .SYNOPSIS
+        A VolumeCaches-shaped scratch key holding exactly the handlers named, and no others.
+    .DESCRIPTION
+        CreateSubKey rather than New-Item, for the same reason New-ScratchVolumeCacheKey uses it:
+        the provider probes a parent by ENUMERATING it, and the two hosts create and delete their
+        own scratch roots under HKCU:\Software at the same time.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$KeyPath,
+        [AllowEmptyCollection()][string[]]$Handler = @()
+    )
+
+    $relative = $KeyPath -replace '^(?i)HKCU:\\', ''
+    $created = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($relative)
+    if ($null -eq $created) { throw ('the scratch key {0} could not be created' -f $KeyPath) }
+    $created.Close()
+
+    foreach ($name in $Handler) {
+        $child = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey(($relative + '\' + $name))
+        if ($null -eq $child) { throw ('the scratch key {0} could not be created' -f $name) }
+        $child.Close()
+    }
+
+    return $KeyPath
+}
+
+function Invoke-ProfileExact {
+    <#
+    .SYNOPSIS
+        Calls Test-WacDiskCleanupProfileExact inside the module's own scope.
+    .DESCRIPTION
+        The function is deliberately not exported: it is the step's internal proof, not part of the
+        step contract, and exporting it only to test it would widen the module's surface.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$KeyPath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected,
+        [int]$SageId = 9999
+    )
+
+    return (& $script:StepModule {
+        param($s, $e, $k)
+        Test-WacDiskCleanupProfileExact -SageId $s -Expected ([string[]]@($e)) -KeyPath $k
+    } $SageId (@($Expected)) $KeyPath)
+}
+
+Test-Case 'an expected handler that was never enumerated is not proven enabled' {
+    # The WAC-08 counterexample exactly: Expected={A} against an enumeration that returns only a
+    # correctly disabled B. Nothing observed is wrong, and the selection is still unproven.
+    $key = New-HandlerKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath 'Vanished') -Handler @('Thumbnail Cache')
+    try {
+        Add-ScratchStateFlagValue -KeyPath $key -Handler 'Thumbnail Cache' -ValueName 'StateFlags9999' `
+            -Kind ([Microsoft.Win32.RegistryValueKind]::DWord) -Value 0
+
+        $exact = Invoke-ProfileExact -KeyPath $key -Expected @('Temporary Files')
+
+        Assert-False $exact.Ok ('an unenumerated handler passed the exact check: {0}' -f $exact.Reason)
+        Assert-True (@($exact.Missing) -ccontains 'Temporary Files') ('missing: {0}' -f (@($exact.Missing) -join ','))
+        Assert-Equal 0 (@($exact.Enabled)).Count 'nothing was enabled, so nothing may be reported as enabled'
+        Assert-True ($exact.Reason -match 'did not read back as enabled') $exact.Reason
+    }
+    finally {
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'a non-empty selection against an EMPTY enumeration is not exact' {
+    # The degenerate form of the same defect: nothing at all comes back, so no handler can be found
+    # wrong, and a check that only subtracts in one direction has nothing to object to.
+    $key = New-HandlerKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath 'Empty')
+    try {
+        $exact = Invoke-ProfileExact -KeyPath $key -Expected @('Temporary Files', 'Thumbnail Cache')
+
+        Assert-False $exact.Ok ('an empty enumeration passed the exact check: {0}' -f $exact.Reason)
+        Assert-Equal 2 (@($exact.Missing)).Count ('missing: {0}' -f (@($exact.Missing) -join ','))
+    }
+    finally {
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'an unexpected value, kind or enabled handler still fails the exact check' {
+    # Controls for the other direction of the equality, which the one-sided walk already caught.
+    # They are here so the added subtraction cannot quietly replace them.
+    $scenario = @(
+        @{ Name = 'an unexpected handler left enabled'; Key = 'Unexpected'
+           Kind = [Microsoft.Win32.RegistryValueKind]::DWord; Value = 2; Wrong = 'Thumbnail Cache' },
+        @{ Name = 'a value that is neither 0 nor 2'; Key = 'OddValue'
+           Kind = [Microsoft.Win32.RegistryValueKind]::DWord; Value = 7; Wrong = 'Thumbnail Cache' },
+        @{ Name = 'the right number written as the wrong kind'; Key = 'WrongKind'
+           Kind = [Microsoft.Win32.RegistryValueKind]::String; Value = '0'; Wrong = 'Thumbnail Cache' }
+    )
+
+    try {
+        foreach ($entry in $scenario) {
+            $key = New-HandlerKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath $entry['Key']) `
+                -Handler @('Temporary Files', 'Thumbnail Cache')
+            Add-ScratchStateFlagValue -KeyPath $key -Handler 'Temporary Files' -ValueName 'StateFlags9999' `
+                -Kind ([Microsoft.Win32.RegistryValueKind]::DWord) -Value 2
+            Add-ScratchStateFlagValue -KeyPath $key -Handler 'Thumbnail Cache' -ValueName 'StateFlags9999' `
+                -Kind $entry['Kind'] -Value $entry['Value']
+
+            $exact = Invoke-ProfileExact -KeyPath $key -Expected @('Temporary Files')
+
+            Assert-False $exact.Ok ('{0}: passed the exact check' -f $entry['Name'])
+            Assert-True ($exact.Reason -match [regex]::Escape($entry['Wrong'])) ('{0}: {1}' -f $entry['Name'], $exact.Reason)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'a correct selection passes, empty or not' {
+    # The controls that stop the equality check from becoming a blanket refusal. A profile that IS
+    # exactly right has to read back as exactly right, including the case where nothing is selected.
+    try {
+        $key = New-HandlerKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath 'Correct') `
+            -Handler @('Temporary Files', 'Thumbnail Cache')
+        Add-ScratchStateFlagValue -KeyPath $key -Handler 'Temporary Files' -ValueName 'StateFlags9999' `
+            -Kind ([Microsoft.Win32.RegistryValueKind]::DWord) -Value 2
+        Add-ScratchStateFlagValue -KeyPath $key -Handler 'Thumbnail Cache' -ValueName 'StateFlags9999' `
+            -Kind ([Microsoft.Win32.RegistryValueKind]::DWord) -Value 0
+
+        $exact = Invoke-ProfileExact -KeyPath $key -Expected @('Temporary Files')
+        Assert-True $exact.Ok ('a correct selection was refused: {0}' -f $exact.Reason)
+        Assert-Equal 'Temporary Files' ((@($exact.Enabled)) -join ',')
+        Assert-Equal 0 (@($exact.Missing)).Count
+
+        $offKey = New-HandlerKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath 'AllOff') `
+            -Handler @('Temporary Files', 'Thumbnail Cache')
+        foreach ($handler in @('Temporary Files', 'Thumbnail Cache')) {
+            Add-ScratchStateFlagValue -KeyPath $offKey -Handler $handler -ValueName 'StateFlags9999' `
+                -Kind ([Microsoft.Win32.RegistryValueKind]::DWord) -Value 0
+        }
+
+        $none = Invoke-ProfileExact -KeyPath $offKey -Expected @()
+        Assert-True $none.Ok ('an all-off profile with nothing selected was refused: {0}' -f $none.Reason)
+        Assert-Equal 0 (@($none.Enabled)).Count
+    }
+    finally {
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'a handler missing from the rollback snapshot is refused, not written' {
+    # A handler that appeared after the snapshot has no recorded original, so a value written to it
+    # could not be put back. Refusing is counted as a failure, which is what stops the launch.
+    $key = New-HandlerKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath 'Appeared') `
+        -Handler @('Temporary Files', 'Thumbnail Cache')
+    try {
+        $enabled = Enable-WacDiskCleanupCategory -SageId 9999 -KeyPath $key `
+            -Category @('Temporary Files') -KnownHandler @('Temporary Files')
+
+        Assert-Equal 1 $enabled.Touched 'the snapshotted handler must still be written'
+        Assert-Equal 1 $enabled.Failed 'a handler with no recorded original was written anyway'
+        Assert-Equal 2 (Get-StateFlagValue -KeyPath $key -Handler 'Temporary Files' -ValueName 'StateFlags9999')
+        Assert-Equal $null (Get-StateFlagValue -KeyPath $key -Handler 'Thumbnail Cache' -ValueName 'StateFlags9999') `
+            'a borrowed profile value with no snapshot was mutated'
+    }
+    finally {
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Complete-TestRun

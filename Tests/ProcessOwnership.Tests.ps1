@@ -105,4 +105,71 @@ Test-Case 'probe cleanup still stops its owned child when output acquisition thr
     }
 }
 
+# ---------------------------------------------------------------------------------------------
+# WAC-04: an exception AFTER the process started must not claim it never ran
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'a failure after the tool started reports Started true and never fabricates termination' {
+    # One catch used to cover both sides of Process.Start, answering Started=$false and
+    # TerminationProven=$true for either. So a post-start fault - a failed output read, a failed
+    # wait, an unreadable exit code - reported that the tool never ran and that nothing was left
+    # alive, while the process could still be executing. Driver pruning reads Started to decide it
+    # may delete the backup directory and the pending marker, so that lie authorised discarding the
+    # only recovery copy of a package a destructive pnputil delete may already have removed.
+    #
+    # The fault is injected at the first log line INSIDE the timeout branch, which is reached only
+    # after a real child has started and outlived its bound. Nothing before Process.Start throws, so
+    # a red result here can only come from the post-start path.
+    $replace = {
+        param($Name, $Body)
+        & $script:CoreModule { param($n, $b) Set-Item -LiteralPath ('Function:script:' + $n) -Value $b } $Name $Body
+    }
+    $originalLog = & $script:CoreModule { (Get-Command Write-WacLog).ScriptBlock }
+
+    try {
+        & $replace 'Write-WacLog' {
+            param(
+                [Parameter(Mandatory = $true)][string]$Level,
+                [Parameter(Mandatory = $true)][string]$Component,
+                [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message,
+                [hashtable]$Data
+            )
+            # The shim has to accept the real signature so every caller still binds, but only
+            # $Message selects the injection point. Discarding the rest explicitly keeps the
+            # analyzer's unused-parameter rule satisfied without weakening the parameter list.
+            $null = $Level, $Component, $Data
+            if ($Message -like '*exceeded its deadline*') { throw 'injected post-start failure' }
+        }
+
+        $host51 = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $result = Invoke-WacProcess -FilePath $host51 `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 120') `
+            -TimeoutMs 1500 -Component 'Test'
+
+        Assert-True ([bool]$result.Started) `
+            'a tool that really started was reported as never started'
+        Assert-False ([bool]$result.TimedOut) `
+            'an unknown post-start outcome was reported as the deadline case it is not'
+        Assert-True ($result.PSObject.Properties.Name -ccontains 'TerminationProven') `
+            'the result dropped its termination claim entirely'
+        Assert-Equal $null $result.ExitCode 'an exit code was reported for a run whose result was never read'
+    }
+    finally {
+        & $replace 'Write-WacLog' $originalLog
+    }
+}
+
+Test-Case 'a genuine pre-start failure still reports Started false' {
+    # The control case. Without it the fix above could be "always say it started", which would be a
+    # different lie rather than a repair.
+    $missing = Join-Path -Path $env:TEMP -ChildPath ('wac-no-such-tool-' + [guid]::NewGuid().ToString('N') + '.exe')
+
+    $result = Invoke-WacProcess -FilePath $missing -ArgumentList @() -TimeoutMs 5000 -Component 'Test'
+
+    Assert-False ([bool]$result.Started) 'a tool that never started was reported as started'
+    Assert-True ([bool]$result.TerminationProven) `
+        'nothing was started, so there is nothing whose termination could be in doubt'
+    Assert-Equal $null $result.ExitCode 'an exit code was reported for a tool that never ran'
+}
+
 Complete-TestRun

@@ -106,6 +106,10 @@ public static class WacNative
     private const int  PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000;
     private const uint DELETE_ACCESS                = 0x00010000;
     private const int  FileDispositionInformation   = 13;
+    private const int  FileDispositionInformationEx = 64;
+    // FILE_DISPOSITION_DELETE | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE; see DeleteBoundLeaf.
+    private const uint DISPOSITION_DELETE_IGNORE_READONLY = 0x11;
+    private const int  STATUS_CANNOT_DELETE         = unchecked((int)0xC0000121);
 
     // The trusted-directory primitive. FILE_SHARE_READ_WRITE deliberately WITHHOLDS
     // FILE_SHARE_DELETE: while such a handle is open the object cannot be renamed or deleted by
@@ -160,6 +164,17 @@ public static class WacNative
     private static extern int NtSetInformationFile(
         SafeFileHandle FileHandle, out IO_STATUS_BLOCK IoStatusBlock,
         ref FILE_DISPOSITION_INFORMATION FileInformation, int Length, int FileInformationClass);
+
+    // The Windows 10 1809 form of the struct above, flags instead of a bare bool. Declared alongside
+    // rather than replacing it: the argument type differs and an ordinary delete still uses the
+    // original, so this is the same export under a second managed signature.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_DISPOSITION_INFORMATION_EX { public uint Flags; }
+
+    [DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile", ExactSpelling = true)]
+    private static extern int NtSetDispositionEx(
+        SafeFileHandle FileHandle, out IO_STATUS_BLOCK IoStatusBlock,
+        ref FILE_DISPOSITION_INFORMATION_EX FileInformation, int Length, int FileInformationClass);
 
     // Opening a leaf RELATIVE to a directory handle is the only way to stop an ancestor swap from
     // redirecting the open, and managed code cannot express it: every .NET open takes a path string,
@@ -643,7 +658,40 @@ public static class WacNative
                     leafHandle, out iosb, ref disposition,
                     Marshal.SizeOf(typeof(FILE_DISPOSITION_INFORMATION)), FileDispositionInformation);
 
-                if (ntStatus != 0) { return DELETE_DISPOSITION_FAILED; }
+                if (ntStatus == 0) { return DELETE_OK; }
+                if (ntStatus != STATUS_CANNOT_DELETE) { return DELETE_DISPOSITION_FAILED; }
+
+                // STATUS_CANNOT_DELETE on an already-proved handle means one thing:
+                // FILE_ATTRIBUTE_READONLY. The caller used to answer it by clearing ReadOnly,
+                // Hidden and System through the PATHNAME, which reopened the very race this
+                // function exists to close - both proved handles are shut by then, so an ancestor
+                // swapped in between redirected the attribute WRITE onto another object. It was
+                // also wrong on its own terms: attributes belong to the FILE, not to the directory
+                // entry, so clearing ReadOnly through an allow-listed HARD LINK changes that file
+                // under every other name it has, including names outside the allow-list.
+                //
+                // FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE removes both problems rather than
+                // narrowing them: the retry goes to the SAME proved handle, so there is still no
+                // second resolution of the name, and it unlinks the object without writing any
+                // metadata at all. THAT IS THE HARD-LINK POLICY - this tool removes the one
+                // directory entry it was pointed at and never mutates state shared with the file's
+                // other names. Measured: an allow-listed read-only hard link is unlinked and the
+                // outside name keeps its bytes AND its ReadOnly attribute.
+                //
+                // The class arrived in Windows 10 1809 / Server 2019 and a volume may decline it
+                // with STATUS_INVALID_PARAMETER or STATUS_NOT_SUPPORTED. STATUS_CANNOT_DELETE is
+                // then put back so the caller still classifies Denied and counts a skip: a
+                // read-only file left on disk, never an attribute rewritten outside a proved handle.
+                IO_STATUS_BLOCK ignoreReadOnlyBlock;
+                FILE_DISPOSITION_INFORMATION_EX ignoreReadOnly = new FILE_DISPOSITION_INFORMATION_EX();
+                ignoreReadOnly.Flags = DISPOSITION_DELETE_IGNORE_READONLY;
+
+                int ignoreStatus = NtSetDispositionEx(
+                    leafHandle, out ignoreReadOnlyBlock, ref ignoreReadOnly,
+                    Marshal.SizeOf(typeof(FILE_DISPOSITION_INFORMATION_EX)), FileDispositionInformationEx);
+                if (ignoreStatus != 0) { return DELETE_DISPOSITION_FAILED; }
+
+                ntStatus = 0;
                 return DELETE_OK;
             }
         }

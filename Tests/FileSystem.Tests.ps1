@@ -195,7 +195,10 @@ Test-Case 'Remove-WacFilesByPattern refuses a reparse-point root' {
 # Effectiveness (ledger U-1)
 # ---------------------------------------------------------------------------------------------
 
-Test-Case 'Remove-WacTree clears read-only, hidden and system attributes instead of skipping' {
+Test-Case 'Remove-WacTree removes read-only, hidden and system files instead of skipping them' {
+    # The outcome is what it always was; the mechanism is not. Nothing clears an attribute any more
+    # - the bound delete tolerates ReadOnly on the handle it has already proved - so this case says
+    # "removed", not "cleared". Hidden and System never blocked a delete in the first place.
     $sandbox = New-TestSandbox -Prefix 'fs-attr'
     try {
         $root = New-TestDirectory (Join-Path -Path $sandbox -ChildPath 'root')
@@ -216,6 +219,58 @@ Test-Case 'Remove-WacTree clears read-only, hidden and system attributes instead
         Assert-False ([System.IO.File]::Exists($system))
     }
     finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A read-only object is removed on every shape the sweep meets, target and all' {
+    <#
+        The read-only retry used to be a pathname attribute rewrite, so it was only ever written
+        against the plain file in the case above. The replacement is a disposition on the handle the
+        delete already proved, and it has to hold for every shape a real sweep meets: a LINK, whose
+        target must stay untouched, and a path past MAX_PATH, which Windows PowerShell 5.1 cannot
+        reach at all without the \\?\ form. Any of the three coming back skipDenied would mean the
+        tool leaves read-only rubbish behind - the effectiveness problem the old retry existed for.
+    #>
+    $sandbox = New-TestSandbox -Prefix 'fs-ro-shapes'
+    try {
+        $root = New-TestDirectory (Join-Path -Path $sandbox -ChildPath 'root')
+        $linkTarget = New-TestDirectory (Join-Path -Path $sandbox -ChildPath 'linktarget')
+        $keep = New-TestFile (Join-Path -Path $linkTarget -ChildPath 'keep.txt') -Content 'untouched'
+
+        $plain = New-TestFile (Join-Path -Path $root -ChildPath 'plain.tmp')
+        [System.IO.File]::SetAttributes($plain, [System.IO.FileAttributes]::ReadOnly)
+
+        # Measured on both hosts: SetAttributes through a junction marks the LINK, not its target,
+        # so this really is a read-only reparse leaf rather than a read-only directory elsewhere.
+        $link = New-TestJunction -Link (Join-Path -Path $root -ChildPath 'link') -Target $linkTarget
+        [System.IO.File]::SetAttributes(
+            $link, ([System.IO.File]::GetAttributes($link) -bor [System.IO.FileAttributes]::ReadOnly))
+
+        $deep = Join-Path -Path $root -ChildPath 'deep'
+        while ($deep.Length -lt 250) { $deep = Join-Path -Path $deep -ChildPath ('d' * 40) }
+        [void][System.IO.Directory]::CreateDirectory('\\?\' + $deep)
+        $long = Join-Path -Path $deep -ChildPath 'long.tmp'
+        [System.IO.File]::WriteAllText(('\\?\' + $long), 'x')
+        [System.IO.File]::SetAttributes(('\\?\' + $long), [System.IO.FileAttributes]::ReadOnly)
+        Assert-True ($long.Length -gt 260) ('the probe path is only {0} characters' -f $long.Length)
+
+        $result = Remove-WacTree -Category 'roshapes' -Path $root
+
+        Assert-Equal 2 ([int]$result.FilesDeleted) ('skipDenied=' + $result.SkippedDenied + ' failed=' + $result.Failed)
+        Assert-Equal 1 ([int]$result.ReparsePointsDeleted) 'the read-only link was not unlinked'
+        Assert-Equal 0 ([int]$result.SkippedDenied) 'a read-only object was left on disk'
+        Assert-Equal 0 ([int]$result.Refused) 'an ordinary read-only object is not a security refusal'
+        Assert-False ([System.IO.File]::Exists($plain)) 'a read-only file survived'
+        Assert-False ([System.IO.File]::Exists('\\?\' + $long)) 'a read-only >MAX_PATH file survived'
+        Assert-False (Test-Path -LiteralPath $link) 'the read-only link survived'
+        Assert-True ([System.IO.File]::Exists($keep)) 'the link was followed and its target emptied'
+    }
+    finally {
+        $planted = Join-Path -Path $sandbox -ChildPath 'root\link'
+        if (Test-Path -LiteralPath $planted) {
+            try { [System.IO.Directory]::Delete($planted, $false) } catch { $null = $_ }
+        }
         Remove-TestSandbox -Path $sandbox
     }
 }

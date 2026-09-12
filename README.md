@@ -136,6 +136,10 @@ iterating and run the full set before pushing.
   executable through `Get-Command` — `Tests/ShippedCodeBan.Tests.ps1`.
 - Every `Tests\*.Tests.ps1` file is discovered and must actually run — a CI guard compares the
   discovered set against the manifest the runner writes, so a suite cannot be silently skipped.
+  A run is identified by its suite path under `Tests\` **and** the host it ran on, and the entry is
+  written when the run finishes, carrying its status. So two suites sharing a name in different
+  subdirectories stay two entries rather than folding into one, one host cannot stand in for the
+  other, and a suite that was started and then vanished cannot certify itself as covered.
 
 ## Parameters
 

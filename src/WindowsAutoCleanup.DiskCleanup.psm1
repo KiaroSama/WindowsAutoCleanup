@@ -279,13 +279,21 @@ function Enable-WacDiskCleanupCategory {
 
         A write that fails is COUNTED, not merely logged: a half-written profile means cleanmgr
         would run against a selection nobody chose.
+    .PARAMETER KnownHandler
+        The handler names the caller already snapshotted for its rollback. A handler that appeared
+        between that snapshot and this write has no recorded original, so writing to it would leave
+        a borrowed-profile value that the restore cannot put back; such a handler is refused and
+        counted as a failure, which stops the launch instead of silently mutating it. An empty list
+        means no snapshot was taken, which is the direct unit-test shape and keeps the previous
+        unconditional behaviour.
     .OUTPUTS
         Touched (values actually written), Failed, and Enabled (the handler names switched on).
     #>
     param(
         [Parameter(Mandatory = $true)][ValidateRange(0, 9999)][int]$SageId,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Category,
-        [string]$KeyPath = $script:VolumeCacheKeyPath
+        [string]$KeyPath = $script:VolumeCacheKeyPath,
+        [AllowEmptyCollection()][string[]]$KnownHandler = @()
     )
 
     $valueName = 'StateFlags{0:0000}' -f $SageId
@@ -298,6 +306,14 @@ function Enable-WacDiskCleanupCategory {
     foreach ($name in $Category) {
         if ($script:DiskCleanupSkipHandler -contains $name) { continue }
         $requested[[string]$name] = $true
+    }
+
+    # $null rather than an empty hashtable, so "the caller passed no snapshot" stays distinguishable
+    # from "the caller snapshotted an empty key".
+    $known = $null
+    if ($KnownHandler.Count -gt 0) {
+        $known = @{}
+        foreach ($name in $KnownHandler) { $known[[string]$name] = $true }
     }
 
     $handlers = @()
@@ -314,6 +330,16 @@ function Enable-WacDiskCleanupCategory {
 
     foreach ($handler in $handlers) {
         $name = [string](Split-Path -Leaf $handler.Name)
+
+        if ($null -ne $known -and -not $known.ContainsKey($name)) {
+            # This handler did not exist when the rollback snapshot was taken, so its original value
+            # was never recorded and nothing here could put it back afterwards. Refusing to write it
+            # is counted as a failure, which is what keeps cleanmgr from being launched at all.
+            $failed++
+            Write-WacLog -Level WARNING -Component 'DiskCleanup' -Message 'A VolumeCaches handler appeared after the profile was snapshotted, so it was left untouched.' -Data @{ handler = $name }
+            continue
+        }
+
         $wanted = $requested.ContainsKey($name)
 
         $value = 0
@@ -347,8 +373,17 @@ function Test-WacDiskCleanupProfileExact {
         Enabled is DWORD 2 and nothing else. That is the only documented "run this handler" value,
         and disabled is DWORD 0. Missing values, wrong kinds and other numbers are not proof of an
         explicit selection, so they fail the read-back even for unrequested handlers.
+
+        The answer is SET EQUALITY, which needs both directions. Walking the enumerated handlers
+        alone only ever proves "nothing observed is wrong": an expected handler that was never
+        enumerated - because it disappeared between the write and this read, or because the whole
+        enumeration came back empty - is in no observed record, so it can never be found wrong and
+        an unproven profile reads back as exact. Every expected name is therefore also subtracted
+        from the observed-enabled set and reported as MISSING, so a selection is only exact when the
+        two sets are equal.
     .OUTPUTS
-        Ok, Reason and Enabled (the handler names found switched on).
+        Ok, Reason, Enabled (the handler names found switched on) and Missing (the expected handler
+        names that were not read back as enabled).
     #>
     param(
         [Parameter(Mandatory = $true)][ValidateRange(0, 9999)][int]$SageId,
@@ -357,18 +392,24 @@ function Test-WacDiskCleanupProfileExact {
     )
 
     $valueName = 'StateFlags{0:0000}' -f $SageId
-    $result = [PSCustomObject]@{ Ok = $false; Reason = ''; Enabled = @() }
+    $result = [PSCustomObject]@{ Ok = $false; Reason = ''; Enabled = @(); Missing = @() }
 
     $wanted = @{}
     foreach ($name in $Expected) { $wanted[[string]$name] = $true }
 
     $on = New-Object 'System.Collections.Generic.List[string]'
     $wrong = New-Object 'System.Collections.Generic.List[string]'
+    # A bare hashtable is case-insensitive, which is what the registry is, so this is the right
+    # lookup for subtracting the expected set from what was actually observed switched on.
+    $onLookup = @{}
 
     $handlers = @()
+    # -ErrorAction Stop is what makes this a COMPLETE enumeration or none at all: a subkey the
+    # provider cannot open would otherwise be a non-terminating error and a short list.
     try { $handlers = @(Get-ChildItem -LiteralPath $KeyPath -ErrorAction Stop) }
     catch {
         $result.Reason = 'the VolumeCaches key could not be read back ({0})' -f $_.Exception.Message
+        $result.Missing = @($Expected)
         return $result
     }
 
@@ -379,11 +420,15 @@ function Test-WacDiskCleanupProfileExact {
         try { $fact = Get-WacRegistryValueFact -KeyPath ([string]$handler.PSPath) -ValueName $valueName }
         catch {
             $result.Reason = 'the {0} value of {1} could not be read back ({2})' -f $valueName, $name, $_.Exception.Message
+            $result.Missing = @($Expected)
             return $result
         }
 
         $isOn = ((-not $fact.WasAbsent) -and $fact.Kind -eq [Microsoft.Win32.RegistryValueKind]::DWord -and ([int]$fact.Value) -eq 2)
-        if ($isOn) { [void]$on.Add($name) }
+        if ($isOn) {
+            [void]$on.Add($name)
+            $onLookup[$name] = $true
+        }
         $expectedValue = 0
         if ($wanted.ContainsKey($name)) { $expectedValue = 2 }
         if ($fact.WasAbsent -or $fact.Kind -ne [Microsoft.Win32.RegistryValueKind]::DWord -or ([int]$fact.Value) -ne $expectedValue) {
@@ -391,10 +436,25 @@ function Test-WacDiskCleanupProfileExact {
         }
     }
 
-    $result.Enabled = @($on.ToArray())
+    # The other direction of the equality: an expected handler nobody enumerated is not proven on.
+    $missing = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in $Expected) {
+        if (-not $onLookup.ContainsKey([string]$name)) { [void]$missing.Add([string]$name) }
+    }
 
+    $result.Enabled = @($on.ToArray())
+    $result.Missing = @($missing.ToArray())
+
+    $problem = New-Object 'System.Collections.Generic.List[string]'
+    if ($missing.Count -gt 0) {
+        [void]$problem.Add(('{0} expected handler(s) did not read back as enabled: {1}' -f $missing.Count, ((@($missing.ToArray()) | Sort-Object) -join ', ')))
+    }
     if ($wrong.Count -gt 0) {
-        $result.Reason = '{0} handler(s) do not match the requested selection: {1}' -f $wrong.Count, ((@($wrong.ToArray()) | Sort-Object) -join ', ')
+        [void]$problem.Add(('{0} handler(s) do not match the requested selection: {1}' -f $wrong.Count, ((@($wrong.ToArray()) | Sort-Object) -join ', ')))
+    }
+
+    if ($problem.Count -gt 0) {
+        $result.Reason = (@($problem.ToArray()) -join '; ')
         return $result
     }
 
@@ -417,13 +477,18 @@ function Invoke-WacLegacyDiskCleanup {
         someone else's cleanmgr profile gets destroyed.
 
         Between those two the profile is made EXACT rather than merely extended, and then read back
-        before cleanmgr is launched. A sage id is a number, not a reservation: the one this step
-        defaults to may already carry enabled values from somebody's earlier /sageset, and /sagerun
-        would run those categories too. Restoring the profile afterwards does not undo what they
-        deleted, so the selection has to be provably right BEFORE the launch. Allocating an unused
-        sage id instead was the documented alternative and is not what this does: it would still be
-        a guess about a number this code does not own, and the guess would have to be re-made on
-        every run, while making one id exact fixes every id a caller can pass.
+        before cleanmgr is launched. Exact means SET EQUALITY against a complete enumeration, not
+        "nothing observed looked wrong": a handler that vanishes between the write and the read-back
+        is a missing proof, not a pass, and a handler that appears after the snapshot is refused
+        outright because this run has no original for it to put back.
+
+        A sage id is a number, not a reservation: the one this step defaults to may already carry
+        enabled values from somebody's earlier /sageset, and /sagerun would run those categories
+        too. Restoring the profile afterwards does not undo what they deleted, so the selection has
+        to be provably right BEFORE the launch. Allocating an unused sage id instead was the
+        documented alternative and is not what this does: it would still be a guess about a number
+        this code does not own, and the guess would have to be re-made on every run, while making
+        one id exact fixes every id a caller can pass.
 
         Outcomes: an unreadable original value is a SafeSkip, because the step declines BEFORE
         mutating anything and the machine is left exactly as it was. Once state HAS been written, a
@@ -502,7 +567,11 @@ function Invoke-WacLegacyDiskCleanup {
             }
         }
         else {
-            $enabledResult = Enable-WacDiskCleanupCategory -SageId $SageId -Category $Category -KeyPath $keyPath
+            # The snapshot's handler names travel with the write. A handler that turned up after the
+            # snapshot has no recorded original, and writing to a borrowed profile value this run
+            # cannot put back is exactly what the rollback exists to prevent.
+            $enabledResult = Enable-WacDiskCleanupCategory -SageId $SageId -Category $Category -KeyPath $keyPath `
+                -KnownHandler @(@($snapshot) | ForEach-Object { [string]$_.Name })
             # Touched counts values actually written, so this is "did this run change anything",
             # not "did it intend to". Switching somebody else's leftover selection off counts too.
             $mutated = ($enabledResult.Touched -gt 0)

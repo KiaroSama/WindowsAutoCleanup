@@ -595,4 +595,79 @@ Test-Case 'an unverifiable profile is never launched, and a restore fault is rep
     }
 }
 
+Test-Case 'a selection the read-back cannot PROVE never reaches cleanmgr' {
+    # WAC-08 at the step. The write succeeds and reports the handlers it switched on; the read-back
+    # then does not see one of them - because it vanished between the two, or because the whole
+    # enumeration came back empty. A check that only walks what it observed finds nothing wrong in
+    # either case and /sagerun runs on every drive against a selection nobody proved.
+    $scenario = @(
+        @{ Name = 'an expected handler disappears between the write and the read-back'
+           Key = 'Vanished'; Mode = 'Drop'; Missing = 'Temporary Files' },
+        @{ Name = 'the read-back enumerates nothing at all'
+           Key = 'Blank'; Mode = 'Empty'; Missing = 'Thumbnail Cache' }
+    )
+    $handlerName = @('Temporary Files', 'Thumbnail Cache', 'Offline Pages Files', 'Not A Real Handler')
+    $originalKeyPath = Get-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath'
+
+    try {
+        foreach ($entry in $scenario) {
+            $key = New-ScratchVolumeCacheKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath $entry['Key'])
+            Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $key
+
+            $expected = @{}
+            foreach ($handler in $handlerName) {
+                $expected[$handler] = Get-StateFlagFact -KeyPath $key -Handler $handler -ValueName 'StateFlags9999'
+            }
+
+            # Call 1 is the snapshot and call 2 is the profile write, so both see the real key; only
+            # the read-back is disturbed. The counter lives in a hashtable because GetNewClosure
+            # captures variable VALUES: an incremented integer would only ever be incremented inside
+            # the closure's own copy, while a hashtable is a reference the assertion below can read.
+            $state = @{ Calls = 0 }
+            $mode = [string]$entry['Mode']
+            Set-ModuleFunctionBody -Module $script:StepModule -Name 'Get-ChildItem' -Body ({
+                param([Parameter(Mandatory = $true)][string]$LiteralPath)
+
+                $state.Calls++
+                $real = @(Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $LiteralPath -ErrorAction Stop)
+                if ($state.Calls -lt 3) { return $real }
+                if ($mode -eq 'Empty') { return @() }
+                return @($real | Where-Object { (Split-Path -Leaf $_.Name) -ne 'Temporary Files' })
+            }.GetNewClosure())
+
+            try {
+                Invoke-WithStubbedTool -StubToolPath -Body {
+                    $result = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999 -Category @('Temporary Files', 'Thumbnail Cache')
+
+                    Assert-Equal 0 $script:StubCall.Count ('{0}: cleanmgr ran against an unproven profile' -f $entry['Name'])
+                    Assert-Equal 'Incomplete' $result.Outcome ('{0}: {1}' -f $entry['Name'], $result.Detail)
+                    Assert-True $result.Failed ('{0} was reported as a clean run: {1}' -f $entry['Name'], $result.Detail)
+                    Assert-False $result.Skipped ('{0} was reported as a benign skip: {1}' -f $entry['Name'], $result.Detail)
+                    Assert-True ($result.Detail -match 'did not read back as the exact requested selection') ('{0}: {1}' -f $entry['Name'], $result.Detail)
+                    Assert-True ($result.Detail -match [regex]::Escape($entry['Missing'])) ('{0}: {1}' -f $entry['Name'], $result.Detail)
+
+                    # The profile really was written first, so the restoration asserted below is the
+                    # rollback of a real mutation and not an assertion over an untouched key.
+                    Assert-Equal 2 $script:BoundedCall.Count ('{0}: the step did not snapshot and restore' -f $entry['Name'])
+                    Assert-True $script:BoundedCall[1].IgnoreRunBudget ('{0}: the restore must run even after the budget expired' -f $entry['Name'])
+                }
+            }
+            finally {
+                Remove-ModuleFunction -Module $script:StepModule -Name 'Get-ChildItem'
+            }
+
+            Assert-True ($state.Calls -ge 3) ('{0}: the read-back never ran, so nothing was proved' -f $entry['Name'])
+            foreach ($handler in $handlerName) {
+                Assert-StateFlagFact -Expected $expected[$handler] `
+                    -Actual (Get-StateFlagFact -KeyPath $key -Handler $handler -ValueName 'StateFlags9999') `
+                    -Handler ('{0} after {1}' -f $handler, $entry['Name'])
+            }
+        }
+    }
+    finally {
+        Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $originalKeyPath
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Complete-TestRun
