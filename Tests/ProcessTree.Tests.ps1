@@ -174,9 +174,39 @@ Test-Case 'Stop-WacProcessTree terminates a hung parent AND its child' {
         Assert-False $child.HasExited 'the child was not running before the kill'
 
         $verdict = Stop-WacProcessTree -ProcessId $parent.Id -TimeoutMs 20000
-        Assert-True $verdict.Proven ('the tree kill reported failure: ' + $verdict.Reason)
+
+        # WHAT THIS CASE IS NAMED FOR COMES FIRST. Proven is a claim about the whole tree; these two
+        # are the claim in the title, and they are what tells the next reader WHICH failure they are
+        # looking at. Asserting Proven first cost exactly that: a hosted-runner failure on
+        # 2026-09-12 ("5 identity/identities in the tree could not be proven gone") aborted here and
+        # never reached them, so nothing recorded whether the kill had actually worked. Reordered,
+        # a survivor among OUR OWN processes fails loudly and unambiguously, and a poisoned verdict
+        # over identities that are not ours fails with the diagnostic below naming them.
         Assert-True ($parent.WaitForExit(15000)) 'the parent survived the tree kill'
         Assert-True ($child.WaitForExit(15000)) 'the child survived the tree kill'
+
+        if (-not $verdict.Proven) {
+            $detail = foreach ($identity in @($verdict.Survivor)) {
+                $processInfo = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f $identity) -ErrorAction SilentlyContinue
+                if ($processInfo) {
+                    [PSCustomObject]@{
+                        ProcessId = $identity; StillLive = $true; Name = $processInfo.Name
+                        ParentProcessId = $processInfo.ParentProcessId; CreationDate = $processInfo.CreationDate
+                        IsOurParent = ($identity -eq $parent.Id); IsOurChild = ($identity -eq $child.Id)
+                    }
+                }
+                else {
+                    [PSCustomObject]@{ ProcessId = $identity; StillLive = $false
+                        IsOurParent = ($identity -eq $parent.Id); IsOurChild = ($identity -eq $child.Id) }
+                }
+            }
+            Write-Host ('      termination diagnostic: ' + ([PSCustomObject]@{
+                        Reason = $verdict.Reason; Bound = @($verdict.Bound); Survivor = @($verdict.Survivor)
+                        OurParent = $parent.Id; OurChild = $child.Id; Survivors = @($detail)
+                    } | ConvertTo-Json -Depth 5 -Compress))
+        }
+
+        Assert-True $verdict.Proven ('the tree kill reported failure: ' + $verdict.Reason)
 
         # The child has to be an identity the kill BOUND, not one that happened to die with its
         # parent: a verdict that never saw it cannot have proved anything about it.
