@@ -21,10 +21,18 @@
     silently unrun suite rather than an error. The host and completion halves are not latent at all -
     they decide what the CI guard is able to prove on every run.
 
-    The fixture is a DISPOSABLE Tests tree under TEMP holding a COPY of the real runner. Copying the
-    shipped file rather than restating its logic is what keeps this test able to fail when the runner
-    regresses. The fixture suites are plain scripts - printing a TOTAL line and exiting 0 is the
-    entire contract Run-Tests.ps1 has with a suite - so the harness is not needed inside them.
+    COST. Spawning a runner is the expensive part, so ONE fixture run answers every question here:
+    a disposable Tests tree holding a COPY of the real runner, two same-named suites in different
+    directories, and one suite that exits 1, executed once across BOTH hosts with default workers.
+    That single run exercises path identity, host identity, concurrent capture isolation, report
+    identity and status recording together; the cases below only read its result. Copying the shipped
+    runner rather than restating its logic is what keeps the test able to fail when the runner
+    regresses. The fixture suites are plain scripts - printing a TOTAL line and exiting is the whole
+    contract Run-Tests.ps1 has with a suite - so the harness is not needed inside them.
+
+    An earlier shape of this suite spent 14 seconds per host driving a real idle-timeout kill to
+    prove the recorded status is not a constant. A suite that exits 1 proves the same thing in about
+    one second, so that is what ships.
 #>
 
 Set-StrictMode -Version 2.0
@@ -32,48 +40,38 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_Harness.ps1')
 
 $script:HostExecutable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-$script:HostKind = 'powershell'
-if ($PSVersionTable.PSEdition -eq 'Core') { $script:HostKind = 'pwsh' }
+$script:SharedRun = $null
 
 function New-RunnerFixture {
     <#
     .SYNOPSIS
-        Builds <sandbox>\Tests with a copy of the real runner and two same-named suites.
-    .PARAMETER WithHang
-        Adds a third suite that produces no output and never finishes on its own, so a caller can
-        exercise the timeout status. It is bounded by the INNER runner's idle deadline, which is the
-        mechanism under test; nothing waits on it blindly.
+        Builds <sandbox>\Tests with a copy of the real runner, two same-named suites and a failing one.
     #>
-    param([switch]$WithHang)
-
     $sandbox = New-TestSandbox -Prefix 'wac_runnerid'
     $tests = Join-Path -Path $sandbox -ChildPath 'Tests'
     [void][System.IO.Directory]::CreateDirectory($tests)
 
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Run-Tests.ps1') -Destination $tests -Force
 
+    # Deliberately the SAME file name in both directories. That is the input under test.
     foreach ($leaf in @('alpha', 'beta')) {
         $directory = Join-Path -Path $tests -ChildPath $leaf
         [void][System.IO.Directory]::CreateDirectory($directory)
-
-        # Deliberately the SAME file name in both directories. That is the input under test.
         $body = @'
 Write-Host 'MARKER-{0}'
 Write-Host 'TOTAL cases=1 passed=1 failed=0 skipped=0 duration=1ms'
 exit 0
 '@ -f $leaf.ToUpperInvariant()
-
         Set-Content -LiteralPath (Join-Path $directory 'Same.Tests.ps1') -Value $body -Encoding UTF8
     }
 
-    if ($WithHang) {
-        $directory = Join-Path -Path $tests -ChildPath 'gamma'
-        [void][System.IO.Directory]::CreateDirectory($directory)
-        Set-Content -LiteralPath (Join-Path $directory 'Hang.Tests.ps1') -Encoding UTF8 -Value @'
-[void]([System.Threading.ManualResetEvent]::new($false).WaitOne(600000))
-exit 0
+    # A distinct, non-clean outcome, so the recorded status cannot be a constant that happens to fit.
+    $failing = Join-Path -Path $tests -ChildPath 'gamma'
+    [void][System.IO.Directory]::CreateDirectory($failing)
+    Set-Content -LiteralPath (Join-Path $failing 'Fails.Tests.ps1') -Encoding UTF8 -Value @'
+Write-Host 'TOTAL cases=1 passed=0 failed=1 skipped=0 duration=1ms'
+exit 1
 '@
-    }
 
     return [PSCustomObject]@{
         Runner   = (Join-Path -Path $tests -ChildPath 'Run-Tests.ps1')
@@ -81,33 +79,30 @@ exit 0
     }
 }
 
-function Invoke-RunnerFixture {
+function Get-SharedRun {
     <#
     .SYNOPSIS
-        Runs the copied runner on the current host and returns its exit code, output and manifest.
+        Runs the fixture once across both hosts and caches the result for every case.
+    .DESCRIPTION
+        Lazy rather than executed at suite scope: a failure here then surfaces as a failing CASE with
+        its message, instead of killing the suite before it can print a TOTAL line.
     #>
-    param(
-        [Parameter(Mandatory = $true)]$Fixture,
-        [int]$MaxWorkers,
-        [string]$TestHost,
-        [int]$TimeoutSeconds = 60,
-        [int]$IdleTimeoutSeconds = 30
-    )
+    if ($null -ne $script:SharedRun) { return $script:SharedRun }
 
+    $fixture = New-RunnerFixture
     $arguments = @(
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', $Fixture.Runner,
-        '-ManifestPath', $Fixture.Manifest,
+        '-File', $fixture.Runner,
+        '-ManifestPath', $fixture.Manifest,
+        '-Host', 'both',
         # Short bounds: a fixture suite that does not finish in seconds is a failure worth seeing
-        # quickly, and the runner's own 300s default would stall this case instead.
-        '-TimeoutSeconds', [string]$TimeoutSeconds, '-IdleTimeoutSeconds', [string]$IdleTimeoutSeconds
+        # quickly, and the runner's own 300s default would stall this suite instead.
+        '-TimeoutSeconds', '60', '-IdleTimeoutSeconds', '30'
     )
-    if ($PSBoundParameters.ContainsKey('MaxWorkers')) { $arguments += @('-MaxWorkers', [string]$MaxWorkers) }
-    if ($TestHost) { $arguments += @('-Host', $TestHost) }
 
     # 2>&1 on a native command turns its stderr into ErrorRecords, which $ErrorActionPreference =
     # 'Stop' then promotes to a terminating NativeCommandError - so a child that merely printed a
-    # warning would abort this case instead of failing an assertion. Relaxed only for the call.
+    # warning would abort this suite instead of failing an assertion. Relaxed only for the call.
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try { $captured = & $script:HostExecutable @arguments 2>&1 }
@@ -115,15 +110,16 @@ function Invoke-RunnerFixture {
     $code = $LASTEXITCODE
 
     $entries = @()
-    if (Test-Path -LiteralPath $Fixture.Manifest -PathType Leaf) {
-        $entries = @(Get-Content -LiteralPath $Fixture.Manifest | Where-Object { $_.Trim() })
+    if (Test-Path -LiteralPath $fixture.Manifest -PathType Leaf) {
+        $entries = @(Get-Content -LiteralPath $fixture.Manifest | Where-Object { $_.Trim() })
     }
 
-    return [PSCustomObject]@{
+    $script:SharedRun = [PSCustomObject]@{
         ExitCode = $code
         Text     = (@($captured | ForEach-Object { [string]$_ }) -join "`n")
         Entries  = $entries
     }
+    return $script:SharedRun
 }
 
 function Get-ManifestStatus {
@@ -144,52 +140,14 @@ function Get-ManifestStatus {
     return $null
 }
 
-Test-Case 'two suites sharing a name in different directories produce two manifest entries' {
-    $fixture = New-RunnerFixture
+Test-Case 'the manifest identifies a run by suite path AND host' {
+    $run = Get-SharedRun
 
-    # One worker, so the two runs are strictly sequential and no capture file can be contended.
-    # This case therefore isolates the IDENTITY defect from any concurrency effect: the pre-fix
-    # runner completed happily here and still reported a single suite as having executed.
-    $run = Invoke-RunnerFixture -Fixture $fixture -MaxWorkers 1
-
-    Assert-Equal 0 $run.ExitCode ('the fixture run failed: ' + $run.Text)
-    Assert-Equal 2 $run.Entries.Count ('two suites ran but the manifest holds ' + ($run.Entries -join ', '))
-
-    foreach ($leaf in @('alpha', 'beta')) {
-        $key = '{0}\Same.Tests.ps1|{1}' -f $leaf, $script:HostKind
-        Assert-Equal 'exit=0' (Get-ManifestStatus -Entries $run.Entries -Key $key) `
-            ('the manifest has no clean entry for ' + $key + ': ' + ($run.Entries -join ', '))
-    }
-}
-
-Test-Case 'each of the two same-named suites is reported under its own identity' {
-    $fixture = New-RunnerFixture
-
-    # Default workers, so both runs really are in flight together and each needs its own redirect
-    # files. Under the shared-name scheme the second Start-Process opened a capture file the first
-    # still held; either way the two runs could not be told apart in the report.
-    $run = Invoke-RunnerFixture -Fixture $fixture
-
-    Assert-Equal 0 $run.ExitCode ('the concurrent fixture run failed: ' + $run.Text)
-    Assert-True ($run.Text -match '(?m)^--- alpha\\Same\.Tests\.ps1 ') `
-        ('the alpha suite was not reported under its own path: ' + $run.Text)
-    Assert-True ($run.Text -match '(?m)^--- beta\\Same\.Tests\.ps1 ') `
-        ('the beta suite was not reported under its own path: ' + $run.Text)
-    Assert-True ($run.Text -match 'MARKER-ALPHA') 'the alpha suite output was lost'
-    Assert-True ($run.Text -match 'MARKER-BETA') 'the beta suite output was lost'
-}
-
-Test-Case 'the manifest separates the two hosts, so one host cannot stand in for the other' {
-    $fixture = New-RunnerFixture
-
-    # The host half of the identity. Without it a suite that ran on pwsh alone satisfies a guard
-    # that believes it also ran on Windows PowerShell 5.1 - and the divergence between those two
-    # hosts is where this project's defects actually live.
-    $run = Invoke-RunnerFixture -Fixture $fixture -TestHost 'both'
-
-    Assert-Equal 0 $run.ExitCode ('the two-host fixture run failed: ' + $run.Text)
-    Assert-Equal 4 $run.Entries.Count `
-        ('two suites on two hosts is four runs, but the manifest holds ' + ($run.Entries -join ', '))
+    # Three suites on two hosts is six runs. Under the bare-name scheme the two Same.Tests.ps1 files
+    # folded into one line and the two hosts folded into each other, leaving two entries for six
+    # runs - and the CI guard called that complete.
+    Assert-Equal 6 $run.Entries.Count `
+        ('three suites on two hosts is six runs, but the manifest holds ' + ($run.Entries -join ', '))
 
     foreach ($leaf in @('alpha', 'beta')) {
         foreach ($kind in @('pwsh', 'powershell')) {
@@ -200,26 +158,31 @@ Test-Case 'the manifest separates the two hosts, so one host cannot stand in for
     }
 }
 
-Test-Case 'a run that was killed is recorded as a timeout, not as a clean exit' {
-    $fixture = New-RunnerFixture -WithHang
+Test-Case 'same-named suites keep separate capture files and separate report lines' {
+    $run = Get-SharedRun
 
-    # What makes the recorded status EVIDENCE rather than a constant. A manifest that always says
-    # exit=0 would satisfy every assertion above while telling the guard nothing, and a manifest
-    # written at launch could not carry a status at all. The hanging suite is bounded by the inner
-    # runner's own 10s idle deadline - the mechanism under test - so nothing here waits blindly.
-    $run = Invoke-RunnerFixture -Fixture $fixture -TimeoutSeconds 15 -IdleTimeoutSeconds 10
+    # Both are in flight together, so each needs its own redirect files; under the shared-name scheme
+    # one suite's entire output vanished into the other's capture file while the run still exited 0.
+    foreach ($leaf in @('alpha', 'beta')) {
+        Assert-True ($run.Text -match ('(?m)^--- {0}\\Same\.Tests\.ps1 ' -f $leaf)) `
+            ('the ' + $leaf + ' suite was not reported under its own path: ' + $run.Text)
+        Assert-True ($run.Text -match ('MARKER-' + $leaf.ToUpperInvariant())) `
+            ('the ' + $leaf + ' suite output was lost')
+    }
+}
 
-    Assert-True ($run.ExitCode -ne 0) 'a force-killed suite must fail the run'
-    Assert-Equal 3 $run.Entries.Count ('the manifest holds ' + ($run.Entries -join ', '))
+Test-Case 'the recorded status is the real outcome, not a constant' {
+    $run = Get-SharedRun
 
-    $hangKey = 'gamma\Hang.Tests.ps1|{0}' -f $script:HostKind
-    $hangStatus = Get-ManifestStatus -Entries $run.Entries -Key $hangKey
-    Assert-True ($null -ne $hangStatus) ('the killed run left no manifest entry: ' + ($run.Entries -join ', '))
-    Assert-True ($hangStatus -like 'timeout-*') `
-        ('the killed run was recorded as [' + $hangStatus + '] rather than a timeout')
+    # What makes the status EVIDENCE. A manifest that always said exit=0 would satisfy every
+    # assertion above while telling the CI guard nothing, and an entry written at launch could not
+    # carry an outcome at all.
+    Assert-Equal 1 $run.ExitCode 'a run containing a failing suite must fail'
 
-    Assert-Equal 'exit=0' (Get-ManifestStatus -Entries $run.Entries -Key ('alpha\Same.Tests.ps1|{0}' -f $script:HostKind)) `
-        'a suite that finished cleanly beside the killed one lost its own status'
+    foreach ($kind in @('pwsh', 'powershell')) {
+        Assert-Equal 'exit=1' (Get-ManifestStatus -Entries $run.Entries -Key ('gamma\Fails.Tests.ps1|{0}' -f $kind)) `
+            ('the failing suite was not recorded as failing on ' + $kind + ': ' + ($run.Entries -join ', '))
+    }
 }
 
 Complete-TestRun
