@@ -396,8 +396,25 @@ finally {
         }
     }
 
-    try { if (Test-Path -LiteralPath $workRoot) { Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction Stop } }
-    catch { Write-Host ('WARNING could not remove {0}: {1}' -f $workRoot, $_.Exception.Message) }
+    # The per-suite stdout/stderr captures live under $workRoot, and deleting them unconditionally
+    # destroyed the only record of a failure. A suite that went red inside a 104-run parallel pass
+    # left NOTHING behind saying which assertion, on which host, with what message - the run was
+    # simply unexplainable afterwards, which is exactly what happened once and could not be
+    # diagnosed. The brief's own CI rule says the same thing: preserve failure evidence instead of
+    # deleting the only captures.
+    #
+    # A clean run has nothing worth keeping, so it is still swept. A run with any non-zero suite
+    # result keeps its captures and prints where they are.
+    $keepEvidence = @($executed.ToArray() | Where-Object { $_ -notmatch '\|exit=0$' })
+    if ($keepEvidence.Count -gt 0) {
+        Write-Host ''
+        Write-Host ('EVIDENCE {0} run(s) did not exit 0; their captures are kept at {1}' -f $keepEvidence.Count, $workRoot)
+        foreach ($line in @($keepEvidence | Sort-Object -Unique)) { Write-Host ('  ! {0}' -f $line) }
+    }
+    else {
+        try { if (Test-Path -LiteralPath $workRoot) { Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction Stop } }
+        catch { Write-Host ('WARNING could not remove {0}: {1}' -f $workRoot, $_.Exception.Message) }
+    }
 }
 
 $failures = 0
