@@ -414,7 +414,10 @@ unlocked scratch files, so do not run it during work that depends on those files
 | Path | Purpose |
 | --- | --- |
 | `Run.ps1` | Entry point: parameters, elevation, single-instance lock, orchestration, exit codes. |
-| `src/WindowsAutoCleanup.Core.psm1` | Package entry point over `Native`, `Path`, `TrustedStore`, `Locations`, `RunState`, `Process`, `Environment` and `Trust`: the P/Invoke surface, path safety, pinned-handle directory creation, the fixed machine locations, the audit log and run budget, bounded execution, machine facts, and the owner/DACL rules. |
+| `src/WindowsAutoCleanup.Core.psm1` | Package entry point over `Native`, `Path`, `TrustedStore`, `Locations`, `Budget`, `RunState`, `Process`, `Environment` and `Trust`: the P/Invoke surface, path safety, pinned-handle directory creation, the fixed machine locations, the run deadline and recovery reserve, the audit log, bounded execution, machine facts, and the owner/DACL rules. |
+| `src/WindowsAutoCleanup.Budget.ps1` | The run's two time budgets: the deadline ordinary work is held to, and the single reserve that recovery work draws from after that deadline is gone, so a rollback still runs but twenty of them cannot add up to an unbounded shutdown. |
+| `src/WindowsAutoCleanup.OwnedProcess.ps1` | Ownership at creation: every external tool is launched suspended, bound to a kill-on-close Job Object before its first instruction, then resumed. Termination is one call over the whole tree, and "did everything this run started finish?" is answered from the job rather than from a process snapshot. |
+| `src/WindowsAutoCleanup.BoundedWork.ps1` | In-process work under a real wall-clock bound, in its own runspace - including the rule that a block declaring itself a mutator, once abandoned, stops every later mutation in the run. |
 | `src/WindowsAutoCleanup.FileSystem.psm1` | The single no-follow, reparse-safe, long-path-safe traversal, over the handle-bound delete in `BoundDelete`. |
 | `src/WindowsAutoCleanup.Targets.psm1` | The `C:`-only allow-list. |
 | `src/WindowsAutoCleanup.Steps.psm1` | Package entry point over `StepContract`, `RecycleBin` and `DiskCleanup`: the shared result vocabulary, DISM, Delivery Optimization, the Recycle Bin sweep and the opt-in cleanmgr step. |
