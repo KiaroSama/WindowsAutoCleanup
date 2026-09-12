@@ -311,6 +311,33 @@ function Get-NonSandboxCategory {
         if ($names.Contains($target.Category)) { continue }
         [void]$names.Add($target.Category)
     }
+
+    # The live set above is only what THIS process managed to materialise, and that is NOT the same
+    # set the child materialises. Measured in a Hyper-V guest: the harness enumerated 16 categories
+    # including 'Current user TEMP contents' but NOT 'User TEMP contents', because
+    # Get-WacUserProfilePath returned nothing here while it returned C:\Users\<name> in the child.
+    # The per-profile category was therefore absent from the deny-list, survived -SkipCategory, and
+    # the child swept the operator's REAL %USERPROFILE%\AppData\Local\Temp - outside the sandbox,
+    # on a machine the brief forbids running destructive cleanup against. Windows Sandbox had hidden
+    # it because no second profile path existed there.
+    #
+    # So the deny-list is built from what Targets.psm1 DECLARES, not from what one process happens
+    # to resolve. Reading the module's own table is deliberate: an environment-dependent enumeration
+    # is exactly what failed.
+    $module = Get-Module -Name 'WindowsAutoCleanup.Targets'
+    if (-not $module) {
+        throw 'the Targets module is not loaded, so the per-profile categories cannot be denied; refusing to build a partial skip list'
+    }
+    $declared = @(& $module { $script:UserCacheTarget } | ForEach-Object { [string]$_.Category })
+    if ($declared.Count -lt 1) {
+        throw 'the declared per-profile category table is empty or unreadable; refusing to build a partial skip list'
+    }
+    foreach ($name in $declared) {
+        if ($name -ieq $Keep) { continue }
+        if ($names.Contains($name)) { continue }
+        [void]$names.Add($name)
+    }
+
     return @($names.ToArray())
 }
 
