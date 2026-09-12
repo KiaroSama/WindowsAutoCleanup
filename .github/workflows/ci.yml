@@ -11,19 +11,35 @@ permissions:
 
 jobs:
   validate:
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
-    # No matrix. `shell:` is resolved BEFORE matrix expansion, so binding it to a matrix value is
-    # rejected outright with "Unrecognized named-value: 'matrix'" and the whole run fails before a
-    # single job starts. It was redundant anyway: Run-Tests.ps1 -Host both launches every suite as a
-    # child process under BOTH Windows PowerShell 5.1 and PowerShell 7 from one pwsh process, which
-    # is the same coverage in half the runner minutes.
+    strategy:
+      # Do not stop the other image when one fails: an OS-specific regression is exactly what a
+      # second baseline exists to show, and cancelling its sibling hides half the evidence.
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022]
+
+    # The matrix drives `runs-on` ONLY. `shell:` is resolved before matrix expansion, so binding
+    # THAT to a matrix value is rejected with "Unrecognized named-value: 'matrix'" and the run dies
+    # before a job starts - which is why an earlier attempt concluded a matrix was impossible here.
+    # It is not: `runs-on` expands normally, and the shell stays the literal `pwsh`.
+    #
+    # The two axes are different questions and both are needed. Run-Tests.ps1 -Host both already
+    # covers the two POWERSHELL hosts inside one job; this covers two WINDOWS baselines, where the
+    # differences that bite this project live - scheduler behaviour, cleanmgr handler sets, DISM and
+    # the shape of a profile.
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        # Pinned to the full commit SHA of v7: a tag is mutable, and this workflow runs with the
+        # repository token. persist-credentials:false because nothing here pushes - leaving the
+        # token in .git/config would hand it to every later step and to anything they execute.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         timeout-minutes: 5
+        with:
+          persist-credentials: false
 
       - name: Whitespace and conflict markers
         shell: pwsh
@@ -71,10 +87,41 @@ jobs:
           }
           Write-Host 'PSScriptAnalyzer is clean.'
 
+      - name: Record the environment this evidence belongs to
+        if: always()
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          # Evidence with no provenance is not evidence: a captured failure has to say which commit,
+          # image, architecture and host versions produced it, or it cannot be reproduced later.
+          $facts = [ordered]@{
+            commit          = $env:GITHUB_SHA
+            ref             = $env:GITHUB_REF
+            runId           = $env:GITHUB_RUN_ID
+            runAttempt      = $env:GITHUB_RUN_ATTEMPT
+            imageLabel      = '${{ matrix.os }}'
+            imageName       = $env:ImageOS
+            imageVersion    = $env:ImageVersion
+            osCaption       = (Get-CimInstance Win32_OperatingSystem).Caption
+            osBuild         = [string][Environment]::OSVersion.Version
+            architecture    = $env:PROCESSOR_ARCHITECTURE
+            pwshVersion     = [string]$PSVersionTable.PSVersion
+            windowsPsVersion = (& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')
+            analyzerVersion = '1.25.0'
+          }
+          $facts | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath "$env:RUNNER_TEMP\run-environment.json" -Encoding UTF8
+          Get-Content -LiteralPath "$env:RUNNER_TEMP\run-environment.json" | Write-Host
+
       - name: Tests on both PowerShell hosts
         shell: pwsh
         timeout-minutes: 20
-        run: .\Tests\Run-Tests.ps1 -Host both -ManifestPath "$env:RUNNER_TEMP\executed-suites.txt"
+        run: |
+          # Tee rather than plain output: the transcript is uploaded as an artifact on success AND
+          # on failure, because the runner's own log is the only other copy and a failed matrix leg
+          # is exactly when somebody needs the per-suite detail after the fact.
+          .\Tests\Run-Tests.ps1 -Host both -ManifestPath "$env:RUNNER_TEMP\executed-suites.txt" *>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\test-output.log"
+          exit $LASTEXITCODE
 
       - name: Guard - every discovered suite ran
         if: always()
@@ -130,4 +177,58 @@ jobs:
           $notClean = @($completed.GetEnumerator() | Where-Object { $_.Value -ne 'exit=0' } | ForEach-Object { '{0} ({1})' -f $_.Key, $_.Value })
           if ($notClean.Count -gt 0) { Write-Host ('Completed but not clean: {0}' -f ($notClean -join ', ')) }
 
-          Write-Host ('All {0} discovered suite(s) completed on all {1} host(s): {2} runs.' -f $discovered.Count, $hostKinds.Count, $completed.Count)
+          # A TOTAL line is not evidence on its own. A suite that declared no cases, or whose counts
+          # do not add up, or whose exit code disagrees with its own failure count, produced a green
+          # shape without proving anything - and the substring check that used to stand here
+          # accepted all three. The per-run totals are parsed and reconciled against the exit code.
+          $log = Join-Path $env:RUNNER_TEMP 'test-output.log'
+          if (-not (Test-Path -LiteralPath $log)) { Write-Host 'The test transcript is missing, so case totals cannot be checked.'; exit 1 }
+
+          $runs = @()
+          $currentExit = $null
+          foreach ($line in (Get-Content -LiteralPath $log)) {
+            $header = [regex]::Match($line, '^--- (?<suite>.+?) \[(?<host>.+?)\] exit=(?<exit>\d+)')
+            if ($header.Success) { $currentExit = [int]$header.Groups['exit'].Value; continue }
+            $total = [regex]::Match($line, 'TOTAL cases=(?<cases>\d+) passed=(?<passed>\d+) failed=(?<failed>\d+) skipped=(?<skipped>\d+)')
+            if (-not $total.Success -or $null -eq $currentExit) { continue }
+            $runs += [pscustomobject]@{
+              Cases   = [int]$total.Groups['cases'].Value
+              Passed  = [int]$total.Groups['passed'].Value
+              Failed  = [int]$total.Groups['failed'].Value
+              Skipped = [int]$total.Groups['skipped'].Value
+              Exit    = $currentExit
+            }
+            $currentExit = $null
+          }
+
+          if ($runs.Count -ne $completed.Count) {
+            Write-Host ('Parsed {0} TOTAL line(s) for {1} completed run(s); the transcript and the manifest disagree.' -f $runs.Count, $completed.Count)
+            exit 1
+          }
+          $empty = @($runs | Where-Object { $_.Cases -lt 1 })
+          if ($empty.Count -gt 0) { Write-Host ('{0} run(s) declared no cases at all.' -f $empty.Count); exit 1 }
+          $inconsistent = @($runs | Where-Object { ($_.Passed + $_.Failed + $_.Skipped) -ne $_.Cases })
+          if ($inconsistent.Count -gt 0) { Write-Host ('{0} run(s) have totals that do not add up.' -f $inconsistent.Count); exit 1 }
+          $lying = @($runs | Where-Object { ($_.Failed -gt 0 -and $_.Exit -eq 0) -or ($_.Failed -eq 0 -and $_.Skipped -eq 0 -and $_.Exit -ne 0) })
+          if ($lying.Count -gt 0) { Write-Host ('{0} run(s) have an exit code that disagrees with their own case counts.' -f $lying.Count); exit 1 }
+
+          $totalCases = ($runs | Measure-Object -Property Cases -Sum).Sum
+          Write-Host ('All {0} discovered suite(s) completed on all {1} host(s): {2} runs, {3} case executions, totals consistent with every exit code.' -f `
+            $discovered.Count, $hostKinds.Count, $completed.Count, $totalCases)
+
+      - name: Upload run evidence
+        # ALWAYS, not only on failure. A green run's manifest, transcript and environment record are
+        # what a later investigation compares a red one against; keeping them only when something
+        # broke means there is never a baseline to compare with.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        timeout-minutes: 5
+        with:
+          # Unique per matrix leg: two legs uploading the same name collide and one is lost.
+          name: run-evidence-${{ matrix.os }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/test-output.log
+            ${{ runner.temp }}/executed-suites.txt
+            ${{ runner.temp }}/run-environment.json
+          if-no-files-found: warn
+          retention-days: 14
