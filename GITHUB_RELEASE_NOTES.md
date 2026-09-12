@@ -38,9 +38,16 @@ refused. Losing that race produces a wrong **refusal**, never a wrong deletion.
   removal, rollback and uninstall rather than letting an unanswerable query look clean.
 - **An incomplete directory walk can no longer look like an empty one.** Deployment traversal reports
   its own completeness, and every decision that depends on it refuses to mutate when it is incomplete.
-- **A kill is only reported when it is proven.** Process-tree termination binds every identity it
-  finds and reports success only when all of them are known to have exited; the installer wrappers no
-  longer time out before the elevated child they started.
+- **A kill is only reported when it is proven, and the tool is owned before it runs.** Every external
+  tool is now created SUSPENDED and bound to a kill-on-close Job Object before its first instruction,
+  then resumed. Membership is decided at creation, so a grandchild stays accounted for even when the
+  process that started it has already exited - the case a process snapshot cannot answer, because a
+  snapshot shows only who is alive NOW. Stopping the tool is one call over the whole job, "did
+  everything this run started finish?" is read from the job rather than inferred, and if this process
+  dies the job's last handle closing takes the tree with it. When a job cannot be created the tool
+  still runs, the older handle-binding walk still proves what it can, and the result says plainly that
+  it was not owned rather than implying otherwise. The installer wrappers no longer time out before
+  the elevated child they started.
 - **Driver deletion and its backup are one commit.** A marker is written before `pnputil` is asked to
   remove anything and cleared only once the backup record is durable on disk, so an interrupted
   deletion can never leave an export that a later run mistakes for residue and reclaims.
@@ -198,8 +205,13 @@ before it was fixed.
   tree before checking the root meant terminating those strangers. Blocking work that never leaves the
   process — the Delivery Optimization cmdlets, WMI profile discovery, the registry snapshot, the
   Recycle Bin scan, building the allow-list — runs under its own bound too, because a call blocked
-  in the OS blocks every deadline check behind it. The default internal budget is 210 minutes, below
-  the task's 4-hour limit.
+  in the OS blocks every deadline check behind it. That bound now covers the PREPARATION as well:
+  opening a runspace and importing a module is charged to the same allowance, so a call can no longer
+  cost "setup plus its timeout", and a tool's watchdog is re-derived immediately before the launch
+  rather than when the step began. Work that must still run after the budget is gone — putting a
+  borrowed registry value back, undoing a half-finished swap — draws from ONE recovery reserve for
+  the whole run, so a rollback still gets time while twenty of them cannot add up to an unbounded
+  shutdown. The default internal budget is 210 minutes, below the task's 4-hour limit.
 - **Concurrent runs can no longer corrupt shared state.** ONE machine-wide mutex, shared by the
   cleanup runtime, the installer, the upgrade path and the uninstaller, guards every mutation, so a
   cleanup run can no longer race a deployment being replaced or removed. A run that cannot take it
