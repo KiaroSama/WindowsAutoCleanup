@@ -295,6 +295,16 @@ try {
                 -ArgumentList $argLine -WorkingDirectory $repoRoot -NoNewWindow -PassThru `
                 -RedirectStandardOutput $job.OutFile -RedirectStandardError $job.ErrFile
 
+            # Windows PowerShell 5.1's Start-Process -PassThru hands back a Process whose handle was
+            # never cached, and once the child is gone its ExitCode answers 0 for ANY real exit code.
+            # Measured on both shipped hosts with a child that exited 1: PowerShell 7 reported 1,
+            # Windows PowerShell 5.1 reported 0. So every FAILING suite read as a pass whenever this
+            # runner itself ran on 5.1, and the whole run exited 0 - a false green in the very thing
+            # that decides whether the tests passed. CI drives it with pwsh, which is the only reason
+            # it stayed hidden. Touching Handle caches it and makes ExitCode truthful; the installer
+            # and uninstaller already do exactly this for their elevated child.
+            try { $null = $job.Process.Handle } catch { $null = $_ }
+
             [void]$running.Add($job)
         }
 

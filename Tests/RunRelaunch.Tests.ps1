@@ -533,4 +533,54 @@ Test-Case 'The relaunch reports what happened: no trusted host and a refused ele
     Assert-Equal 7 (Invoke-WacElevatedRelaunch) 'the parent did not report the exit code its child produced'
 }
 
+Test-Case 'The child exit code is read through a cached handle, so 5.1 cannot report a failure as 0' {
+    # The stand-in above answers ExitCode from a plain property, so it passes whether or not the
+    # handle was ever cached. Real Windows PowerShell 5.1 does not: Start-Process -PassThru returns
+    # a Process whose handle was never cached, and once the child has gone ExitCode answers 0 for
+    # ANY real exit code. Measured on both shipped hosts with a child that exited 1 - PowerShell 7
+    # reported 1, 5.1 reported 0. Since this function hands the child's code back as the RUN's exit
+    # code, and the elevated child is a 5.1 host, a failed cleanup reported success to the scheduler.
+    # WaitForExit is not a substitute; the installer and uninstaller call it and still read Handle
+    # first. This case models that behaviour so the ordering is asserted rather than assumed.
+    function Write-WacLog {
+        param([string]$Level, [string]$Component, [string]$Message, [hashtable]$Data)
+        $null = $Level; $null = $Component; $null = $Message; $null = $Data
+    }
+    function Get-WacRunRelaunchArgument {
+        param([hashtable]$Bound)
+        $null = $Bound
+        return @('-NoProfile', '-Command', 'exit 0')
+    }
+    function Get-WacCanonicalPowerShellHost { return $script:HostExe }
+
+    $script:HandleWasCached = $false
+    $standIn = New-Object PSObject
+    Add-Member -InputObject $standIn -MemberType NoteProperty -Name 'Id' -Value 424244
+    Add-Member -InputObject $standIn -MemberType ScriptProperty -Name 'Handle' -Value {
+        $script:HandleWasCached = $true
+        return ([IntPtr]1)
+    }
+    Add-Member -InputObject $standIn -MemberType ScriptProperty -Name 'ExitCode' -Value {
+        if ($script:HandleWasCached) { return 5 }
+        return 0
+    }
+    Add-Member -InputObject $standIn -MemberType ScriptMethod -Name 'WaitForExit' -Value {
+        param([int]$Milliseconds)
+        $null = $Milliseconds
+        return $true
+    }
+
+    Set-Item -Path 'function:Start-Process' -Value {
+        [CmdletBinding()]
+        param([string]$FilePath, [string]$ArgumentList, [string]$Verb, [switch]$PassThru)
+        $null = $FilePath; $null = $ArgumentList; $null = $Verb; $null = $PassThru
+        return $standIn
+    }
+
+    $script:BudgetMinutes = 210
+    Assert-Equal 5 (Invoke-WacElevatedRelaunch) `
+        'the exit code was read without caching the handle first, so on 5.1 a failed elevated run reports 0'
+    Assert-True $script:HandleWasCached 'the handle was never cached'
+}
+
 Complete-TestRun

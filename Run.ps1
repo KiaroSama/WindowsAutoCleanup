@@ -386,6 +386,14 @@ function Invoke-WacElevatedRelaunch {
 
     if (-not $process) { return 4 }
 
+    # Windows PowerShell 5.1's Start-Process -PassThru returns a Process whose handle was never
+    # cached, and ExitCode then answers 0 for ANY real exit code once the child has gone. Measured
+    # on both shipped hosts with a child that exited 1: PowerShell 7 reported 1, 5.1 reported 0.
+    # This function's whole purpose is to hand the child's exit code back as the run's exit code, so
+    # without this a FAILED elevated cleanup reports success to the scheduler. WaitForExit below is
+    # not a substitute - the installer and uninstaller call it too and still cache the handle first.
+    try { $null = $process.Handle } catch { $null = $_ }
+
     # The child arms the SAME budget from its own start time, so waiting only for what the parent
     # has left would kill it seconds before it finished cleanly. Give the child its full budget plus
     # a small margin for process start-up.
