@@ -16,7 +16,11 @@
 
 $script:ProcessInvoker = $null
 
-# Proving a tree is dead is its own responsibility and its own file; see the header there.
+# Owning a tree from the instant it is created, and proving one is dead once it was not owned, are
+# two different jobs with two different mechanisms. Both are dot-sourced here because this file is
+# where the policy that uses them lives.
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.OwnedProcess.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.BoundedWork.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ProcessTree.ps1')
 
 # ---------------------------------------------------------------------------------------------
@@ -237,6 +241,29 @@ function Invoke-WacProcess {
         return [PSCustomObject]@{
             ExitCode = $null; TimedOut = $true; StandardOutput = ''; StandardError = ''
             DurationMs = 0; Started = $false; TerminationProven = $true; OutputComplete = $true
+            Owned = $false; OwnedTreeState = 'Complete'
+        }
+    }
+
+    # OWNERSHIP FIRST (ledger WAC-05R). A suspended native launch bound to a kill-on-close job before
+    # its first instruction is the only start that can answer "did everything this run created
+    # finish?" without enumerating anything. Everything below it is the fallback for the case where
+    # that is unavailable, and it says Owned=$false rather than pretending otherwise.
+    $launch = $null
+    try { $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList }
+    catch { $launch = $null }
+
+    if ($launch) {
+        Write-WacLog -Level DEBUG -Component $Component -Message 'Starting external tool in an owned job.' -Data @{
+            tool = $FilePath; pid = [int]$launch.ProcessId; timeoutMs = $TimeoutMs; owned = [bool]$launch.Owned
+        }
+        try {
+            return (Invoke-WacOwnedTool -Launch $launch -TimeoutMs $TimeoutMs -FilePath $FilePath -Component $Component)
+        }
+        finally {
+            # Closing the job handle is the kill-on-close backstop. It runs even when the block above
+            # threw, which is what makes an abandoned run safe rather than merely reported.
+            try { [WacOwnedProcess]::Close($launch) } catch { $null = $_ }
         }
     }
 
@@ -352,6 +379,9 @@ function Invoke-WacProcess {
             # Whether StandardOutput/StandardError are the tool's WHOLE output. A caller that parses
             # them must check this before believing an empty or short answer.
             OutputComplete = $outputComplete
+            # This tool was NOT owned from creation, so the verdict above rests on a best-effort
+            # snapshot walk rather than on a job. Reported, never hidden.
+            Owned = $false; OwnedTreeState = 'Unknown'
         }
     }
     catch {
@@ -373,6 +403,7 @@ function Invoke-WacProcess {
                 ExitCode = $null; TimedOut = $false; StandardOutput = ''; StandardError = [string]$_.Exception.Message
                 DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds; Started = $false
                 TerminationProven = $true; OutputComplete = $true
+                Owned = $false; OwnedTreeState = 'Complete'
             }
         }
 
@@ -407,201 +438,13 @@ function Invoke-WacProcess {
             TerminationProven = $terminationProven
             # The result was never known, so the output cannot be claimed complete either.
             OutputComplete = $false
+            Owned = $false; OwnedTreeState = 'Unknown'
         }
     }
     finally {
         # Dispose releases the WRAPPER. It has never terminated anything, so it is not cleanup for a
         # process this run started and may have lost track of - that is what the catch above does.
         if ($process) { try { $process.Dispose() } catch { $null = $_ } }
-    }
-}
-
-# ---------------------------------------------------------------------------------------------
-# Bounded in-process work
-# ---------------------------------------------------------------------------------------------
-
-function Invoke-WacBounded {
-    <#
-    .SYNOPSIS
-        Runs IN-PROCESS work under a real wall-clock bound and returns a shared-contract outcome.
-    .DESCRIPTION
-        The run budget used to cover only external tools and the traversal loop. Everything else -
-        the Delivery Optimization cmdlet, a CIM/WMI profile query, registry work, a Recycle Bin
-        scan, target construction, a deployment walk - runs inside this process, and a call that
-        blocks in the OS blocks every deadline check sitting behind it. A 210-minute budget can be
-        blown by one of them without a single clock read.
-
-        Cooperative checking cannot fix that, because the thread never comes back to check. So the
-        work runs in its own runspace and the caller waits on a handle: expiry is a real bound, not
-        a request. Measured cost of the runspace on BOTH shipped hosts: ~80 ms bare, ~100 ms with
-        this module imported into it. That is fine per PHASE and far too expensive per file - this
-        is for phase-level blocking calls, never for the traversal loop's inner steps.
-
-        Expiry is NOT success. The outcome is 'Incomplete', which the shared result contract maps to
-        exit code 6. An exhausted run budget also refuses to START the work, which is what "stop
-        scheduling new work" means; a bounded rollback that must still run after expiry passes
-        -IgnoreRunBudget and supplies its own explicit bound.
-
-        The pipeline holds exactly ONE AddScript, and that is not cosmetic. Arming strict mode as a
-        separate first statement was tried and had to be rejected on measured evidence:
-
-          * AddScript / AddStatement / AddScript turns a THROW inside the block into an ordinary
-            error-stream record instead of an exception out of EndInvoke, so a broken step reported
-            Succeeded;
-          * with a batched pipeline, abandoning a blocked runspace crashes the HOST at process exit
-            when the worker wakes into a closing runspace - measured on both hosts, pwsh exited
-            -532462766 (unhandled InvalidRunspaceStateException from BatchInvocationWorkItem) and
-            Windows PowerShell 5.1 exited 2. A single AddScript exits 0 in the same scenario.
-
-        Prefixing the block's own text is not an alternative either: a param() block has to be the
-        first statement in a script. So a bounded block runs WITHOUT strict mode, which is one more
-        reason to keep it down to the single blocking call and leave the logic outside.
-
-        A terminating error is Failed. A non-terminating one leaves Outcome Succeeded with
-        HadErrors set and Error populated - reported, never swallowed, and the caller decides.
-
-        ponytail: a runspace whose thread is stuck inside a blocking NATIVE call is abandoned rather
-        than aborted - PowerShell.Stop() cannot interrupt one and Thread.Abort does not exist on
-        .NET Core. Measured cost of one abandoned call: 2-3 threads until the process exits. That is
-        the right trade for a tool that runs once a day and then leaves; if a caller ever abandons
-        many, move that work to a child process and kill it with Stop-WacProcessTree instead.
-    .OUTPUTS
-        Outcome (Succeeded | Incomplete | Failed), Started, TimedOut, Output, HadErrors, Error,
-        DurationMs.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock,
-        [Parameter(Mandatory = $true)][int]$TimeoutMs,
-        [AllowEmptyCollection()][object[]]$ArgumentList = @(),
-        [AllowEmptyCollection()][string[]]$ImportModule = @(),
-        [string]$Component = 'Bounded',
-        [switch]$IgnoreRunBudget
-    )
-
-    $budgetMs = $TimeoutMs
-    if (-not $IgnoreRunBudget) { $budgetMs = Get-WacStepTimeoutMs -RequestedMs $TimeoutMs }
-
-    if ($budgetMs -le 0) {
-        Write-WacLog -Level WARNING -Component $Component -Message 'Run budget exhausted before the work could be scheduled.' -Data @{ requestedMs = $TimeoutMs }
-        return [PSCustomObject]@{
-            Outcome = 'Incomplete'; Started = $false; TimedOut = $true
-            Output = @(); HadErrors = $false
-            Error = 'The run budget expired before this work was scheduled.'
-            DurationMs = 0
-        }
-    }
-
-    $modules = New-Object 'System.Collections.Generic.List[string]'
-    if ($script:CoreModulePath) { [void]$modules.Add($script:CoreModulePath) }
-    foreach ($module in $ImportModule) {
-        if (-not [string]::IsNullOrWhiteSpace($module)) { [void]$modules.Add($module) }
-    }
-
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $runspace = $null
-    $shell = $null
-    $abandoned = $false
-
-    try {
-        $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
-        if ($modules.Count -gt 0) { $state.ImportPSModule([string[]]$modules.ToArray()) }
-
-        $runspace = [runspacefactory]::CreateRunspace($state)
-        $runspace.Open()
-
-        $shell = [powershell]::Create()
-        $shell.Runspace = $runspace
-        [void]$shell.AddScript($ScriptBlock.ToString())
-        foreach ($argument in $ArgumentList) { [void]$shell.AddArgument($argument) }
-
-        # The budget was measured before the runspace existed. Creating one, opening it and
-        # importing this module is SYNCHRONOUS and costs ~80-100 ms on both hosts - more on a cold
-        # or contended machine, and an arbitrary amount when a module's own top-level code blocks.
-        # Waiting the ORIGINAL budget after that makes this call's real upper bound "setup + budget"
-        # rather than "budget", which is precisely the accounting hole the run deadline exists to
-        # close. Charge the setup to the same budget and reclamp against the live deadline here,
-        # immediately before the work is scheduled, not at the top of the function.
-        $setupMs = [int]$watch.Elapsed.TotalMilliseconds
-        $waitMs = $budgetMs - $setupMs
-        if (-not $IgnoreRunBudget) { $waitMs = Get-WacStepTimeoutMs -RequestedMs $waitMs }
-
-        if ($waitMs -le 0) {
-            # Nothing has been invoked, so there is nothing to abandon: the runspace disposes
-            # normally in the finally block and the machine is untouched.
-            $watch.Stop()
-            Write-WacLog -Level WARNING -Component $Component -Message 'Preparation consumed the whole bound, so the work was never scheduled.' -Data @{ budgetMs = $budgetMs; setupMs = $setupMs }
-            return [PSCustomObject]@{
-                Outcome = 'Incomplete'; Started = $false; TimedOut = $true
-                Output = @(); HadErrors = $false
-                Error = ('Preparing the bounded work used {0} ms of its {1} ms bound, so nothing was started.' -f $setupMs, $budgetMs)
-                DurationMs = [int]$watch.Elapsed.TotalMilliseconds
-            }
-        }
-
-        $handle = $shell.BeginInvoke()
-
-        if (-not $handle.AsyncWaitHandle.WaitOne($waitMs)) {
-            $abandoned = $true
-            try { [void]$shell.BeginStop($null, $null) } catch { $null = $_ }
-            $watch.Stop()
-
-            Write-WacLog -Level WARNING -Component $Component -Message 'In-process work exceeded its bound and was abandoned.' -Data @{ budgetMs = $budgetMs; setupMs = $setupMs; waitMs = $waitMs }
-            return [PSCustomObject]@{
-                Outcome = 'Incomplete'; Started = $true; TimedOut = $true
-                Output = @(); HadErrors = $false
-                Error = ('The work did not finish within {0} ms.' -f $waitMs)
-                DurationMs = [int]$watch.Elapsed.TotalMilliseconds
-            }
-        }
-
-        $output = @()
-        $failure = $null
-        try {
-            $output = @($shell.EndInvoke($handle))
-        }
-        catch {
-            # A terminating error inside the block surfaces HERE, wrapped, not in the error stream.
-            $failure = [string]$_.Exception.Message
-        }
-
-        $errors = @()
-        try { $errors = @($shell.Streams.Error) } catch { $errors = @() }
-
-        $watch.Stop()
-        $outcome = 'Succeeded'
-        if ($failure) { $outcome = 'Failed' }
-
-        $errorText = $failure
-        if (-not $errorText -and $errors.Count -gt 0) {
-            $errorText = (@($errors | ForEach-Object { [string]$_ }) -join '; ')
-        }
-
-        return [PSCustomObject]@{
-            Outcome = $outcome; Started = $true; TimedOut = $false
-            Output = $output; HadErrors = ($errors.Count -gt 0)
-            Error = $errorText
-            DurationMs = [int]$watch.Elapsed.TotalMilliseconds
-        }
-    }
-    catch {
-        $watch.Stop()
-        Write-WacLog -Level WARNING -Component $Component -Message 'Bounded work could not be started.' -Data @{ error = $_.Exception.Message }
-        return [PSCustomObject]@{
-            Outcome = 'Failed'; Started = $false; TimedOut = $false
-            Output = @(); HadErrors = $true
-            Error = [string]$_.Exception.Message
-            DurationMs = [int]$watch.Elapsed.TotalMilliseconds
-        }
-    }
-    finally {
-        # Disposing either object waits for the pipeline, so an abandoned runspace must be left
-        # alone: cleaning it up here would reintroduce exactly the unbounded wait this function
-        # exists to prevent.
-        if (-not $abandoned) {
-            if ($shell) { try { $shell.Dispose() } catch { $null = $_ } }
-            if ($runspace) { try { $runspace.Dispose() } catch { $null = $_ } }
-        }
     }
 }
 

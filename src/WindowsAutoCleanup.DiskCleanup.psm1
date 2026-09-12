@@ -640,7 +640,7 @@ function Invoke-WacLegacyDiskCleanup {
         if ($mutated -and @($snapshot).Count -gt 0) {
             # -IgnoreRunBudget with its own explicit bound: the rollback still has to run when the
             # budget that stopped the work has already expired.
-            $restoreRun = Invoke-WacStepBounded -Component $component -TimeoutMs $script:VolumeCacheRegistryTimeoutMs -IgnoreRunBudget `
+            $restoreRun = Invoke-WacStepBounded -Component $component -TimeoutMs $script:VolumeCacheRegistryTimeoutMs -IgnoreRunBudget -Mutating `
                 -ArgumentList @(, $snapshot) -ScriptBlock {
                     param($Snapshot)
                     Restore-WacDiskCleanupStateFlag -Snapshot $Snapshot

@@ -37,6 +37,7 @@ $script:CoreModulePath      = $PSCommandPath
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Path.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TrustedStore.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Locations.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Budget.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.RunState.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Process.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Environment.ps1')
@@ -61,9 +62,13 @@ Export-ModuleMember -Function @(
     'Set-WacLogFallbackWriter', 'Set-WacLogWriter',
     'New-WacLogFile', 'Remove-WacOldLog',
     'Set-WacDeadline', 'Get-WacRemainingMs', 'Test-WacDeadlineExpired', 'Get-WacStepTimeoutMs',
+    'Reset-WacShutdownReserve', 'Get-WacShutdownReserveMs', 'Request-WacShutdownReserveMs',
+    'Reset-WacAbandonedMutator', 'Get-WacAbandonedMutatorCount', 'Test-WacMutationAllowed',
     'ConvertTo-WacCommandLineArgument', 'ConvertTo-WacCommandLine',
     'ConvertTo-WacPowerShellLiteral', 'Get-WacRelaunchCommand', 'Get-WacRelaunchArgument',
     'Stop-WacProcessTree', 'Set-WacProcessHandleOpener',
+    'Start-WacOwnedProcess', 'Get-WacOwnedTreeState', 'Set-WacOwnedProcessLauncher',
+    'Initialize-WacOwnedProcessNative',
     'Invoke-WacProcess', 'Set-WacProcessInvoker', 'Get-WacProcessInvoker', 'Invoke-WacBounded',
     'Enter-WacSingleInstance', 'Exit-WacSingleInstance',
     'Test-WacIsAdministrator', 'Test-WacIsWindowsServer', 'Test-WacSystemDriveSupported',
