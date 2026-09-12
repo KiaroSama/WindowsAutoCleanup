@@ -308,20 +308,35 @@ function Invoke-Exit2Scenario {
 
             $text = Get-SandboxLogText -Sandbox $sandbox
 
-            # Exactly one target may have been touched, and it must be the sandbox one: any other
-            # [Result] line would mean an allow-list entry outside the sandbox was cleaned for real.
+            # EVERY touched target must lie inside the sandbox: a [Result] line for a path outside it
+            # would mean an allow-list entry on the real machine was cleaned for real. That is the
+            # invariant; the count is not. This used to demand exactly one line, which is an
+            # assumption about the MACHINE rather than about containment - 'Defender cleanup files'
+            # has two entries (LocalCopy and Support, Targets.psm1), both built from %ProgramData%
+            # and therefore both redirected into the sandbox, so a guest where the second one exists
+            # legitimately completes two targets. Windows Sandbox happened to have only the first,
+            # and a Hyper-V guest failed the scenario on that difference alone while containment was
+            # intact. Checking every path is strictly stronger than counting lines and carries no
+            # environment assumption.
             $resultLines = @(Get-MatchingLine -Text $text -Needle '[Result] Target complete.')
-            if ($resultLines.Count -ne 1) {
-                [void]$problem.Add(('expected exactly one cleaned target, the log shows {0}' -f $resultLines.Count))
+            if ($resultLines.Count -lt 1) {
+                [void]$problem.Add('the log shows no cleaned target at all, so the sweep never ran')
             }
-            else {
-                [void]$evidence.Add($resultLines[0])
-                if ($resultLines[0].IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
-                    [void]$problem.Add(('the cleaned target was not the sandbox directory {0}' -f $target))
+            foreach ($line in $resultLines) {
+                [void]$evidence.Add($line)
+                if ($line.IndexOf($sandbox, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                    [void]$problem.Add(('a target outside the sandbox was cleaned for real: {0}' -f $line))
                 }
-                if (-not (Test-KeyValue -Line $resultLines[0] -Pair 'failed=1')) {
-                    [void]$problem.Add('the target result did not report exactly failed=1, so the locked directory never reached the Failed bucket')
-                }
+            }
+
+            # The bait target specifically: it is the one the locked subdirectory was planted in, so
+            # it is the one that proves the failure reached the Failed bucket rather than a skip.
+            $baitLines = @($resultLines | Where-Object { $_.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+            if ($baitLines.Count -ne 1) {
+                [void]$problem.Add(('expected exactly one result line for the sandbox bait directory {0}, got {1}' -f $target, $baitLines.Count))
+            }
+            elseif (-not (Test-KeyValue -Line $baitLines[0] -Pair 'failed=1')) {
+                [void]$problem.Add('the target result did not report exactly failed=1, so the locked directory never reached the Failed bucket')
             }
 
             # The totals line disambiguates: exactly failed=1 proves the exit 2 came from this
