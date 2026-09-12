@@ -324,7 +324,24 @@ function Invoke-Exit2Scenario {
             }
             foreach ($line in $resultLines) {
                 [void]$evidence.Add($line)
-                if ($line.IndexOf($sandbox, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                # A SUBSTRING test was wrong in both directions. It accepted a sibling - the sandbox
+                # `...\wac-exit2_ab12` is a substring of `...\wac-exit2_ab12-other`, so a target in
+                # a different directory whose name merely starts with the sandbox's passed - and it
+                # matched the sandbox path wherever it appeared in the line, including inside an
+                # unrelated field. The path is taken from the line's own `path=` field and compared
+                # with the shipped containment rule, which is prefix-safe at the separator.
+                $target = Get-ResultLinePath -Line $line
+                if ([string]::IsNullOrWhiteSpace($target)) {
+                    [void]$problem.Add(('a result line carries no readable path, so containment cannot be proven: {0}' -f $line))
+                    continue
+                }
+                $normalizedTarget = Get-WacNormalizedPath -Path $target
+                $normalizedSandbox = Get-WacNormalizedPath -Path $sandbox
+                if (-not $normalizedTarget -or -not $normalizedSandbox) {
+                    [void]$problem.Add(('a result path could not be normalised, so containment cannot be proven: {0}' -f $line))
+                    continue
+                }
+                if (-not (Test-WacIsWithinRoot -ChildPath $normalizedTarget -RootPath $normalizedSandbox)) {
                     [void]$problem.Add(('a target outside the sandbox was cleaned for real: {0}' -f $line))
                 }
             }

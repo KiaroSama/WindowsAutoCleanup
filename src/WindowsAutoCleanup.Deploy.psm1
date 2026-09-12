@@ -84,20 +84,66 @@ function Move-WacDeploymentSlot {
     [System.IO.Directory]::Move($From, $To)
 }
 
+function Save-WacDeploymentJournal {
+    <#
+    .SYNOPSIS
+        Writes the current stage of the in-flight swap to the durable record beside the slots.
+    .DESCRIPTION
+        The record carries what a LATER PROCESS needs and cannot otherwise obtain: which root is
+        being swapped, and the content identity of the tree that was at it before the first move.
+        Stage is evidence for a human reading the file; nothing branches on it, because a stage
+        update can itself be the write that never landed. What the recovery path branches on is the
+        pair of fingerprints, each re-checked against the bytes on disk.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Transaction,
+        [Parameter(Mandatory = $true)][string]$Stage
+    )
+
+    return (Write-WacDeploymentJournal -DeploymentRoot $Transaction.Root -Record ([PSCustomObject]@{
+        Schema = $script:DeploymentJournalSchema
+        ProjectId = $script:DeploymentProjectId
+        Root = $Transaction.Root
+        Previous = $Transaction.Previous
+        Stage = $Stage
+        StartedUtc = [string]$Transaction.StartedUtc
+        ProcessId = $PID
+        OriginalKind = [string]$Transaction.OriginalKind
+        OriginalVersion = [string]$Transaction.OriginalVersion
+        OriginalTampered = [bool]$Transaction.OriginalTampered
+        OriginalFingerprint = [string]$Transaction.OriginalFingerprint
+        OriginalFileCount = [int]$Transaction.OriginalFileCount
+        ReplacementManifestHash = [string]$Transaction.ReplacementManifestHash
+    }))
+}
+
 function Resolve-WacDeploymentRecoverySlot {
     <#
     .SYNOPSIS
         Reconciles a .previous slot an earlier run left behind, BEFORE a new stage would clear it.
     .DESCRIPTION
-        Clearing .previous unconditionally is safe only while it holds a superseded copy. An install
-        interrupted between the two moves, or a rollback that stopped half way, leaves the machine's
-        ONLY installation there - and clearing it to make room for another attempt threw that
-        original away.
+        Clearing .previous is safe only once the tree that replaced it is a COMMITTED, verified
+        deployment. "The root is ours" is not that test and never was (ledger WAC-02R): an empty
+        directory is deliberately adopted as ours, and so is a managed tree three of whose files no
+        longer match the manifest, so an interrupted or broken install could talk this into deleting
+        the last good copy on the machine.
 
-        The deployment root is the evidence. Nothing there: .previous is the original and it goes
-        back where it belongs. Our deployment there: .previous is the superseded copy and it goes.
-        Something there that cannot be proven ours: neither is touched and staging refuses, because
-        that is the one shape in which guessing can cost the operator both trees.
+        Four shapes, in this order:
+
+          * The root holds nothing of its own - absent, or the empty directory a half-finished move
+            leaves. The slot is the only installation left, so it goes back, once its provenance is
+            proven.
+          * The durable record shows a swap that never committed, and the live root still hashes to
+            the replacement that record names. An earlier PROCESS died between the swap and the
+            read-backs, so the rollback it could not finish is finished here: its replacement is
+            removed and the original put back.
+          * The root is a HEALTHY committed replacement and no record claims an unfinished swap.
+            Only now is the recovery copy genuinely superseded, and only now is it discarded.
+          * Anything else. Both trees are left exactly as found and staging refuses, because that is
+            the one shape in which guessing can cost the operator both of them.
+
+        Promotion is never a bare Directory.Move either: what comes out of the slot becomes what
+        SYSTEM executes, so it is proven ours and substantive first.
     .OUTPUTS
         Action (None, Restored or Discarded) and Reason.
     #>
@@ -105,31 +151,91 @@ function Resolve-WacDeploymentRecoverySlot {
 
     $result = [PSCustomObject]@{ Action = 'None'; Reason = 'There was no recovery slot to reconcile.' }
 
-    if (-not (Test-Path -LiteralPath $Slots.Previous -PathType Container)) { return $result }
+    if (-not (Test-Path -LiteralPath $Slots.Previous -PathType Container)) {
+        # A record describing a swap whose recovery slot is gone can only mislead the next run:
+        # there is nothing left to put back, so the transaction it describes is over either way.
+        [void](Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)
+        return $result
+    }
 
-    if (-not (Test-Path -LiteralPath $Slots.Root -PathType Container)) {
+    $journal = Read-WacDeploymentJournal -DeploymentRoot $Slots.Root
+    $previous = Test-WacRecoverySlotIsPromotable -Path $Slots.Previous
+    $live = Get-WacDeploymentOwnership -DeploymentRoot $Slots.Root
+
+    # The record is corroborated, never believed: the slot has to still hash to the inventory taken
+    # before that run's first move. A stale record, a record copied from another machine, or a slot
+    # something has since rewritten all fail here and fall through to the refusal.
+    $interrupted = $false
+    if ($journal -and $previous.Promotable) {
+        $inventory = Get-WacDeploymentFingerprint -DeploymentRoot $Slots.Previous
+        $interrupted = ($inventory.Complete -and
+            -not [string]::IsNullOrWhiteSpace([string]$journal.OriginalFingerprint) -and
+            [string]::Equals([string]$inventory.Fingerprint, [string]$journal.OriginalFingerprint, [System.StringComparison]::OrdinalIgnoreCase))
+    }
+
+    if ((-not $live.Exists) -or ($live.IsOurs -and $live.IsEmpty)) {
+        if (-not $previous.Promotable) {
+            throw ("A recovery slot from an earlier run is still present and could not be put back, so nothing was touched: {0} ({1})" -f $Slots.Previous, [string]$previous.Reason)
+        }
+
+        if ($live.Exists) {
+            $emptied = Remove-WacDeployment -Path $Slots.Root
+            if (-not $emptied.Removed) {
+                throw ("The empty directory at the deployment root could not be cleared, so the recovery slot was left where it is: {0} ({1})" -f $Slots.Root, [string]$emptied.Reason)
+            }
+        }
+
         Move-WacDeploymentSlot -From $Slots.Previous -To $Slots.Root
+        [void](Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)
         $result.Action = 'Restored'
-        $result.Reason = 'The deployment root was empty, so the recovery slot held the only installation on this machine and was put back.'
+        $result.Reason = 'The deployment root held nothing of its own, so the recovery slot held the only installation on this machine and was put back.'
         Write-WacLog -Level WARNING -Component 'Deploy' -Message 'An interrupted run left the only deployment in the recovery slot; it was restored before staging.' -Data @{
-            previous = $Slots.Previous; root = $Slots.Root
+            previous = $Slots.Previous; root = $Slots.Root; proof = [string]$previous.Reason
         }
         return $result
     }
 
-    $live = Get-WacDeploymentOwnership -DeploymentRoot $Slots.Root
+    $liveManifestHash = Get-WacDeploymentFileHash -Path (Get-WacDeploymentManifestPath -DeploymentRoot $Slots.Root)
+    $isRecordedReplacement = $interrupted -and
+        -not [string]::IsNullOrWhiteSpace([string]$journal.ReplacementManifestHash) -and
+        -not [string]::IsNullOrWhiteSpace([string]$liveManifestHash) -and
+        [string]::Equals([string]$liveManifestHash, [string]$journal.ReplacementManifestHash, [System.StringComparison]::OrdinalIgnoreCase)
+
+    if ($isRecordedReplacement) {
+        # Proven promotable BEFORE the delete, never after it: removing the replacement first and
+        # only then finding nothing may take its place is how a recovery leaves a machine bare.
+        $removed = Remove-WacDeployment -Path $Slots.Root
+        if (-not $removed.Removed) {
+            throw ("The unfinished install at the deployment root could not be removed, so the deployment it replaced was left in the recovery slot: {0} ({1})" -f $Slots.Root, [string]$removed.Reason)
+        }
+
+        Move-WacDeploymentSlot -From $Slots.Previous -To $Slots.Root
+        [void](Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)
+        $result.Action = 'Restored'
+        $result.Reason = 'An earlier run was interrupted after the swap and before it committed, so its replacement was discarded and the deployment it replaced was put back.'
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'An install interrupted before it committed was rolled back from its own durable record.' -Data @{
+            root = $Slots.Root; previous = $Slots.Previous; startedUtc = [string]$journal.StartedUtc; stage = [string]$journal.Stage
+        }
+        return $result
+    }
+
+    if ($live.IsHealthy -and -not $interrupted) {
+        $cleared = Remove-WacDeployment -Path $Slots.Previous
+        if (-not $cleared.Removed) {
+            throw ("A leftover deployment slot could not be cleared: {0} ({1})" -f $Slots.Previous, [string]$cleared.Reason)
+        }
+
+        [void](Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)
+        $result.Action = 'Discarded'
+        $result.Reason = 'The recovery slot held a superseded copy while a verified deployment of ours is live, so it was discarded.'
+        return $result
+    }
+
     if (-not $live.IsOurs) {
         throw ("A recovery slot from an earlier run is still present and what stands at the deployment root cannot be proven ours, so neither was touched: {0} ({1})" -f $Slots.Previous, [string]$live.Reason)
     }
 
-    $cleared = Remove-WacDeployment -Path $Slots.Previous
-    if (-not $cleared.Removed) {
-        throw ("A leftover deployment slot could not be cleared: {0} ({1})" -f $Slots.Previous, [string]$cleared.Reason)
-    }
-
-    $result.Action = 'Discarded'
-    $result.Reason = 'The recovery slot held a superseded copy while our deployment is live, so it was discarded.'
-    return $result
+    throw ("A recovery slot from an earlier run is still present and what stands at the deployment root is not a verified replacement for it, so neither was touched: {0} ({1})" -f $Slots.Previous, [string]$live.Reason)
 }
 
 function New-WacDeploymentStage {
@@ -238,10 +344,13 @@ function Switch-WacDeploymentStage {
     $transaction = [PSCustomObject]@{
         Root = $slots.Root
         Previous = $slots.Previous
+        StartedUtc = ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture))
         HadOriginal = [bool](Test-Path -LiteralPath $slots.Root -PathType Container)
         OriginalKind = $null
         OriginalVersion = $null
         OriginalTampered = $false
+        OriginalFingerprint = $null
+        OriginalFileCount = 0
         OriginalMovedAside = $false
         ReplacementLive = $false
         ReplacementManifestHash = $null
@@ -256,13 +365,34 @@ function Switch-WacDeploymentStage {
         $transaction.OriginalKind = [string]$original.Kind
         $transaction.OriginalVersion = [string]$original.Version
         $transaction.OriginalTampered = [bool]$original.Tampered
+
+        # And its CONTENT identity, which kind and version are not: two builds of 1.2.0 agree on
+        # both and each carries its own self-consistent manifest (ledger WAC-02R). Taken here
+        # because this is the last moment the original is at a path anything can name. Refusing on
+        # a tree that cannot be inventoried costs only the staged copy - nothing has moved yet -
+        # whereas swapping it out would leave a rollback with nothing to compare what it restores to.
+        $inventory = Get-WacDeploymentFingerprint -DeploymentRoot $slots.Root
+        if (-not $inventory.Complete) {
+            throw ("The deployment about to be replaced could not be inventoried, so a rollback could not prove what it put back: {0}" -f [string]$inventory.Reason)
+        }
+        $transaction.OriginalFingerprint = [string]$inventory.Fingerprint
+        $transaction.OriginalFileCount = [int]$inventory.FileCount
     }
 
     $script:DeploymentTransaction = $transaction
 
+    # Durable BEFORE the first move, and mandatory. A $script: record dies with its process, so a
+    # run killed mid-swap leaves the next one unable to tell an original from a replacement - and
+    # refusing here costs only the staged copy, because nothing has moved yet.
+    if (-not (Save-WacDeploymentJournal -Transaction $transaction -Stage 'Staged')) {
+        throw ("The deployment transaction could not be recorded, so the swap was not started: {0}" -f
+            [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root))
+    }
+
     if ($transaction.HadOriginal) {
         Move-WacDeploymentSlot -From $slots.Root -To $slots.Previous
         $transaction.OriginalMovedAside = $true
+        [void](Save-WacDeploymentJournal -Transaction $transaction -Stage 'OriginalMovedAside')
     }
 
     try {
@@ -273,6 +403,7 @@ function Switch-WacDeploymentStage {
         # its layout and its project id do not: the original carries all three. The manifest hashes
         # every staged file and the moment it was written, so it identifies one particular build.
         $transaction.ReplacementManifestHash = Get-WacDeploymentFileHash -Path (Get-WacDeploymentManifestPath -DeploymentRoot $slots.Root)
+        [void](Save-WacDeploymentJournal -Transaction $transaction -Stage 'ReplacementLive')
     }
     catch {
         # Captured before the nested catch below can rebind $_ in this same scope.
@@ -282,6 +413,10 @@ function Switch-WacDeploymentStage {
                 Move-WacDeploymentSlot -From $slots.Previous -To $slots.Root
                 $transaction.OriginalMovedAside = $false
                 $transaction.OriginalRestored = $true
+                # The original is back and the slot is empty, so there is no longer an unfinished
+                # swap for a later process to reconcile. A restore that FAILED keeps its record: it
+                # is the only thing that can tell that process which tree is which.
+                [void](Remove-WacDeploymentJournal -DeploymentRoot $slots.Root)
             }
             catch { Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'The previous deployment could not be restored.' -Data @{ previous = $slots.Previous; root = $slots.Root } }
         }
@@ -306,8 +441,10 @@ function Switch-WacDeploymentStage {
 
         # Without -KeepPrevious the caller has said it will not roll back, and the original has just
         # been discarded, so there is nothing left to restore. Forgetting the transaction is what
-        # stops a rollback that arrives anyway from deleting a live deployment it cannot replace.
+        # stops a rollback that arrives anyway from deleting a live deployment it cannot replace -
+        # and the durable record has to go with it, for the same reason and for the next process.
         $script:DeploymentTransaction = $null
+        [void](Remove-WacDeploymentJournal -DeploymentRoot $slots.Root)
     }
 
     # Throwing here is deliberate and the caller must be inside its rollback try: a deployment whose
@@ -422,6 +559,7 @@ function Restore-WacDeploymentPrevious {
 
     if (-not $transaction.ReplacementLive -and -not $transaction.OriginalMovedAside) {
         $transaction.OriginalRestored = $true
+        [void](Remove-WacDeploymentJournal -DeploymentRoot $transaction.Root)
         $result.Restored = $true
         $result.Reason = 'The switch failed before anything moved, so the deployment was never changed.'
         return $result
@@ -437,6 +575,7 @@ function Restore-WacDeploymentPrevious {
 
     if (-not $transaction.HadOriginal) {
         $transaction.OriginalRestored = $true
+        [void](Remove-WacDeploymentJournal -DeploymentRoot $transaction.Root)
         $result.Restored = $true
         $result.Reason = 'There was no previous deployment; the one this run installed was removed.'
         return $result
@@ -452,8 +591,11 @@ function Restore-WacDeploymentPrevious {
     }
 
     # Identity and content, not merely a directory at the right path. The tree that comes back has
-    # to read as the same KIND of deployment, carry the same version, and not have stopped matching
-    # its own manifest between the two moves.
+    # to read as the same KIND of deployment, carry the same version, not have stopped matching its
+    # own manifest between the two moves - and hash, file for file, to the inventory taken before
+    # the first move. The first three are kept ahead of the fourth because they say WHICH WAY a tree
+    # differs; the inventory is what catches the case none of them can, a different build of the
+    # same version whose own manifest agrees with it perfectly (ledger WAC-02R).
     $back = Get-WacDeploymentOwnership -DeploymentRoot $transaction.Root
     $transaction.OriginalRestored = $true
     if (-not [string]::Equals([string]$back.Kind, [string]$transaction.OriginalKind, [System.StringComparison]::Ordinal)) {
@@ -467,11 +609,24 @@ function Restore-WacDeploymentPrevious {
     elseif ($back.Tampered -and -not $transaction.OriginalTampered) {
         $transaction.RestoreVerdict = ('The tree put back at the deployment root no longer matches its own manifest: {0}' -f [string]$back.Reason)
     }
+    else {
+        $inventory = Get-WacDeploymentFingerprint -DeploymentRoot $transaction.Root
+        if (-not $inventory.Complete) {
+            $transaction.RestoreVerdict = ('The tree put back at the deployment root could not be inventoried, so it cannot be proven to be the one this run moved aside: {0}' -f [string]$inventory.Reason)
+        }
+        elseif (-not [string]::Equals([string]$inventory.Fingerprint, [string]$transaction.OriginalFingerprint, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $transaction.RestoreVerdict = ('The tree put back at the deployment root holds different files from the one this run moved aside ({0} file(s) against {1}).' -f
+                [int]$inventory.FileCount, [int]$transaction.OriginalFileCount)
+        }
+    }
 
     if ($transaction.RestoreVerdict) {
         $result.Reason = [string]$transaction.RestoreVerdict
         return $result
     }
+
+    # The swap is undone and proven undone, so the transaction is over for every later process too.
+    [void](Remove-WacDeploymentJournal -DeploymentRoot $transaction.Root)
 
     $result.Restored = $true
     $result.Reason = ('The previous deployment was restored and verified: {0}' -f [string]$back.Reason)
@@ -486,6 +641,12 @@ function Remove-WacDeploymentPrevious {
         This is the commit point, so the transaction ends here whether or not the old tree could be
         deleted. Leaving it recorded would let a rollback arriving afterwards delete the deployment
         this run has just proven good.
+
+        The caller reaches this only once the replacement verified, the task registered and every
+        read-back passed, which is what makes discarding the recovery copy safe at all - and the
+        durable record is ended FIRST. While that file exists a later run reads the swap as
+        unfinished, so a crash between the two deletions would leave the next install rolling back
+        an installation this one committed. The other order has no such failure.
     #>
     [CmdletBinding()]
     param()
@@ -495,13 +656,20 @@ function Remove-WacDeploymentPrevious {
 
     $script:DeploymentTransaction = $null
 
-    if (-not (Test-Path -LiteralPath $slots.Previous)) { return $true }
+    $ended = Remove-WacDeploymentJournal -DeploymentRoot $slots.Root
+    if (-not $ended) {
+        Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'This install is committed but its transaction record could not be deleted; a later run may read the committed swap as unfinished. Delete it by hand.' -Data @{
+            path = [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root)
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $slots.Previous)) { return $ended }
 
     $discarded = Remove-WacDeployment -Path $slots.Previous
     if (-not $discarded.Removed) {
         Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The previous deployment could not be deleted.' -Data @{ path = $slots.Previous; reason = [string]$discarded.Reason }
     }
-    return [bool]$discarded.Removed
+    return ([bool]$discarded.Removed -and $ended)
 }
 
 function Install-WacDeployment {
@@ -529,7 +697,8 @@ Export-ModuleMember -Function @(
     'Get-WacTaskName', 'Get-WacTaskFolder', 'Get-WacTaskSentinel', 'Get-WacTaskDescription',
     'Get-WacOperationLockName', 'Get-WacDeploymentVersion', 'Get-WacDeploymentProjectId',
     'Get-WacDeploymentManifestPath', 'New-WacDeploymentManifest', 'Read-WacDeploymentManifest',
-    'Get-WacDeploymentFileHash', 'Get-WacDeploymentOwnership',
+    'Get-WacDeploymentFileHash', 'Get-WacDeploymentOwnership', 'Get-WacDeploymentFingerprint',
+    'Get-WacDeploymentJournalPath',
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
     'New-WacDeploymentStage', 'Switch-WacDeploymentStage',

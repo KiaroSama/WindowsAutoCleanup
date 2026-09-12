@@ -1,0 +1,406 @@
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    What the deployment slots are allowed to throw away, and what a swap interrupted by the death of
+    its own process leaves for the next run to reconcile (ledger WAC-02R).
+
+.DESCRIPTION
+    DeploymentRollback.Tests.ps1 covers a rollback inside ONE process, driven by the transaction
+    that process recorded in memory. This suite covers the two things that record cannot answer:
+
+      * whether the tree standing at the deployment root is a HEALTHY, COMMITTED replacement, or
+        merely "ours" - an empty directory and a managed tree whose files no longer match its
+        manifest are both ours, and treating either as a replacement is what deleted the only good
+        copy the machine had left;
+      * what happens when the process that started the swap is gone. A $script: flag dies with it,
+        so the only evidence left is the directories and the durable record written beside them.
+
+    Nothing is stubbed. %ProgramFiles% is redirected into a disposable sandbox, real trees are built
+    through New-WacDeploymentStage, process death is simulated by discarding the module's in-memory
+    transaction while leaving the disk exactly as the dead process left it, and every assertion is
+    the SHA-256 of a file that was in the original - a recovery that deleted it cannot pass by
+    reporting the right words.
+#>
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+. (Join-Path -Path $PSScriptRoot -ChildPath '_Harness.ps1')
+
+$script:RepoRoot = Split-Path -Parent $PSScriptRoot
+Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Core.psm1') `
+    -Force -DisableNameChecking -ErrorAction Stop
+Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Deploy.psm1') `
+    -Force -DisableNameChecking -ErrorAction Stop
+
+. (Join-Path -Path $PSScriptRoot -ChildPath '_DeployFixtures.ps1')
+
+$script:DeployModule = Get-Module -Name 'WindowsAutoCleanup.Deploy'
+
+function Reset-RecoveryFixture {
+    & $script:DeployModule { $script:DeploymentTransaction = $null }
+}
+
+function Stop-FixtureProcess {
+    <#
+    .SYNOPSIS
+        Simulates the death of the process that started a swap: the in-memory transaction goes, the
+        disk stays exactly as it was.
+    .DESCRIPTION
+        This is the whole point of the durable record. A later run gets no $script: state from the
+        run before it, so everything it does has to come from what is on disk - and that is what
+        this fixture leaves behind.
+    #>
+    & $script:DeployModule { $script:DeploymentTransaction = $null }
+}
+
+function Install-FixtureDeployment {
+    param(
+        [Parameter(Mandatory = $true)][string]$Sandbox,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$RunContent
+    )
+
+    return (Install-WacDeployment -SourceRoot (New-TestCheckout -Path (Join-Path -Path $Sandbox -ChildPath $Name) -RunContent $RunContent))
+}
+
+function New-FixtureStage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Sandbox,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$RunContent
+    )
+
+    return (New-WacDeploymentStage -SourceRoot (New-TestCheckout -Path (Join-Path -Path $Sandbox -ChildPath $Name) -RunContent $RunContent))
+}
+
+function Get-SlotRunContent {
+    <#
+    .SYNOPSIS
+        The text of a slot's Run.ps1, or $null when there is none. What actually survived, rather
+        than whether a directory exists.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Slot)
+
+    $path = Join-Path -Path $Slot -ChildPath 'Run.ps1'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    return ([System.IO.File]::ReadAllText($path))
+}
+
+# ---------------------------------------------------------------------------------------------
+# "Ours" is not "a healthy replacement"
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'An EMPTY deployment root does not authorise deleting the only copy left in the recovery slot' {
+    # The exact shape a move interrupted half way leaves: an empty directory at the root, which
+    # ownership deliberately adopts as Unmanaged AND OURS so that a first install is not refused.
+    # That adoption used to be the whole test before .previous was cleared.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-empty-root' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+        $originalHash = Get-WacDeploymentFileHash -Path $live.RunScript
+        $slots = Get-WacDeploymentSlotPath
+
+        [System.IO.Directory]::Move($slots.Root, $slots.Previous)
+        [void][System.IO.Directory]::CreateDirectory($slots.Root)
+
+        $empty = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
+        Assert-True $empty.IsOurs 'the fixture no longer reproduces the adoption this case is about'
+        Assert-True $empty.IsEmpty 'the deployment root is not empty, so this is not the interrupted-move shape'
+        Assert-False $empty.IsHealthy 'an empty directory was reported as a healthy deployment'
+
+        $stage = New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2'
+        Assert-True (Test-Path -LiteralPath $stage.StagingRoot -PathType Container)
+
+        # Restored, not merely spared: the empty directory held nothing, so putting the original
+        # back is the only outcome that leaves the machine with an installation.
+        Assert-Equal '# original v1' (Get-SlotRunContent -Slot $slots.Root) 'the only deployment left on the machine was destroyed to make room for a new attempt'
+        Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path $live.RunScript) 'the recovered deployment is not the one that was orphaned'
+        Assert-False (Test-Path -LiteralPath $slots.Previous) 'the recovery slot was left behind after it was reconciled'
+    }
+}
+
+Test-Case 'A TAMPERED deployment root does not authorise deleting the recovery slot either' {
+    # Ownership reports tampering rather than refusing on it, so a managed tree three of whose files
+    # were overwritten is still "ours". It is not, however, a replacement anything verified, and
+    # nothing about it says the copy in the recovery slot is superseded.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-tampered-root' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+        $originalHash = Get-WacDeploymentFileHash -Path $live.RunScript
+        $slots = Get-WacDeploymentSlotPath
+
+        [System.IO.Directory]::Move($slots.Root, $slots.Previous)
+        Copy-WacDeploymentTree -Source $slots.Previous -Destination $slots.Root
+        [System.IO.File]::WriteAllText((Join-Path -Path $slots.Root -ChildPath 'Run.ps1'), '# half-written')
+
+        $broken = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
+        Assert-True $broken.IsOurs 'the fixture no longer reproduces the adoption this case is about'
+        Assert-True $broken.Tampered 'the tree at the deployment root still matches its manifest'
+        Assert-False $broken.IsHealthy 'a tree that stopped matching its own manifest was reported healthy'
+
+        Assert-Throws { New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2' } `
+            'not a verified replacement' 'staging discarded the recovery slot on the strength of a broken deployment'
+
+        Assert-Equal '# original v1' (Get-SlotRunContent -Slot $slots.Previous) 'the good copy in the recovery slot was deleted'
+        Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path (Join-Path -Path $slots.Previous -ChildPath 'Run.ps1'))
+        Assert-Equal '# half-written' (Get-SlotRunContent -Slot $slots.Root) 'the refusal changed what stands at the deployment root'
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# What comes OUT of the recovery slot becomes what SYSTEM executes
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'A recovery slot that cannot be proven ours is never promoted onto the deployment root' {
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-foreign-previous' -Body {
+        param($sandbox)
+
+        # Read only inside the Assert-Throws block below, which static analysis cannot see into.
+        $null = $sandbox
+        $slots = Get-WacDeploymentSlotPath
+        [void][System.IO.Directory]::CreateDirectory($slots.Previous)
+        [System.IO.File]::WriteAllText((Join-Path -Path $slots.Previous -ChildPath 'someone-elses-product.exe'), 'x')
+
+        Assert-Throws { New-FixtureStage -Sandbox $sandbox -Name 'v1' -RunContent '# first install' } `
+            'could not be put back' 'a tree nothing could prove ours was moved onto the deployment root'
+
+        Assert-False (Test-Path -LiteralPath $slots.Root) 'somebody else''s directory was installed as the deployment'
+        Assert-True (Test-Path -LiteralPath (Join-Path -Path $slots.Previous -ChildPath 'someone-elses-product.exe') -PathType Leaf) `
+            'the refusal touched the directory it refused'
+    }
+}
+
+Test-Case 'A recovery slot that is a reparse point is never promoted onto the deployment root' {
+    # Test-Path -PathType Container answers TRUE for a junction, so the promotion used to move the
+    # LINK into place and hand SYSTEM whatever it points at.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-link-previous' -Body {
+        param($sandbox)
+
+        $slots = Get-WacDeploymentSlotPath
+        $elsewhere = Join-Path -Path $sandbox -ChildPath 'elsewhere'
+        [void][System.IO.Directory]::CreateDirectory($elsewhere)
+        [System.IO.File]::WriteAllText((Join-Path -Path $elsewhere -ChildPath 'Run.ps1'), '# whatever the link points at')
+        [void](New-TestJunction -Link $slots.Previous -Target $elsewhere)
+
+        Assert-Throws { New-FixtureStage -Sandbox $sandbox -Name 'v1' -RunContent '# first install' } `
+            'could not be put back' 'a reparse point was promoted onto the deployment root'
+
+        Assert-False (Test-Path -LiteralPath $slots.Root) 'the deployment root now stands for whatever the link points at'
+        Assert-Equal '# whatever the link points at' (Get-SlotRunContent -Slot $elsewhere) 'the junction target was written through'
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The rollback proves WHICH BUILD came back, not merely that one did
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'A rollback refuses a DIFFERENT build that shares the version it moved aside' {
+    # Kind, version and "matches its own manifest" all agree between two builds of 1.2.0, so the
+    # rollback reported a tree it had never seen as the one it had moved aside. Only an inventory
+    # taken from the bytes before the first move tells them apart.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-same-version' -Body {
+        param($sandbox)
+
+        [void](Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1')
+        $slots = Get-WacDeploymentSlotPath
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+
+        # A different build of the same version replaces the contents of the recovery slot, manifest
+        # and all, so it is internally consistent in every way the old check could see.
+        [System.IO.File]::WriteAllText((Join-Path -Path $slots.Previous -ChildPath 'Run.ps1'), '# a different build of 1.2.0')
+        [void](New-WacDeploymentManifest -StagingRoot $slots.Previous)
+
+        $swapped = Get-WacDeploymentOwnership -DeploymentRoot $slots.Previous
+        Assert-Equal 'Managed' $swapped.Kind ([string]$swapped.Reason)
+        Assert-False $swapped.Tampered 'the fixture is not a self-consistent build, so the old check would have caught it anyway'
+        Assert-Equal (Get-WacDeploymentVersion) ([string]$swapped.Version) 'the fixture does not share the version it must be told apart by'
+
+        $restored = Restore-WacDeploymentPrevious
+        Assert-False $restored.Restored 'a build this run never moved aside was reported as the one it put back'
+        Assert-True ([string]$restored.Reason -match 'different files') ([string]$restored.Reason)
+
+        # Reported, not destroyed: whatever it is, it is what the operator has.
+        Assert-Equal '# a different build of 1.2.0' (Get-SlotRunContent -Slot $slots.Root) 'the refusal deleted the tree it could not identify'
+    }
+}
+
+Test-Case 'A rollback still accepts the tree it really did move aside' {
+    # The other half of the case above: the inventory must not make a correct rollback fail.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-same-build' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+        $originalHash = Get-WacDeploymentFileHash -Path $live.RunScript
+        $slots = Get-WacDeploymentSlotPath
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+
+        $restored = Restore-WacDeploymentPrevious
+        Assert-True $restored.Restored ([string]$restored.Reason)
+        Assert-Equal '# original v1' (Get-SlotRunContent -Slot $slots.Root)
+        Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path $live.RunScript)
+        Assert-False (Test-Path -LiteralPath (Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root)) `
+            'a completed rollback left its transaction record on disk for the next run to act on'
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The process that started the swap is gone
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'An install killed after the swap and before it committed is rolled back by the next run' {
+    # The dangerous shape: the root holds a replacement that verifies perfectly against its own
+    # manifest, so "is the live tree ours and healthy" answers yes - while the task read-backs that
+    # would have made it a committed installation never ran. Nothing in the directories says which
+    # of the two trees the machine last trusted; the durable record does.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-death-after-swap' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+        $originalHash = Get-WacDeploymentFileHash -Path $live.RunScript
+        $slots = Get-WacDeploymentSlotPath
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+        Assert-Equal '# replacement v2' (Get-SlotRunContent -Slot $slots.Root) 'the fixture did not reach the state this case is about'
+        Assert-True (Test-Path -LiteralPath (Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root) -PathType Leaf) `
+            'the swap left no durable record, so a later process has nothing to reconcile from'
+
+        Stop-FixtureProcess
+
+        $stage = New-FixtureStage -Sandbox $sandbox -Name 'v3' -RunContent '# replacement v3'
+        Assert-True (Test-Path -LiteralPath $stage.StagingRoot -PathType Container)
+
+        Assert-Equal '# original v1' (Get-SlotRunContent -Slot $slots.Root) 'the uncommitted install was kept and the deployment it replaced was deleted'
+        Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path $live.RunScript) 'the tree put back is not the one that was moved aside'
+        Assert-False (Test-Path -LiteralPath $slots.Previous) 'the recovery slot was left behind after it was reconciled'
+        Assert-False (Test-Path -LiteralPath (Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root)) `
+            'the reconciled transaction record was left on disk'
+
+        # And the run carries on from a known state: the recovered tree is the one moved aside next.
+        $switched = Switch-WacDeploymentStage -KeepPrevious
+        Assert-True $switched.PreviousKept 'the recovered deployment was not treated as a previous tree'
+        Assert-Equal '# replacement v3' (Get-SlotRunContent -Slot $slots.Root)
+        Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path (Join-Path -Path $slots.Previous -ChildPath 'Run.ps1'))
+    }
+}
+
+Test-Case 'An install killed between the two moves is put back by the next run, provenance first' {
+    # Death with the original in the recovery slot and nothing at the root at all.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-death-between' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+        $originalHash = Get-WacDeploymentFileHash -Path $live.RunScript
+        $slots = Get-WacDeploymentSlotPath
+
+        # The move that puts the original aside, and nothing after it - the disk state a process
+        # killed between its two moves leaves behind.
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        [System.IO.Directory]::Move($slots.Root, $slots.Previous)
+        [void](Remove-WacDeployment -Path $slots.Staging)
+        Stop-FixtureProcess
+
+        Assert-False (Test-Path -LiteralPath $slots.Root) 'the fixture did not reach the state this case is about'
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v3' -RunContent '# replacement v3')
+
+        Assert-Equal '# original v1' (Get-SlotRunContent -Slot $slots.Root) 'the only deployment left on the machine was not put back'
+        Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path $live.RunScript)
+        Assert-False (Test-Path -LiteralPath $slots.Previous) 'the recovery slot was left behind after it was reconciled'
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The steady states this must not break
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'Two clean installs in a row leave no recovery slot and no transaction record' {
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-reinstall' -Body {
+        param($sandbox)
+
+        $slots = Get-WacDeploymentSlotPath
+        $journal = Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root
+
+        foreach ($pass in @(1, 2)) {
+            [void](New-FixtureStage -Sandbox $sandbox -Name ('pass{0}' -f $pass) -RunContent ('# build {0}' -f $pass))
+            [void](Switch-WacDeploymentStage -KeepPrevious)
+            Assert-True (Remove-WacDeploymentPrevious) ('the commit of pass {0} did not complete' -f $pass)
+
+            Assert-Equal ('# build {0}' -f $pass) (Get-SlotRunContent -Slot $slots.Root)
+            Assert-False (Test-Path -LiteralPath $slots.Previous) ('pass {0} left a recovery slot behind' -f $pass)
+            Assert-False (Test-Path -LiteralPath $slots.Staging) ('pass {0} left a staging slot behind' -f $pass)
+            Assert-False (Test-Path -LiteralPath $journal) ('pass {0} left its transaction record on disk' -f $pass)
+
+            $ownership = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
+            Assert-True $ownership.IsHealthy ([string]$ownership.Reason)
+        }
+    }
+}
+
+Test-Case 'A committed install still discards the copy it superseded' {
+    # The legitimate discard, kept: a recovery slot beside a live, verified deployment of ours and
+    # no record of an unfinished swap is a superseded copy, and preserving it forever would leave a
+    # second tree in %ProgramFiles% after every upgrade.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-supersede' -Body {
+        param($sandbox)
+
+        [void](Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1')
+        $slots = Get-WacDeploymentSlotPath
+
+        # A committed upgrade whose final delete failed: the root is healthy, nothing claims an
+        # unfinished swap, and the slot is debris.
+        Copy-WacDeploymentTree -Source $slots.Root -Destination $slots.Previous
+        Assert-True (Test-Path -LiteralPath $slots.Previous -PathType Container)
+
+        $stage = New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2'
+        Assert-True (Test-Path -LiteralPath $stage.StagingRoot -PathType Container)
+        Assert-False (Test-Path -LiteralPath $slots.Previous) 'a superseded copy was preserved forever beside a healthy deployment'
+    }
+}
+
+Test-Case 'A pre-manifest deployment is still adopted, replaced and committed' {
+    # Legacy adoption, unchanged: IsHealthy is false for a tree with no manifest, and that must
+    # narrow only what may be DISCARDED - never strand a machine that installed before manifests.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-legacy' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# legacy v1'
+        $slots = Get-WacDeploymentSlotPath
+        [System.IO.File]::Delete((Get-WacDeploymentManifestPath -DeploymentRoot $slots.Root))
+
+        $legacy = Get-WacDeploymentOwnership -DeploymentRoot $slots.Root
+        Assert-Equal 'Unmanaged' $legacy.Kind ([string]$legacy.Reason)
+        Assert-True $legacy.IsOurs 'a pre-manifest deployment stopped being adoptable'
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        $switched = Switch-WacDeploymentStage -KeepPrevious
+        Assert-True $switched.PreviousKept 'the legacy tree was discarded instead of being kept for a rollback'
+        Assert-Equal '# replacement v2' (Get-SlotRunContent -Slot $slots.Root)
+
+        # And it can still be rolled back to, inventory and all, even with no manifest of its own.
+        $restored = Restore-WacDeploymentPrevious
+        Assert-True $restored.Restored ([string]$restored.Reason)
+        Assert-Equal '# legacy v1' (Get-SlotRunContent -Slot $slots.Root)
+        Assert-Equal ($live.RunScript) (Join-Path -Path $slots.Root -ChildPath 'Run.ps1')
+    }
+}
+
+Complete-TestRun

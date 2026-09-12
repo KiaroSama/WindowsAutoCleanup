@@ -172,4 +172,64 @@ Test-Case 'a genuine pre-start failure still reports Started false' {
     Assert-Equal $null $result.ExitCode 'an exit code was reported for a tool that never ran'
 }
 
+# ---------------------------------------------------------------------------------------------
+# WAC-05R (partial): a root that exits is not proof that its children, or its output, are finished
+# ---------------------------------------------------------------------------------------------
+
+Test-Case 'a child holding the inherited pipe after the root exits is reported, not silently dropped' {
+    # A pipe reaches EOF only when EVERY write handle on it closes, so a read still outstanding after
+    # the root has exited is positive evidence that a process this run started inherited the handle
+    # and is still alive.
+    #
+    # Both halves used to lie about that. TerminationProven was set $true for any run that was not
+    # killed on a timeout - a normal exit 0 "proved" the tree was gone - and the two fixed 5 s read
+    # waits turned an unfinished read into the EMPTY STRING, which a caller parsing stdout reads as a
+    # real answer ("pnputil listed no drivers") rather than as a missing one.
+    #
+    # The fixture owns both processes: the root is this host, the grandchild is a bounded ping whose
+    # pid the root writes out, and the teardown kills it. The expired deadline is what clamps the
+    # read budget to its floor, so the case costs about a second instead of five.
+    $marker = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('wacpipe-{0}.txt' -f [guid]::NewGuid().ToString('N').Substring(0, 10))
+    $grandchildId = 0
+    try {
+        $payload = "`$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','ping -n 4 127.0.0.1 >nul' -NoNewWindow -PassThru; Set-Content -LiteralPath '$marker' -Value ([string]`$p.Id); exit 0"
+        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
+
+        $held = Invoke-WacProcess -FilePath $script:HostExe `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $payload) -TimeoutMs 20000
+
+        if (Test-Path -LiteralPath $marker) {
+            $recorded = (Get-Content -LiteralPath $marker -Raw).Trim()
+            if ($recorded -match '^\d+$') { $grandchildId = [int]$recorded }
+        }
+        Assert-True ($grandchildId -gt 0) 'the fixture never recorded the child that was supposed to hold the pipe'
+
+        Assert-True ([bool]$held.Started) 'the root did not start, so the case proves nothing'
+        Assert-True (-not $held.TimedOut) 'the root did not exit on its own, so this is not the shape under test'
+        Assert-Equal 0 ([int]$held.ExitCode) 'the root did not exit cleanly, so its exit code is not the reassuring one'
+        Assert-True (-not $held.OutputComplete) `
+            'an output read that never finished was handed over as though it were the whole output'
+        Assert-True (-not $held.TerminationProven) `
+            'a clean root exit was reported as proof that the tree had stopped, while a child still held its pipe'
+    }
+    finally {
+        if ($grandchildId -gt 0) { Stop-Process -Id $grandchildId -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
+    }
+}
+
+Test-Case 'an ordinary tool that leaves nothing behind still reports complete output and a proven stop' {
+    # The control. Without it the assertions above would also pass if OutputComplete were hard-wired
+    # to $false, and every real tool call in the project would start reporting an unproven stop.
+    $clean = Invoke-WacProcess -FilePath $script:HostExe `
+        -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', "'done'; exit 0") -TimeoutMs 20000
+
+    Assert-True ([bool]$clean.Started) 'the control tool did not start'
+    Assert-Equal 0 ([int]$clean.ExitCode) 'the control tool did not exit cleanly'
+    Assert-True ([bool]$clean.OutputComplete) 'a tool that finished normally was reported as having incomplete output'
+    Assert-True ([bool]$clean.TerminationProven) 'a tool that exited on its own was reported as not proven stopped'
+    Assert-True ($clean.StandardOutput -match 'done') 'the control tool output did not reach the caller'
+}
+
 Complete-TestRun

@@ -87,6 +87,73 @@ function Get-WacCanonicalPowerShellHost {
     return $null
 }
 
+function Get-WacPathPresence {
+    <#
+    .SYNOPSIS
+        'Present', 'Absent' or 'Unresolved' for one file or directory. Bounded; never throws.
+    .DESCRIPTION
+        Directory.Exists answers a BOOLEAN to a three-valued question. It is documented to return
+        false when the path is missing AND when the caller cannot determine whether it exists -
+        access denied, an IO error, a device that will not answer - so "not there" and "I was not
+        allowed to look" arrive identically. Every caller that filtered on it therefore dropped an
+        unreadable profile or cache silently, which is the one outcome this project is not allowed
+        to report as a clean answer.
+
+        The discrimination is the exception TYPE from a single enumeration of the parent for this
+        one leaf: a missing parent raises DirectoryNotFoundException, which proves absence just as
+        well as an empty result does, while UnauthorizedAccessException, SecurityException or
+        IOException prove only that the question could not be answered. No recursion, no retry and
+        no traversal beyond the parent, so the cost is one directory read.
+
+        A path with no parent - a volume root - is answered directly, because there is nothing above
+        it to enumerate.
+    .OUTPUTS
+        [string] 'Present', 'Absent' or 'Unresolved'.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'Absent' }
+
+    $long = Get-WacLongPath -Path $Path
+    if ([System.IO.Directory]::Exists($long)) { return 'Present' }
+
+    $parent = $null
+    $leaf = ''
+    try {
+        $parent = [System.IO.Path]::GetDirectoryName($Path)
+        $leaf = [System.IO.Path]::GetFileName($Path)
+    }
+    catch {
+        return 'Unresolved'
+    }
+
+    # A volume root that Directory.Exists denied: there is no parent to ask, so the boolean is all
+    # there is and a drive that will not answer stays unresolved rather than being called absent.
+    if ([string]::IsNullOrEmpty($parent) -or [string]::IsNullOrEmpty($leaf)) {
+        if ([System.IO.Directory]::Exists($long)) { return 'Present' }
+        return 'Unresolved'
+    }
+
+    # A FILE where the parent directory should be: nothing can exist beneath it, so this is proven
+    # absence. Without this the enumeration below raises IOException ("the directory name is
+    # invalid") and the answer would be Unresolved - fail-closed, but it would manufacture a gap out
+    # of a path that is simply not there. Measured: C:\Windows\notepad.exe\child.
+    if ([System.IO.File]::Exists((Get-WacLongPath -Path $parent))) { return 'Absent' }
+
+    try {
+        $found = @([System.IO.Directory]::EnumerateFileSystemEntries((Get-WacLongPath -Path $parent), $leaf))
+        if ($found.Count -gt 0) { return 'Present' }
+        return 'Absent'
+    }
+    catch [System.IO.DirectoryNotFoundException] {
+        # The parent itself is gone, so the child cannot exist. That is an answer.
+        return 'Absent'
+    }
+    catch {
+        return 'Unresolved'
+    }
+}
+
 function Test-WacIsRealUserProfilePath {
     <#
     .SYNOPSIS
@@ -100,13 +167,32 @@ function Test-WacIsRealUserProfilePath {
     #>
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Path,
-        [switch]$RequireUserHive
+        [switch]$RequireUserHive,
+        [AllowNull()][System.Collections.Generic.List[object]]$Gap
     )
 
     $normalized = Get-WacNormalizedPath -Path $Path
     if (-not $normalized) { return $false }
+    # Off-drive, inside the Windows directory, or a reparse point are DELIBERATE exclusions: the
+    # answer is "not a profile we clean", not "we could not tell". Those never become gaps.
     if (-not (Test-WacIsOnTargetDrive -Path $normalized)) { return $false }
-    if (-not [System.IO.Directory]::Exists((Get-WacLongPath -Path $normalized))) { return $false }
+
+    # This used to be a bare Directory.Exists, so a profile root that denied access to the running
+    # identity was indistinguishable from one that was not there and vanished from the allow-list
+    # without a word - the filter ran BEFORE the gap collector ever saw the path.
+    $presence = Get-WacPathPresence -Path $normalized
+    if ($presence -ceq 'Unresolved') {
+        if ($null -ne $Gap) {
+            [void]$Gap.Add([PSCustomObject]@{
+                Source = 'UserProfile'
+                Scope  = $normalized
+                Reason = 'the profile directory could not be inspected, so it is neither cleaned nor proven absent'
+            })
+        }
+        return $false
+    }
+    if ($presence -cne 'Present') { return $false }
+
     if (Test-WacIsReparsePoint -Path $normalized) { return $false }
 
     $systemRoot = Get-WacNormalizedPath -Path $env:SystemRoot
@@ -114,10 +200,22 @@ function Test-WacIsRealUserProfilePath {
 
     if (-not $RequireUserHive) { return $true }
 
+    # Same three-valued question for the hive. A profile whose root is readable but whose hive files
+    # are not is an orphaned-or-locked-down entry we cannot classify; reporting it as "no hive,
+    # therefore not a profile" is the guess this check exists to avoid.
+    $unresolvedHive = $false
     foreach ($hive in @('ntuser.dat', 'ntuser.man')) {
-        # File.Exists returns false instead of writing to the error stream when access is denied,
-        # which keeps a locked-down profile from polluting the caller's error output.
-        if ([System.IO.File]::Exists((Get-WacLongPath -Path (Join-Path -Path $normalized -ChildPath $hive)))) { return $true }
+        $hivePresence = Get-WacPathPresence -Path (Join-Path -Path $normalized -ChildPath $hive)
+        if ($hivePresence -ceq 'Present') { return $true }
+        if ($hivePresence -ceq 'Unresolved') { $unresolvedHive = $true }
+    }
+
+    if ($unresolvedHive -and $null -ne $Gap) {
+        [void]$Gap.Add([PSCustomObject]@{
+            Source = 'UserProfile'
+            Scope  = $normalized
+            Reason = 'the user hive could not be inspected, so this ProfileList entry was neither confirmed nor ruled out'
+        })
     }
 
     return $false
@@ -155,7 +253,10 @@ function Get-WacUserProfilePath {
 
         $normalized = Get-WacNormalizedPath -Path $Candidate
         if (-not $normalized) { return }
-        if (-not (Test-WacIsRealUserProfilePath -Path $normalized -RequireUserHive:$RequireHive)) { return }
+        # The collector travels WITH the acceptance test: an unreadable profile is rejected inside
+        # it, so a caller that only saw the returned list could never learn the path had been
+        # dropped for a reason other than "not a profile".
+        if (-not (Test-WacIsRealUserProfilePath -Path $normalized -RequireUserHive:$RequireHive -Gap $Gap)) { return }
         foreach ($existing in $results) {
             if ([string]::Equals($existing, $normalized, [System.StringComparison]::OrdinalIgnoreCase)) { return }
         }
@@ -164,17 +265,41 @@ function Get-WacUserProfilePath {
 
     $wmiWorked = $false
     $cimError = ''
+    # Reasons one ROW could not be processed, kept rather than reported immediately. The registry
+    # pass below enumerates the same population, so a healthy fallback genuinely supplies what these
+    # rows failed to give and the obligation is discharged; only a fallback that ALSO fails leaves
+    # the machine unanswered, and that is when these become gaps.
+    $cimRowFailure = New-Object 'System.Collections.Generic.List[string]'
     try {
         $profiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)
-        $wmiWorked = $true
+
         foreach ($userProfile in $profiles) {
-            if ($userProfile.Special) { continue }
-            & $addCandidate ([string]$userProfile.LocalPath) $false
+            # Per row. A malformed or unreadable row used to escape to the outer catch, which stored
+            # the error and left $wmiWorked ALREADY $true - it was set before this loop - so the
+            # early return below handed back the rows read so far as if the enumeration had
+            # finished: a partial profile list, no gap, and no fallback. Catching here keeps the
+            # good rows AND keeps the provider honest about not having finished.
+            try {
+                if ($userProfile.Special) { continue }
+                & $addCandidate ([string]$userProfile.LocalPath) $false
+            }
+            catch {
+                [void]$cimRowFailure.Add([string]$_.Exception.Message)
+                Write-WacLog -Level WARNING -Component 'Profiles' -Message 'A Win32_UserProfile row could not be examined; the ProfileList key must answer for it.' -Data @{ error = [string]$_.Exception.Message }
+            }
         }
+
+        # ONLY once every row has been processed, and only if every row was. This is the whole
+        # repair: "the query returned" is not "the provider answered".
+        $wmiWorked = ($cimRowFailure.Count -eq 0)
     }
     catch {
         $cimError = [string]$_.Exception.Message
         Write-WacLog -Level DEBUG -Component 'Profiles' -Message 'Win32_UserProfile is unavailable; falling back to the ProfileList registry key.' -Data @{ error = $cimError }
+    }
+
+    if ($cimRowFailure.Count -gt 0 -and [string]::IsNullOrEmpty($cimError)) {
+        $cimError = ('{0} row(s) could not be examined: {1}' -f $cimRowFailure.Count, ($cimRowFailure -join '; '))
     }
 
     if ($wmiWorked -and $results.Count -gt 0) { return @($results.ToArray()) }

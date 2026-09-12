@@ -598,22 +598,38 @@ function Invoke-WacLegacyDiskCleanup {
             }
             else {
                 $attempted = $true
-                $run = Invoke-WacProcess -FilePath $cleanmgr -ArgumentList @(('/sagerun:{0}' -f $SageId)) -TimeoutMs $timeoutMs -Component $component
-                $durationMs = [int]$run.DurationMs
 
-                if ($run.TimedOut) {
-                    # State HAS been mutated by this point, so a killed cleanmgr is an unfinished
-                    # step, not the benign skip it used to report.
+                # The watchdog above was sized BEFORE the snapshot, the profile write and the exact
+                # read-back. All three are synchronous, each carries its own bound, and together
+                # they can consume the budget that number was drawn from. Handing cleanmgr the
+                # stale allowance would let one step overrun the whole run - so reclamp against the
+                # live deadline immediately before the launch, and start no tool at all when
+                # preparation has already spent everything.
+                $launchTimeoutMs = Get-WacStepTimeoutMs -RequestedMs $timeoutMs
+                if ($launchTimeoutMs -le 0) {
+                    # The profile was mutated, so this is not a benign skip: the finally block still
+                    # restores every touched value, and the step reports unfinished work.
                     $outcome = 'Incomplete'
-                    $detail = 'cleanmgr exceeded its {0} ms watchdog and its process tree was terminated.' -f $timeoutMs
-                }
-                elseif ($run.ExitCode -eq 0) {
-                    $outcome = 'Succeeded'
-                    $detail = 'cleanmgr /sagerun:{0} completed over {1} handler(s) on every drive.' -f $SageId, $enabledHandler.Count
+                    $detail = 'The run budget was exhausted while the cleanmgr profile was prepared, so cleanmgr was not started.'
                 }
                 else {
-                    $outcome = 'Failed'
-                    $detail = 'cleanmgr exited with {0}.' -f $run.ExitCode
+                    $run = Invoke-WacProcess -FilePath $cleanmgr -ArgumentList @(('/sagerun:{0}' -f $SageId)) -TimeoutMs $launchTimeoutMs -Component $component
+                    $durationMs = [int]$run.DurationMs
+
+                    if ($run.TimedOut) {
+                        # State HAS been mutated by this point, so a killed cleanmgr is an
+                        # unfinished step, not the benign skip it used to report.
+                        $outcome = 'Incomplete'
+                        $detail = 'cleanmgr exceeded its {0} ms watchdog and its process tree was terminated.' -f $launchTimeoutMs
+                    }
+                    elseif ($run.ExitCode -eq 0) {
+                        $outcome = 'Succeeded'
+                        $detail = 'cleanmgr /sagerun:{0} completed over {1} handler(s) on every drive.' -f $SageId, $enabledHandler.Count
+                    }
+                    else {
+                        $outcome = 'Failed'
+                        $detail = 'cleanmgr exited with {0}.' -f $run.ExitCode
+                    }
                 }
             }
         }
@@ -644,9 +660,14 @@ function Invoke-WacLegacyDiskCleanup {
             }
 
             if ($restoreFailed -gt 0) {
-                # A profile this run wrote and could not put back is the worst outcome this step
-                # has, so it overrides whatever cleanmgr itself reported.
-                $outcome = 'Incomplete'
+                # COMBINED with what cleanmgr reported, never substituted for it. Assigning
+                # 'Incomplete' outright DOWNGRADED a recorded failure: the shared ranking is
+                # SecurityRefusal > Failed > Incomplete, so a nonzero cleanmgr exit (Failed, rank 2)
+                # followed by a restore failure became Incomplete (rank 1) - two problems reported
+                # as less serious than the first one alone, and the run turned from exit 2 into
+                # exit 6. Get-WacHigherOutcome keeps the worse of the two, so a restore failure can
+                # only ever raise the verdict. Both facts stay in $detail; neither erases the other.
+                $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
                 $detail = '{0} The pre-existing cleanmgr profile could not be restored for {1} handler(s).' -f $detail, $restoreFailed
             }
         }

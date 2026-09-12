@@ -480,17 +480,26 @@ function Invoke-WacDriverPackagePrune {
         $started = $true
         if (@($delete.PSObject.Properties.Name) -ccontains 'Started') { $started = [bool]$delete.Started }
 
-        # TimedOut is answered FIRST because it is the only one of the three that says the tool ran:
+        # Read the same defensive way, for a sharper reason (ledger WAC-05R): a pnputil this run
+        # could not prove stopped may STILL be writing to the driver store while the code below
+        # decides whether the export protecting that package can be reclaimed. The runner reports
+        # that honestly, and this was the only destructive consumer that ignored the answer.
+        $terminationProven = $true
+        if (@($delete.PSObject.Properties.Name) -ccontains 'TerminationProven') { $terminationProven = [bool]$delete.TerminationProven }
+
+        # TimedOut is answered FIRST because it is the only one of these that says the tool ran:
         # a process killed on its deadline may have removed the package, so nothing here may treat
         # it as "never started" and throw the export away.
-        if ($delete.TimedOut -or ($started -and $null -eq $delete.ExitCode)) {
-            # Killed on its deadline, or exited without an exit code anyone could read. Whether the
-            # package survived is unknown, so the marker STAYS and the export is kept: it may be the
-            # only copy left of something that is already gone.
+        if ($delete.TimedOut -or ($started -and $null -eq $delete.ExitCode) -or ($started -and -not $terminationProven)) {
+            # Killed on its deadline, exited without an exit code anyone could read, or left part of
+            # its tree alive. Whether the package survived is unknown, so the marker STAYS and the
+            # export is kept: it may be the only copy left of something that is already gone. An
+            # exit code from a root whose tree outlived it is not an answer about the store.
             $incomplete++
             $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
-            Write-WacLog -Level WARNING -Component $component -Message 'The deletion produced no readable result, so whether the package was removed is unknown.' -Data @{
-                driver = $candidate.DriverName; backup = $backup.Directory; timedOut = [bool]$delete.TimedOut
+            Write-WacLog -Level WARNING -Component $component -Message 'The deletion produced no trustworthy result, so whether the package was removed is unknown.' -Data @{
+                driver = $candidate.DriverName; backup = $backup.Directory
+                timedOut = [bool]$delete.TimedOut; terminationProven = $terminationProven
             }
             continue
         }

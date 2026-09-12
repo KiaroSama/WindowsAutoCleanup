@@ -67,6 +67,6 @@ Export-ModuleMember -Function @(
     'Invoke-WacProcess', 'Set-WacProcessInvoker', 'Get-WacProcessInvoker', 'Invoke-WacBounded',
     'Enter-WacSingleInstance', 'Exit-WacSingleInstance',
     'Test-WacIsAdministrator', 'Test-WacIsWindowsServer', 'Test-WacSystemDriveSupported',
-    'Get-WacCanonicalPowerShellHost', 'Get-WacUserProfilePath', 'Test-WacIsRealUserProfilePath', 'Get-WacFreeBytes', 'Format-WacBytes',
+    'Get-WacCanonicalPowerShellHost', 'Get-WacPathPresence', 'Get-WacUserProfilePath', 'Test-WacIsRealUserProfilePath', 'Get-WacFreeBytes', 'Format-WacBytes',
     'Test-WacPathIsMachineTrusted', 'Test-WacSidIsAdministrator', 'Test-WacStatePathIsTrusted'
 )

@@ -23,6 +23,18 @@ $script:DeploymentProjectId = 'WindowsAutoCleanupDeployment=4a83c6d1-70b5-4c2e-9
 $script:DeploymentManifestName = 'wac-deployment.json'
 $script:DeploymentManifestSchema = 1
 
+# The DURABLE half of the swap transaction (ledger WAC-02R). $script:DeploymentTransaction describes
+# a swap the current process is in the middle of and dies with that process, so a run killed between
+# the two moves leaves a machine whose only evidence is the directories themselves - and those
+# cannot say whether the run that made them ever committed. This record is written beside the slots
+# before the first move and deleted at the commit point, so its PRESENCE means "a swap started and
+# did not finish".
+#
+# It is never believed on its own. Every action it triggers is re-proven against hashes taken from
+# the bytes on disk, so a stale, copied or hand-written record can start no deletion by itself.
+$script:DeploymentJournalSchema = 1
+$script:DeploymentJournalSuffix = '.transaction.json'
+
 # Kept here rather than read out of Run.ps1 at runtime: parsing another script for a version string
 # is a coupling that breaks silently when its formatting changes. Deploy.Tests.ps1 asserts this
 # equals Run.ps1's $script:Version, so drift fails a test instead of shipping a lying manifest.
@@ -160,8 +172,16 @@ function Get-WacDeploymentOwnership {
         it was installed, which is worth logging - but making it flip ownership would mean a single
         edited file locks the deployment in place forever, unremovable and unreplaceable. Identity is
         the project id and the layout; the hashes are evidence about content.
+
+        IsOurs and IsHealthy answer DIFFERENT questions, and conflating them cost a machine its only
+        good copy (ledger WAC-02R). IsOurs means "this run may replace or remove it": an empty
+        directory and a deployment three of whose files were overwritten are both ours. IsHealthy
+        means "this is a complete, verified deployment that can stand on its own", which only a
+        Managed tree whose every recorded file still matches can be - an empty root, a tampered one
+        and a pre-manifest one cannot. Anything that would DISCARD recovery material has to ask the
+        second question; only adoption asks the first.
     .OUTPUTS
-        Root, Exists, Kind, IsOurs, Version, Tampered, Findings, Reason.
+        Root, Exists, Kind, IsOurs, IsEmpty, IsHealthy, Version, Tampered, Findings, Reason.
     #>
     [CmdletBinding()]
     param([string]$DeploymentRoot)
@@ -173,6 +193,8 @@ function Get-WacDeploymentOwnership {
         Exists = $false
         Kind = 'Foreign'
         IsOurs = $false
+        IsEmpty = $false
+        IsHealthy = $false
         Version = $null
         Tampered = $false
         Findings = @()
@@ -223,6 +245,10 @@ function Get-WacDeploymentOwnership {
         $result.Reason = ('The deployment directory could not be enumerated, so nothing about it can be proven: {0}' -f $_.Exception.Message)
         return $result
     }
+
+    # Reported rather than inferred by a caller: an empty directory at the deployment path is what
+    # an interrupted move leaves behind, and it reads as Unmanaged-and-ours below.
+    $result.IsEmpty = ($topLevel.Count -eq 0)
 
     $unexpected = New-Object 'System.Collections.Generic.List[string]'
     foreach ($entry in $topLevel) {
@@ -290,6 +316,9 @@ function Get-WacDeploymentOwnership {
     $result.Kind = 'Managed'
     $result.IsOurs = $true
     $result.Tampered = ($mismatch.Count -gt 0)
+    # The ONLY shape that earns IsHealthy: our manifest, our project id, and every file it records
+    # still hashing to what it recorded.
+    $result.IsHealthy = (-not $result.Tampered)
     $result.Findings = @($mismatch.ToArray())
     $result.Reason = if ($result.Tampered) {
         ('Our manifest, but {0} file(s) no longer match it.' -f $mismatch.Count)
@@ -447,5 +476,247 @@ function Test-WacDeploymentTrusted {
 
     $result.IsTrusted = $true
     $result.Reason = ('All {0} checked paths, ancestors up to the volume root included, are administrative only.' -f $checked)
+    return $result
+}
+
+# ---------------------------------------------------------------------------------------------
+# Content identity, the durable transaction record, and what may be promoted out of a slot
+# ---------------------------------------------------------------------------------------------
+
+function Get-WacDeploymentFingerprint {
+    <#
+    .SYNOPSIS
+        One SHA-256 over the complete file inventory of a deployment tree: the relative path,
+        content hash and length of every file in it.
+    .DESCRIPTION
+        The manifest identifies a PROJECT and a VERSION. Two different builds of 1.2.0 carry the
+        same project id, the same version and each its own self-consistent manifest, so neither
+        kind, version nor "matches its own manifest" tells them apart - and a rollback comparing
+        only those reported a tree it had never seen as the one it moved aside (ledger WAC-02R).
+        This is computed from the bytes on disk rather than from what a file inside the tree claims
+        about them, so it also catches a manifest rewritten to agree with edited files.
+
+        An incomplete walk, a reparse point or an unreadable file yields NO fingerprint. A partial
+        inventory that happened to compare equal would prove the opposite of what the caller asked.
+    .OUTPUTS
+        Fingerprint (uppercase SHA-256 or $null), FileCount, Complete, Reason.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
+
+    $result = [PSCustomObject]@{ Fingerprint = $null; FileCount = 0; Complete = $false; Reason = $null }
+
+    $root = Get-WacNormalizedPath -Path $DeploymentRoot
+    if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) {
+        $result.Reason = 'There is no directory at this path to inventory.'
+        return $result
+    }
+
+    $walk = Get-WacDeploymentItem -Root $root
+    if (-not $walk.Complete) {
+        $result.Reason = ('The tree could not be fully enumerated, so no inventory describes it: {0}' -f
+            ((@($walk.Failure | ForEach-Object { '{0}: {1}' -f $_.Path, $_.Reason }) | Select-Object -First 3) -join '; '))
+        return $result
+    }
+
+    $prefix = $root.TrimEnd('\') + '\'
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($item in @($walk.Entry)) {
+        if ($item.IsReparsePoint) {
+            $result.Reason = ('The tree holds a reparse point, so its contents are not its own: {0}' -f $item.Path)
+            return $result
+        }
+        if ($item.IsDirectory) { continue }
+
+        $relative = [string]$item.Path
+        if ($relative.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $relative = $relative.Substring($prefix.Length)
+        }
+
+        $hash = Get-WacDeploymentFileHash -Path $item.Path
+        if (-not $hash) {
+            $result.Reason = ('A file could not be hashed, so the inventory would be short by one: {0}' -f $item.Path)
+            return $result
+        }
+
+        [void]$lines.Add(('{0}|{1}|{2}' -f $relative.ToUpperInvariant(), $hash,
+            [long](New-Object System.IO.FileInfo($item.Path)).Length))
+    }
+
+    if ($lines.Count -eq 0) {
+        $result.Reason = 'The tree holds no files, so there is nothing to identify it by.'
+        return $result
+    }
+
+    # ORDINAL, and not Sort-Object: the order of these lines decides the digest, and a culture-aware
+    # sort makes the same tree fingerprint differently under a different locale.
+    $ordered = [string[]]$lines.ToArray()
+    [array]::Sort($ordered, [System.StringComparer]::Ordinal)
+
+    $digest = $null
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $digest = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($ordered -join "`n"))) }
+    finally { $sha.Dispose() }
+
+    $result.Fingerprint = ([System.BitConverter]::ToString($digest)).Replace('-', '').ToUpperInvariant()
+    $result.FileCount = $lines.Count
+    $result.Complete = $true
+    $result.Reason = ('{0} file(s) inventoried.' -f $lines.Count)
+    return $result
+}
+
+function Get-WacDeploymentJournalPath {
+    <#
+    .SYNOPSIS
+        Where the durable transaction record lives: beside the slots, never inside one, so no move
+        or delete of a slot can carry it off with them.
+    #>
+    param([string]$DeploymentRoot)
+
+    if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
+    $root = Get-WacNormalizedPath -Path $DeploymentRoot
+    if (-not $root) { return $null }
+    return ($root + $script:DeploymentJournalSuffix)
+}
+
+function Write-WacDeploymentJournal {
+    <#
+    .SYNOPSIS
+        Records the in-flight swap. $false when it could not be written; what that costs is the
+        caller's decision, not this function's.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Record,
+        [string]$DeploymentRoot
+    )
+
+    $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot
+    if (-not $path) { return $false }
+
+    # Never through a link. The record sits in an administrative directory, and writing through a
+    # reparse point somebody else left at that name would write wherever they chose.
+    #
+    # Only when something is already THERE: Test-WacIsReparsePoint reads the attributes and fails
+    # closed, so it answers true for a path that does not exist yet - which is every first write.
+    if ((Test-Path -LiteralPath $path) -and (Test-WacIsReparsePoint -Path $path)) {
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The deployment transaction record could not be written: a reparse point stands at its path.' -Data @{ path = $path }
+        return $false
+    }
+
+    try {
+        [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $Record -Depth 4),
+            (New-Object System.Text.UTF8Encoding($false)))
+        return $true
+    }
+    catch {
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The deployment transaction record could not be written.' -Data @{ path = $path; error = $_.Exception.Message }
+        return $false
+    }
+}
+
+function Read-WacDeploymentJournal {
+    <#
+    .SYNOPSIS
+        The transaction an earlier PROCESS left behind, or $null when there is none this run may
+        act on.
+    .DESCRIPTION
+        Validated before it is handed back, because it comes off disk and a caller acts on it: our
+        schema, our project id, and the deployment root it names has to be the root being
+        reconciled. A record that fails any of those is not evidence about this machine's swap, so
+        it is discarded rather than half-believed - and one that passes still proves nothing on its
+        own, because the caller re-hashes both trees it describes before touching either.
+    #>
+    param([string]$DeploymentRoot)
+
+    if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
+    $expectedRoot = Get-WacNormalizedPath -Path $DeploymentRoot
+    $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot
+    if (-not $expectedRoot -or -not $path) { return $null }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    if (Test-WacIsReparsePoint -Path $path) { return $null }
+
+    $record = $null
+    try { $record = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($path)) }
+    catch { $record = $null }
+    if (-not $record) { return $null }
+
+    $schema = 0
+    $projectId = ''
+    $root = ''
+    try { $schema = [int]$record.Schema } catch { $schema = 0 }
+    try { $projectId = [string]$record.ProjectId } catch { $projectId = '' }
+    try { $root = [string]$record.Root } catch { $root = '' }
+
+    if ($schema -ne $script:DeploymentJournalSchema -or
+        -not [string]::Equals($projectId, $script:DeploymentProjectId, [System.StringComparison]::Ordinal) -or
+        -not [string]::Equals($root, $expectedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A deployment transaction record was ignored because it does not describe this deployment.' -Data @{ path = $path }
+        return $null
+    }
+
+    return $record
+}
+
+function Remove-WacDeploymentJournal {
+    <#
+    .SYNOPSIS
+        Ends the recorded transaction. Deleting this file is what says the swap it describes is no
+        longer in flight, so it happens at the commit point and after a completed rollback - never
+        merely because one step succeeded.
+    #>
+    param([string]$DeploymentRoot)
+
+    $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot
+    if (-not $path) { return $false }
+    if (-not (Test-Path -LiteralPath $path)) { return $true }
+
+    try {
+        [System.IO.File]::Delete((Get-WacLongPath -Path $path))
+        return $true
+    }
+    catch {
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The deployment transaction record could not be deleted.' -Data @{ path = $path; error = $_.Exception.Message }
+        return $false
+    }
+}
+
+function Test-WacRecoverySlotIsPromotable {
+    <#
+    .SYNOPSIS
+        Whether the directory in a recovery slot may be moved back onto the deployment root.
+    .DESCRIPTION
+        That move used to be unconditional whenever the root was empty (ledger WAC-02R), so
+        whatever stood in the slot - a foreign tree, a junction pointing anywhere on the machine -
+        became what SYSTEM executes. Provenance first, then substance: ownership proves the slot is
+        not a reparse point, resolves to itself, holds only names this project deploys and, when it
+        carries a manifest, our project id; and it has to hold the Run.ps1 the task exists to run,
+        because promoting an empty or gutted slot would put a deployment at the root that cannot
+        run, having destroyed whatever was there to make room for it.
+    .OUTPUTS
+        Promotable, Ownership, Reason.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $result = [PSCustomObject]@{ Promotable = $false; Ownership = $null; Reason = $null }
+
+    $ownership = Get-WacDeploymentOwnership -DeploymentRoot $Path
+    $result.Ownership = $ownership
+
+    if (-not $ownership.Exists) {
+        $result.Reason = 'there is nothing in the recovery slot to put back'
+        return $result
+    }
+    if (-not $ownership.IsOurs) {
+        $result.Reason = ('what is in the recovery slot cannot be proven ours: {0}' -f [string]$ownership.Reason)
+        return $result
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path -Path $ownership.Root -ChildPath 'Run.ps1') -PathType Leaf)) {
+        $result.Reason = 'the recovery slot holds no Run.ps1, so it is not a deployment that could be put back'
+        return $result
+    }
+
+    $result.Promotable = $true
+    $result.Reason = [string]$ownership.Reason
     return $result
 }

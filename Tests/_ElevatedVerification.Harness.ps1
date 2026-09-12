@@ -295,6 +295,31 @@ function New-VerificationMutexName {
     return ('Global\WacVerify{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 12))
 }
 
+function Get-ResultLinePath {
+    <#
+    .SYNOPSIS
+        The `path=` value from one '[Result] Target complete.' log line, or $null.
+    .DESCRIPTION
+        Write-WacLog renders key=value pairs and quotes a value that contains a space, so both
+        `path=C:\Temp\x` and `path="C:\Program Files\x"` occur. Taking the field rather than testing
+        the whole line for a substring is what makes containment checkable: a sandbox path is a
+        substring of a SIBLING directory whose name merely extends it, and it can also appear inside
+        an unrelated field, so "the line mentions the sandbox" never meant "the target was inside it".
+
+        The quoted form is matched first; otherwise the value runs to the next space, because the
+        pairs are space-separated and a bare value therefore cannot contain one.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+
+    $match = [regex]::Match($Line, '(?i)\bpath=(?:"(?<quoted>[^"]*)"|(?<bare>[^\s]+))')
+    if (-not $match.Success) { return $null }
+    if ($match.Groups['quoted'].Success) { return [string]$match.Groups['quoted'].Value }
+    return [string]$match.Groups['bare'].Value
+}
+
 function Get-NonSandboxCategory {
     <#
     .SYNOPSIS
