@@ -102,6 +102,14 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Invoke-ElevatedVerific
 
 Here, "Sandboxed" means redirected test folders, not Windows Sandbox: these scenarios still invoke real Windows maintenance. The contention test holds a real, unique mutex until the contender finishes, then verifies an uncontended control can acquire the released lock and remove its own test file. It does not depend on another cleanup being slow enough to overlap.
 
+A second gated lane covers the whole deployment lifecycle against the real Task Scheduler - install, a scheduled SYSTEM run, an idempotent reinstall, an upgrade, a refused recovery from a tampered deployment, and an uninstall that proves both the task and the deployment root are gone. It is refused unless it is elevated **and** `WAC_VM_DEPLOYMENT_LIFECYCLE` is set to `1`, so an ordinary run reports it as refused and touches nothing:
+
+```bash
+$env:WAC_VM_DEPLOYMENT_LIFECYCLE = '1'; pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\VmDeploymentLifecycle.Tests.ps1
+```
+
+Arm it only in a disposable guest with a checkpoint taken first: it installs to the real deployment root and registers a real SYSTEM task. ResetBase stays disabled and the lane asserts that from the registered action.
+
 ### Before you open a pull request
 
 CI enforces four gates. All four are runnable locally, and running them first is faster than
@@ -126,6 +134,16 @@ $shipped = @('Run.ps1', 'Install-WindowsAutoCleanupTask.ps1', 'Uninstall-Windows
 
 **Every suite on both hosts**, with `Run-Tests.ps1 -Host both` as above. Use `-Filter <name>` while
 iterating and run the full set before pushing.
+
+When every run exits `0` the runner deletes its per-suite captures. When any run does not, it keeps
+them and prints where, so a failure inside a parallel pass can still be read afterwards:
+
+```text
+EVIDENCE 1 run(s) did not exit 0; their captures are kept at <temp>\wac-run-<id>
+  ! Deadline.Tests.ps1|pwsh|exit=1
+```
+
+Delete that directory once you are done with it; nothing else will.
 
 **Four hard rules**, each enforced by a test rather than by review:
 
