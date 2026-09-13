@@ -61,6 +61,26 @@ refused. Losing that race produces a wrong **refusal**, never a wrong deletion.
   with a floor underneath - once per tool, on top of a budget that had already expired. They now draw
   from the run budget while it lasts and from the single recovery reserve afterwards, and a wait
   nobody can pay for is reported as an unproven stop rather than silently taken.
+- **`cleanmgr` could never actually run.** The step reads its own profile back before launching the
+  tool, to be sure it is running exactly the selection that was asked for - and that read-back ran in
+  a fresh runspace which could not see the helper it calls, because the package did not export it. An
+  enabled run therefore always failed its own verification and `cleanmgr` was never started. The
+  helper is exported, and a guard now resolves every function any bounded worker calls through a real
+  worker, so the next one cannot be missed.
+- **The file that decides whether a run may change the machine moved somewhere a standard user cannot
+  reach.** It used to sit in the state directory, where this tool's own rule permits a standard user
+  to create new names, and it was written through a predictable temporary name that nothing checked.
+  It now lives under `%SystemRoot%\Logs`, is created collision-failing so anything preplanted at the
+  name is refused rather than written through, and is read through its own handle so a link, an extra
+  hard link or a directory standing at that name is refused instead of read as "nothing is there".
+- **An external tool that cannot be proven finished now stops the run.** A clean exit code is what a
+  tool believes about itself. Where that verdict was previously only recorded in the report, it now
+  also prevents the next change - and the installer and uninstaller refuse on it too, at the same
+  shared gate, before they stage anything or unregister a task.
+- **A suspended process that could not be terminated is no longer reported as stopped**, and a tool
+  that fails after starting without job ownership is now actually terminated rather than only
+  reported. One operation also gets ONE deadline: a root that exited no longer hands its descendants
+  a second full timeout, and two held output pipes no longer spend one reserved allowance twice.
 - **An upgrade can no longer lose the scheduled task it was replacing.** The installer removes the
   existing registration before it swaps the new tree in, and the exact definition it captured used to
   live only in memory - so a machine that lost power between those two steps was left with no task and

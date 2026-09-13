@@ -21,6 +21,41 @@
     Neither record is ever believed on its own. Every action either one triggers is re-proven
     against the bytes on disk - a hash of the tree, or the scheduler's own answer about what is
     registered - so a stale, copied or hand-written record can start no deletion by itself.
+
+    THE LINKING PROTOCOL, and why two files are still one transaction (ledger WAC-02R).
+
+    Two individually durable records do not make the pair atomic. The counterexample that forced
+    this: files A and task A; an upgrade leaves files B, the recovery slot holding A, task B
+    registered, and both records uncommitted. A restart that resolved the two records INDEPENDENTLY
+    retired the task capture because something with that name was registered, then restored files A
+    from the swap record - leaving files A under task B with task A's evidence destroyed.
+
+    What binds them is a GENERATION: one process performs at most one deployment operation, mints
+    one TransactionId for it (Get-WacDeploymentGeneration), and stamps that id into BOTH records.
+    The protocol is:
+
+      1. The capture record is written, carrying the generation id, BEFORE the first unregister.
+      2. The swap record is written, carrying the SAME generation id, BEFORE the first move.
+      3. Every later write of either record repeats that id.
+      4. Commit deletes the swap record first, then the capture record.
+
+    It is crash-consistent because each record is durable before the mutation it describes, and
+    because the id is what a later process reads to decide whether the two records are two halves of
+    ONE interrupted operation or debris from two different ones. Equal ids means one generation, and
+    one generation gets ONE commit decision (Get-WacDeploymentRecoveryPlan) applied to both halves.
+    Unequal ids, or a capture whose generation no swap record accounts for, is ambiguity - and
+    ambiguity preserves both halves rather than guessing which run owned which.
+
+    A record written by a build older than the generation id carries none, which reads as "not
+    recorded" and therefore as unlinked: such a pair is reconciled conservatively, never silently
+    treated as one transaction.
+
+    ARTIFACT LIFECYCLE. A write stages to '<record>.new' and replaces the live record with it, so a
+    crash mid-write cannot tear the only copy. The staging name is transient by construction: it
+    exists between one File.WriteAllText and the File.Replace or File.Move on the next line, and
+    both the failure path and Remove-WacDeploymentJournal sweep it. Builds before this one also left
+    a '<record>.last' backup that nothing ever read; it is no longer created, and the sweep deletes
+    one an older build left behind, so ending a transaction leaves no artifact of it on disk.
 #>
 
 # WHAT THIS BUILD WRITES, and the oldest it can still ACT ON. Schema 2 added the task-capture record
@@ -37,8 +72,29 @@
 # Every field added at schema 2 is therefore read through Get-WacJournalField: absence has to read as
 # "not recorded", never as an error, and Set-StrictMode -Version 2.0 makes a plain property read of a
 # missing member terminating.
-$script:DeploymentJournalSchema = 2
+$script:DeploymentJournalSchema = 3
 $script:DeploymentJournalMinSchema = 1
+
+# The GENERATION this process's records belong to (ledger WAC-02R). One process performs at most one
+# deployment operation, so one id per process is exactly the granularity the linking protocol above
+# needs: both halves of one operation carry it, and a later process compares the two ids rather than
+# guessing that two records found together describe the same run.
+#
+# Minted lazily rather than at load, so importing the module writes nothing and costs nothing.
+$script:DeploymentGeneration = $null
+
+function Get-WacDeploymentGeneration {
+    <#
+    .SYNOPSIS
+        The transaction id every record this process writes carries. Stable for the life of the
+        process, so the swap record and the capture record are provably the same operation.
+    #>
+
+    if ([string]::IsNullOrWhiteSpace([string]$script:DeploymentGeneration)) {
+        $script:DeploymentGeneration = [guid]::NewGuid().ToString('N').ToUpperInvariant()
+    }
+    return [string]$script:DeploymentGeneration
+}
 
 # The DURABLE half of the swap transaction (ledger WAC-02R). $script:DeploymentTransaction describes
 # a swap the current process is in the middle of and dies with that process, so a run killed between
@@ -78,6 +134,63 @@ function Get-WacJournalField {
     if (-not ($names -ccontains $Name)) { return $null }
 
     try { return $Record.$Name } catch { return $null }
+}
+
+function Get-WacJournalPathState {
+    <#
+    .SYNOPSIS
+        What is at a record's path, as THREE answers: File, Absent, or Unreadable.
+    .DESCRIPTION
+        Ledger WAC-02R. Both readers used to ask Test-Path -PathType Leaf and read $false as "no
+        record here", which is wrong for every shape that is not a readable regular file: a
+        DIRECTORY standing at the record's name answers $false, so does a dangling link, and so does
+        a probe the filesystem refused. Each of those means "something is there and this build
+        cannot say what", and reading them as absence is what lets a run delete a recovery copy
+        because it believed no transaction was open.
+
+        Proven absence is narrow on purpose: the name must not exist as a file OR as a directory,
+        and the parent directory must be readable, because a probe that cannot see the parent has
+        not proven anything about what is in it.
+    .OUTPUTS
+        State (File, Absent or Unreadable) and Reason.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+
+    $result = [PSCustomObject]@{ State = 'Unreadable'; Reason = '' }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $result.Reason = 'the transaction record path could not be resolved'
+        return $result
+    }
+
+    try {
+        if ([System.IO.Directory]::Exists($Path)) {
+            $result.Reason = 'a directory stands where the transaction record should be'
+            return $result
+        }
+        if ([System.IO.File]::Exists($Path)) {
+            $result.State = 'File'
+            $result.Reason = 'a transaction record is present'
+            return $result
+        }
+
+        # Neither a file nor a directory. That is absence only if the place it would be in can
+        # actually be read; an unreadable parent makes every name in it answer "not there".
+        $parent = [System.IO.Path]::GetDirectoryName($Path)
+        if ([string]::IsNullOrWhiteSpace($parent) -or -not [System.IO.Directory]::Exists($parent)) {
+            $result.Reason = 'the directory the transaction record would live in could not be read'
+            return $result
+        }
+        [void][System.IO.Directory]::GetFileSystemEntries($parent, [System.IO.Path]::GetFileName($Path))
+    }
+    catch {
+        $result.Reason = ('the transaction record path could not be inspected: {0}' -f $_.Exception.Message)
+        return $result
+    }
+
+    $result.State = 'Absent'
+    $result.Reason = 'no transaction record is present'
+    return $result
 }
 
 function Get-WacDeploymentJournalPath {
@@ -127,18 +240,24 @@ function Write-WacDeploymentJournal {
     # WRITTEN BESIDE, THEN SWAPPED IN. Writing over the live record meant a crash mid-write left a
     # TORN file - and a torn record is worse than none, because it destroyed the last complete one
     # while looking like an answer. The temporary file absorbs a partial write; the swap is what the
-    # next process ever sees, and the displaced record is kept as the previous complete one.
+    # next process ever sees.
+    #
+    # No backup copy. File.Replace used to displace the live record to '<record>.last' so an
+    # unreadable record would have a predecessor to reconcile against - and nothing in this project
+    # ever read one, so the only thing it produced was an artifact outliving the transaction that
+    # made it. A null backup name keeps the replace atomic and leaves the lifecycle above true.
     $staging = $path + '.new'
-    $previous = $path + '.last'
 
     try {
         [System.IO.File]::WriteAllText($staging, (ConvertTo-Json -InputObject $Record -Depth 5),
             (New-Object System.Text.UTF8Encoding($false)))
 
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            # Replace keeps a copy of what it displaced, so a record that is later found unreadable
-            # still has a complete predecessor to reconcile against.
-            [System.IO.File]::Replace($staging, $path, $previous, $true)
+        if ([System.IO.File]::Exists($path)) {
+            # [NullString]::Value, not $null. PowerShell converts $null to an EMPTY STRING when it
+            # binds a [string] parameter, and File.Replace rejects an empty path - measured on both
+            # shipped hosts: "The path is empty. (Parameter 'path')". The write then failed
+            # silently, leaving the record frozen at whatever stage last managed a File.Move.
+            [System.IO.File]::Replace($staging, $path, [NullString]::Value, $true)
         }
         else {
             [System.IO.File]::Move($staging, $path)
@@ -164,14 +283,14 @@ function Read-WacDeploymentJournal {
         nothing on its own, because the caller re-hashes the trees it describes before touching
         either.
     .OUTPUTS
-        State (Absent, Valid or Unreadable), Record, Schema and Reason.
+        State (Absent, Valid or Unreadable), Record, Schema, Generation and Reason.
     #>
     param(
         [string]$DeploymentRoot,
         [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
     )
 
-    $result = [PSCustomObject]@{ State = 'Absent'; Record = $null; Schema = 0; Reason = '' }
+    $result = [PSCustomObject]@{ State = 'Absent'; Record = $null; Schema = 0; Generation = ''; Reason = '' }
 
     if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
     $expectedRoot = Get-WacNormalizedPath -Path $DeploymentRoot
@@ -186,7 +305,18 @@ function Read-WacDeploymentJournal {
         $result.Reason = 'the transaction record path could not be resolved'
         return $result
     }
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $result }
+
+    # Through the three-valued probe, so a DIRECTORY at the record's name, a dangling link or a
+    # refused inspection is unreadable rather than absent.
+    $probe = Get-WacJournalPathState -Path $path
+    if ([string]$probe.State -ceq 'Unreadable') {
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A deployment transaction record path could not be inspected.' -Data @{ path = $path; reason = [string]$probe.Reason }
+        $result.State = 'Unreadable'
+        $result.Reason = [string]$probe.Reason
+        return $result
+    }
+    if ([string]$probe.State -cne 'File') { return $result }
+
     if (Test-WacIsReparsePoint -Path $path) {
         $result.State = 'Unreadable'
         $result.Reason = 'a reparse point stands where the transaction record should be'
@@ -230,6 +360,7 @@ function Read-WacDeploymentJournal {
 
     $result.State = 'Valid'
     $result.Record = $record
+    $result.Generation = [string](Get-WacJournalField -Record $record -Name 'TransactionId')
     return $result
 }
 
@@ -239,6 +370,11 @@ function Remove-WacDeploymentJournal {
         Ends a recorded transaction. Deleting this file is what says the transaction it describes is
         no longer in flight, so it happens at the commit point and after a completed rollback - never
         merely because one step succeeded.
+    .DESCRIPTION
+        $false is a REAL answer and every caller has to carry it: a transaction whose record could
+        not be deleted is still open on disk, so an installation that committed can read back as
+        unfinished to the next run. The artifacts of the write protocol go with the record - one
+        call ends the transaction and leaves nothing of it behind.
     #>
     param(
         [string]$DeploymentRoot,
@@ -247,16 +383,28 @@ function Remove-WacDeploymentJournal {
 
     $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind $Kind
     if (-not $path) { return $false }
-    if (-not (Test-Path -LiteralPath $path)) { return $true }
 
-    try {
-        [System.IO.File]::Delete((Get-WacLongPath -Path $path))
-        return $true
+    $ok = $true
+    # '.last' is swept for machines carrying one an older build left; nothing writes it any more.
+    foreach ($target in @($path, ($path + '.new'), ($path + '.last'))) {
+        $probe = Get-WacJournalPathState -Path $target
+        # Proven absence is the only "nothing to do". An unreadable probe is a failure, because the
+        # record may still be there and a caller that reads $true would call the transaction closed.
+        if ([string]$probe.State -ceq 'Absent') { continue }
+        if ([string]$probe.State -ceq 'Unreadable') {
+            Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A deployment transaction record could not be deleted.' -Data @{ path = $target; error = [string]$probe.Reason }
+            $ok = $false
+            continue
+        }
+
+        try { [System.IO.File]::Delete((Get-WacLongPath -Path $target)) }
+        catch {
+            Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A deployment transaction record could not be deleted.' -Data @{ path = $target; error = $_.Exception.Message }
+            $ok = $false
+        }
     }
-    catch {
-        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A deployment transaction record could not be deleted.' -Data @{ path = $path; error = $_.Exception.Message }
-        return $false
-    }
+
+    return $ok
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -276,6 +424,11 @@ function Write-WacTaskCaptureRecord {
 
         Called once per captured task and given every capture so far, because the record grows with
         each one and a record naming only the LAST removal would strand the ones before it.
+
+        ALL OR NOTHING. An entry that carries no definition used to be skipped, so a record could
+        land describing three removals when four had happened - and the caller read $true and went
+        on to unregister the fourth. A capture this function cannot record in full is recorded not
+        at all, which leaves the task registered and costs the upgrade instead of the machine.
     #>
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Capture,
@@ -288,12 +441,15 @@ function Write-WacTaskCaptureRecord {
 
     $entries = New-Object 'System.Collections.Generic.List[object]'
     foreach ($item in @($Capture)) {
-        if (-not $item) { continue }
         $definition = [string](Get-WacJournalField -Record $item -Name 'Definition')
-        if ([string]::IsNullOrWhiteSpace($definition)) { continue }
+        $taskName = [string](Get-WacJournalField -Record $item -Name 'TaskName')
+        if (-not $item -or [string]::IsNullOrWhiteSpace($definition) -or [string]::IsNullOrWhiteSpace($taskName)) {
+            Write-WacLog -Level ERROR -Component 'Deploy' -Message 'A task capture could not be recorded because one of the captures it must name is incomplete; nothing was written.' -Data @{ root = $root }
+            return $false
+        }
 
         [void]$entries.Add([PSCustomObject]@{
-            TaskName = [string](Get-WacJournalField -Record $item -Name 'TaskName')
+            TaskName = $taskName
             TaskPath = [string](Get-WacJournalField -Record $item -Name 'TaskPath')
             Definition = $definition
         })
@@ -308,6 +464,7 @@ function Write-WacTaskCaptureRecord {
         ProjectId = $script:DeploymentProjectId
         Root = $root
         Stage = 'TaskCapture'
+        TransactionId = (Get-WacDeploymentGeneration)
         StartedUtc = ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture))
         ProcessId = $PID
         CapturedTask = @($entries.ToArray())
@@ -322,8 +479,15 @@ function Read-WacTaskCaptureRecord {
         Shaped so each entry can go straight back through the installer's own restore-and-prove path:
         Captured and CaptureReason are what that path reads before it will re-register anything, so a
         record entry and a live capture are the same object to it.
+
+        A PARTIAL RECORD IS AN UNREADABLE ONE (ledger WAC-02R). An entry with no definition, or with
+        no task name, used to be dropped on the floor - and a record every one of whose entries was
+        dropped came back Valid, naming nothing, which the installer retired as debris. Schema,
+        project id and root prove the record describes THIS deployment; they prove nothing about the
+        transaction being complete. Anything this build cannot decode in full is refused whole, so
+        the one piece of evidence about a missing registration survives for a human to read.
     .OUTPUTS
-        State (Absent, Valid or Unreadable), Schema, Capture and Reason.
+        State (Absent, Valid or Unreadable), Schema, Generation, Capture and Reason.
     #>
     param([string]$DeploymentRoot)
 
@@ -331,6 +495,7 @@ function Read-WacTaskCaptureRecord {
     $result = [PSCustomObject]@{
         State = [string]$read.State
         Schema = [int]$read.Schema
+        Generation = [string]$read.Generation
         Capture = @()
         Reason = [string]$read.Reason
     }
@@ -338,12 +503,20 @@ function Read-WacTaskCaptureRecord {
 
     $entries = New-Object 'System.Collections.Generic.List[object]'
     foreach ($item in @(Get-WacJournalField -Record $read.Record -Name 'CapturedTask')) {
-        if (-not $item) { continue }
         $definition = [string](Get-WacJournalField -Record $item -Name 'Definition')
-        if ([string]::IsNullOrWhiteSpace($definition)) { continue }
+        $taskName = [string](Get-WacJournalField -Record $item -Name 'TaskName')
+        if (-not $item -or [string]::IsNullOrWhiteSpace($definition) -or [string]::IsNullOrWhiteSpace($taskName)) {
+            Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A task-capture record carries an entry this build cannot decode, so the whole record is refused rather than half-read.' -Data @{
+                root = [string]$DeploymentRoot; schema = [int]$read.Schema
+            }
+            $result.State = 'Unreadable'
+            $result.Capture = @()
+            $result.Reason = 'the task-capture record carries an entry with no task name or no definition, so the transaction it describes cannot be read in full'
+            return $result
+        }
 
         [void]$entries.Add([PSCustomObject]@{
-            TaskName = [string](Get-WacJournalField -Record $item -Name 'TaskName')
+            TaskName = $taskName
             TaskPath = [string](Get-WacJournalField -Record $item -Name 'TaskPath')
             Definition = $definition
             Captured = $true
@@ -387,6 +560,12 @@ function Test-WacRecoverySlotMatchesRecord {
         fingerprint there is nothing to corroborate against, and the slot stands on its provenance
         checks alone - which is a WEAKER position than a match, not the same one, so a caller can say
         which of the two it had. "We could not check" and "it matched" must never read alike.
+
+        THREE original states, not two (ledger WAC-02R). An existing but EMPTY deployment root is
+        deliberately adopted as ours, and a tree with no files in it has no fingerprint to record -
+        so "no fingerprint" used to mean both "an older build wrote this record" and "what was moved
+        aside was an empty directory", and the second is a state that can be corroborated exactly.
+        OriginalState says which: Absent, Empty or Substantive.
     .OUTPUTS
         Matches, Corroborated, Fingerprint and Reason.
     #>
@@ -398,6 +577,29 @@ function Test-WacRecoverySlotMatchesRecord {
     $result = [PSCustomObject]@{ Matches = $true; Corroborated = $false; Fingerprint = $null; Reason = $null }
 
     $recorded = [string](Get-WacJournalField -Record $Record -Name 'OriginalFingerprint')
+    $state = [string](Get-WacJournalField -Record $Record -Name 'OriginalState')
+
+    if ([string]::Equals($state, 'Empty', [System.StringComparison]::Ordinal)) {
+        # An empty tree is identified by being empty, which is a fact the slot can be asked for
+        # directly. Get-WacDeploymentFingerprint refuses a tree with no files in it, so demanding a
+        # fingerprint here would refuse the one state this branch exists to corroborate.
+        $ownership = Get-WacDeploymentOwnership -DeploymentRoot $Path
+        if ([string]$ownership.Kind -ceq 'Indeterminate' -or -not $ownership.Exists) {
+            $result.Matches = $false
+            $result.Reason = ('the recovery slot could not be read, so it cannot be proven to be the empty tree the durable record describes: {0}' -f [string]$ownership.Reason)
+            return $result
+        }
+        if (-not [bool]$ownership.IsEmpty) {
+            $result.Matches = $false
+            $result.Reason = 'the recovery slot holds files where the durable record says an empty directory was moved aside'
+            return $result
+        }
+
+        $result.Corroborated = $true
+        $result.Reason = 'the recovery slot is still the empty directory the durable record says was moved aside'
+        return $result
+    }
+
     if ([string]::IsNullOrWhiteSpace($recorded)) {
         $result.Reason = 'no durable record names the content of what was moved aside, so the recovery slot stands on its provenance checks alone'
         return $result

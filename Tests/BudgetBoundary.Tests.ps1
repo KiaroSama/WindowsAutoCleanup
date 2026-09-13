@@ -230,4 +230,105 @@ Test-Case 'a timed-out tool charges its own shutdown waits to the reserve' {
     }
 }
 
+function New-PipeHolderArgument {
+    <#
+    .SYNOPSIS
+        A root that starts a grandchild inheriting its stdout/stderr, then exits 0 immediately.
+    .DESCRIPTION
+        The grandchild keeps the pipes open, so both reads are still outstanding when the root is
+        already gone - which is the only shape in which the drain budget is actually spent. The
+        marker file carries the grandchild's id so the case can reap it.
+    #>
+    param([Parameter(Mandatory = $true)][string]$MarkerPath, [int]$HoldSeconds = 30, [int]$RootSleepMs = 0)
+
+    $source = ("`$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','ping -n {0} 127.0.0.1 >nul' " +
+        "-NoNewWindow -PassThru; Set-Content -LiteralPath '{1}' -Value ([string]`$p.Id); " +
+        "Start-Sleep -Milliseconds {2}; exit 0") -f $HoldSeconds, $MarkerPath, $RootSleepMs
+    return @('-NoProfile', '-NonInteractive', '-Command', $source)
+}
+
+function Stop-MarkedChild {
+    param([Parameter(Mandatory = $true)][string]$MarkerPath)
+
+    if (-not (Test-Path -LiteralPath $MarkerPath)) { return 0 }
+    $recorded = (Get-Content -LiteralPath $MarkerPath -Raw).Trim()
+    if ($recorded -notmatch '^[0-9]+$') { return 0 }
+    Stop-Process -Id ([int]$recorded) -Force -ErrorAction SilentlyContinue
+    return [int]$recorded
+}
+
+Test-Case 'two held pipes drain against ONE grant, not one grant each' {
+    # WAC-06R. Request-WacWaitMs CLAIMS what it grants - a reserve that cannot refill only means
+    # something if the claim matches the spend - and the same grant was passed to BOTH waits. With
+    # a grandchild holding both pipes neither read ever completes, so the run spent up to DOUBLE the
+    # allowance it had reserved. The grant is a deadline now, and the two waits share it.
+    $sandbox = New-TestSandbox -Prefix 'budget-drain'
+    $marker = Join-Path -Path $sandbox -ChildPath 'grandchild.pid'
+    $host5 = if ($env:WAC_PROBE_HOST) { [string]$env:WAC_PROBE_HOST } else { [string](Get-Process -Id $PID).Path }
+    try {
+        Reset-WacTestBudget
+        Reset-WacShutdownReserve -ReserveMs 3000
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddSeconds(-1))
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = Invoke-WacProcess -FilePath $host5 -TimeoutMs 20000 `
+            -ArgumentList (New-PipeHolderArgument -MarkerPath $marker) -Component 'Test'
+        $watch.Stop()
+
+        Assert-True ([bool]$result.Started) 'the fixture root never started, so the case proves nothing'
+        Assert-False ([bool]$result.OutputComplete) `
+            'the grandchild did not hold the pipes, so no drain budget was spent and the case proves nothing'
+
+        # The whole call, not just the drain: 3000 ms was reserved, so anything near 6000 is the two
+        # waits each taking the full grant. The ceiling is generous enough for a loaded runner and
+        # still far below what the defect produced.
+        # BOTH bounds. Without the lower one this case passes when the drain was granted nothing at
+        # all - which is exactly how it first passed, because an unrelated per-launch claim had
+        # already emptied the reserve.
+        Assert-True ($watch.Elapsed.TotalMilliseconds -gt 2000) `
+            ('the drain was granted nothing, so this case proves nothing: {0} ms' -f [int]$watch.Elapsed.TotalMilliseconds)
+        Assert-True ($watch.Elapsed.TotalMilliseconds -lt 5500) `
+            ('the two drains spent more than the one grant that was reserved: {0} ms' -f [int]$watch.Elapsed.TotalMilliseconds)
+    }
+    finally {
+        [void](Stop-MarkedChild -MarkerPath $marker)
+        Reset-WacTestBudget
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a root that exits leaves the tree what is LEFT of the operation, not a fresh budget' {
+    # The other half. A root exiting normally used to hand the tree another full -TimeoutMs, so a
+    # tool given 4 seconds could legitimately occupy twelve: four for the root, four more for the
+    # tree, and a drain on top. One operation, one deadline.
+    $sandbox = New-TestSandbox -Prefix 'budget-tree'
+    $marker = Join-Path -Path $sandbox -ChildPath 'grandchild.pid'
+    $host5 = if ($env:WAC_PROBE_HOST) { [string]$env:WAC_PROBE_HOST } else { [string](Get-Process -Id $PID).Path }
+    try {
+        Reset-WacTestBudget
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        # The root holds MOST of the budget on purpose: what is left for the tree is then about a
+        # second, while a fresh budget would be another four - so the two answers are seconds apart
+        # rather than within the noise of a loaded runner.
+        $result = Invoke-WacProcess -FilePath $host5 -TimeoutMs 4000 `
+            -ArgumentList (New-PipeHolderArgument -MarkerPath $marker -RootSleepMs 3000) -Component 'Test'
+        $watch.Stop()
+
+        Assert-True ([bool]$result.Started) 'the fixture root never started, so the case proves nothing'
+        Assert-True ($watch.Elapsed.TotalMilliseconds -gt 3000) `
+            ('the root did not hold its share of the budget, so this case proves nothing: {0} ms' -f [int]$watch.Elapsed.TotalMilliseconds)
+
+        # One 4000 ms operation plus start-up and cleanup. A fresh tree budget on top of a root that
+        # already spent three seconds is what this rules out.
+        Assert-True ($watch.Elapsed.TotalMilliseconds -lt 6000) `
+            ('the operation ran past one deadline: {0} ms for a 4000 ms bound' -f [int]$watch.Elapsed.TotalMilliseconds)
+    }
+    finally {
+        [void](Stop-MarkedChild -MarkerPath $marker)
+        Reset-WacTestBudget
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun

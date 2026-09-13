@@ -512,10 +512,17 @@ Test-Case 'A rollback whose restored tree stopped matching what was moved aside 
 
         $restored = Restore-WacDeploymentPrevious
         Assert-False $restored.Restored 'a tree that no longer matches what was moved aside was reported as restored'
-        Assert-True ([string]$restored.Reason -match 'no longer matches its own manifest') ([string]$restored.Reason)
+        Assert-True ([string]$restored.Reason -match 'different files') ([string]$restored.Reason)
 
-        # Reported, not destroyed: the operator still has everything that is left.
-        Assert-Equal '# not what was moved aside' ([System.IO.File]::ReadAllText($live.RunScript))
+        # Refused BEFORE the delete (ledger WAC-02R). The check used to run after the promotion, so
+        # the failure it reported had already thrown away the verified replacement and put the
+        # rewritten tree at the path SYSTEM executes. Reported, not destroyed: the operator keeps
+        # both trees AND keeps running the one this run proved.
+        Assert-Equal '# replacement v2' ([System.IO.File]::ReadAllText($live.RunScript)) `
+            'the refusal deleted the verified deployment to put back a tree it could not vouch for'
+        Assert-Equal '# not what was moved aside' `
+            ([System.IO.File]::ReadAllText((Join-Path -Path $slots.Previous -ChildPath 'Run.ps1'))) `
+            'the refusal destroyed the rewritten tree it was reporting on'
 
         $ok = Undo-Installation -DeploymentRoot $slots.Root -CapturedTask @()
         Assert-False $ok 'the installer was told the rollback succeeded'

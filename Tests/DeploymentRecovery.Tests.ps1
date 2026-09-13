@@ -243,8 +243,15 @@ Test-Case 'A rollback refuses a DIFFERENT build that shares the version it moved
         Assert-False $restored.Restored 'a build this run never moved aside was reported as the one it put back'
         Assert-True ([string]$restored.Reason -match 'different files') ([string]$restored.Reason)
 
-        # Reported, not destroyed: whatever it is, it is what the operator has.
-        Assert-Equal '# a different build of 1.2.0' (Get-SlotRunContent -Slot $slots.Root) 'the refusal deleted the tree it could not identify'
+        # And it is caught BEFORE the delete, not after it (ledger WAC-02R). The in-process rollback
+        # used to check only that a directory existed in the recovery slot, promote whatever was in
+        # it, and compare afterwards - so the refusal it reported had already deleted the verified
+        # tree and put the unidentifiable one at the path SYSTEM executes. Both trees survive now,
+        # and the one the machine runs is still the one this run proved.
+        Assert-Equal '# replacement v2' (Get-SlotRunContent -Slot $slots.Root) `
+            'the refusal deleted the verified deployment to put back a tree it could not identify'
+        Assert-Equal '# a different build of 1.2.0' (Get-SlotRunContent -Slot $slots.Previous) `
+            'the refusal destroyed the tree it could not identify'
     }
 }
 
@@ -562,12 +569,18 @@ Test-Case 'A record from a NEWER build than this one is refused rather than half
 
         [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
         [void](Switch-WacDeploymentStage -KeepPrevious)
-        [void](Set-FixtureJournalSchema -Root $slots.Root -Schema 3)
+
+        # One past whatever this build actually wrote, read off the record itself rather than
+        # hard-coded. A literal went stale the moment the schema was bumped for the generation id:
+        # the number this case called "newer" became the number this build writes, so the case
+        # started proving that a CURRENT record is readable and nothing about a future one.
+        $newer = [int](Read-WacDeploymentJournal -DeploymentRoot $slots.Root).Schema + 1
+        [void](Set-FixtureJournalSchema -Root $slots.Root -Schema $newer)
         Stop-FixtureProcess
 
         $read = Read-WacDeploymentJournal -DeploymentRoot $slots.Root
         Assert-Equal 'Unreadable' ([string]$read.State) 'a record from a build this one knows nothing about was acted on'
-        Assert-Equal 3 ([int]$read.Schema) 'the read did not report the schema it actually found'
+        Assert-Equal $newer ([int]$read.Schema) 'the read did not report the schema it actually found'
 
         $refused = $false
         $reason = ''

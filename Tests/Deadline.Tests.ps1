@@ -53,12 +53,16 @@ function Reset-WacTestDeadline {
     # Leaving an expired deadline armed would poison every later case in this process, and so would
     # a spent reserve or an outstanding abandoned mutator: all three are run-scoped state and are
     # reset together or not at all. The durable marker goes with them - Reset-WacAbandonedMutator
-    # deliberately cannot retire one, so a case that wrote it removes the file itself.
+    # deliberately cannot retire one, so a case that armed it retires the record itself.
+    #
+    # The record lives in the strict control store now (ledger WAC-14), which an unelevated suite
+    # cannot create in - so on a developer shell the write already fails and nothing reaches the
+    # machine. Retiring through the shipped function is what keeps an ELEVATED run of this suite
+    # from leaving one behind, and it is a no-op otherwise.
     Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
     Reset-WacShutdownReserve
     Reset-WacAbandonedMutator
-    $marker = Get-WacQuarantineMarkerPath
-    if ($marker -and [System.IO.File]::Exists($marker)) { [System.IO.File]::Delete($marker) }
+    [void](Remove-WacQuarantineMarker)
 }
 
 Test-Case 'A deadline that expires MID-directory stops the sweep' {

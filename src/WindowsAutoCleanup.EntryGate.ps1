@@ -8,8 +8,8 @@
     can only call what a module EXPORTS, the Deploy package's export list is fixed, and a decision
     both scripts have to make identically must not exist as two copies that drift.
 
-    Nothing here has a side effect. It reads two verdicts that Core has already produced and returns
-    a third, so the gate can be exercised directly rather than only through an elevated run against
+    Nothing here has a side effect. It reads verdicts that Core has already produced and returns a
+    third, so the gate can be exercised directly rather than only through an elevated run against
     the live Task Scheduler.
 #>
 
@@ -66,6 +66,22 @@ function Get-OperationSafetyVerdict {
             Ok = $false
             ExitCode = 7
             Reason = 'Refused before any change: whether the machine state directory is trustworthy was never established, and an unanswered trust question is not a yes. Nothing was staged, registered or deleted.'
+        }
+    }
+
+    # QUARANTINE ADMISSION, and it belongs HERE rather than in each entry point (ledger WAC-05R).
+    # Initialize-WacRun has already reconciled the durable record by the time either script reaches
+    # this gate, and both of them then unregister tasks and replace files - mutations every bit as
+    # real as a cleanup sweep. Only Run.ps1's step sequence was asking; the installer and the
+    # uninstaller went ahead over an unresolved mutation from an earlier run.
+    #
+    # Read rather than passed in: a parameter would have to be threaded through two call sites in
+    # two scripts, and a gate half its callers can forget to feed is not a gate.
+    if (-not (Test-WacMutationAllowed)) {
+        return [PSCustomObject]@{
+            Ok = $false
+            ExitCode = 6
+            Reason = 'Refused before any change: an earlier operation on this machine could not be proven finished, so nothing was staged, registered or deleted. Inspect the run that reported it before retrying.'
         }
     }
 
