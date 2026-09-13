@@ -405,4 +405,3 @@ function Test-JournalHas {
 
     return (@(@($Run.Journal) | Where-Object { $_ -match $Pattern }).Count -gt 0)
 }
-
