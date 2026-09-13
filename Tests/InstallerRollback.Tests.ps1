@@ -336,10 +336,19 @@ function Invoke-RollbackScenario {
     $console = ''
     if (Test-Path -LiteralPath $outFile -PathType Leaf) { $console = [System.IO.File]::ReadAllText($outFile) }
 
+    # The child's HOST wrapped this, so a phrase that reads as one line in the log can arrive with a
+    # newline inside it. Measured in CI: Windows PowerShell 5.1 broke
+    # "...; putting it back from the durable record." after "putting it " and the assertion matching
+    # "putting it back" failed on both images while pwsh passed. ConsoleText collapses every run of
+    # whitespace to one space so a text assertion cannot depend on the console width of whatever host
+    # ran the child; Console keeps the layout, because that is what makes a failure message readable.
+    $consoleText = ($console -replace '\s+', ' ')
+
     return [PSCustomObject]@{
         ExitCode = $exitCode
         Journal = @(@([System.IO.File]::ReadAllLines($journal)) | Where-Object { $_.Trim() })
         Console = $console
+        ConsoleText = $consoleText
         TimedOut = (-not $exited)
     }
 }
@@ -371,7 +380,7 @@ Test-Case 'A registration that fails after the old task was removed restores BOT
         # The exact definition that was captured, put back through the scheduler and read back.
         Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + (Get-CapturedTaskXml -Sandbox $sandbox)))) `
             ($run.Journal -join ' / ')
-        Assert-True ($run.Console -match 're-registered and verified') $run.Console
+        Assert-True ($run.ConsoleText -match 're-registered and verified') $run.Console
 
         # And the commit never happened: the previous tree is not thrown away on a failed run.
         Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacDeploymentPrevious$') ($run.Journal -join ' / ')
@@ -401,8 +410,8 @@ Test-Case 'A rollback that cannot prove the new task is gone KEEPS the deploymen
         Assert-False (Test-JournalHas -Run $run -Pattern '^Restore-WacDeploymentPrevious$') `
             ('the deployment was rolled back under a task whose removal was never proven: ' + ($run.Journal -join ' / '))
         Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacDeploymentPrevious$') ($run.Journal -join ' / ')
-        Assert-True ($run.Console -match 'KEPT') $run.Console
-        Assert-True ($run.Console -match 'rollback is INCOMPLETE') $run.Console
+        Assert-True ($run.ConsoleText -match 'KEPT') $run.Console
+        Assert-True ($run.ConsoleText -match 'rollback is INCOMPLETE') $run.Console
     }
     finally {
         Remove-TestSandbox -Path $sandbox
@@ -422,7 +431,7 @@ Test-Case 'A rollback whose scheduler will not answer KEEPS the deployment too' 
         Assert-True (Test-JournalHas -Run $run -Pattern '^Get-WacInstalledTask\|Failed$') ($run.Journal -join ' / ')
         Assert-False (Test-JournalHas -Run $run -Pattern '^Restore-WacDeploymentPrevious$') `
             ('the deployment was rolled back on an unanswered lookup: ' + ($run.Journal -join ' / '))
-        Assert-True ($run.Console -match 'could not be queried') $run.Console
+        Assert-True ($run.ConsoleText -match 'could not be queried') $run.Console
     }
     finally {
         Remove-TestSandbox -Path $sandbox
@@ -487,9 +496,9 @@ Test-Case 'A clean upgrade commits, rolls nothing back, and the second identical
                 ('{0} pass: a successful install rolled itself back' -f $pass)
             Assert-False (Test-JournalHas -Run $run -Pattern '^Register-ScheduledTask\|xml') `
                 ('{0} pass: a successful install re-registered the old task' -f $pass)
-            Assert-False ($run.Console -match 'Refused|refused|INCOMPLETE') `
+            Assert-False ($run.ConsoleText -match 'Refused|refused|INCOMPLETE') `
                 ('{0} pass: a benign upgrade reported a refusal: {1}' -f $pass, $run.Console)
-            Assert-True ($run.Console -match 'Final status: success') ('{0} pass: {1}' -f $pass, $run.Console)
+            Assert-True ($run.ConsoleText -match 'Final status: success') ('{0} pass: {1}' -f $pass, $run.Console)
         }
     }
     finally {
@@ -532,7 +541,7 @@ Test-Case 'A budget that runs out before the staging phase leaves the machine un
 
         Assert-False $run.TimedOut 'the installer never finished inside its bound'
         Assert-Equal 1 $run.ExitCode $run.Console
-        Assert-True ($run.Console -match 'run budget expired before the runtime was staged') $run.Console
+        Assert-True ($run.ConsoleText -match 'run budget expired before the runtime was staged') $run.Console
 
         # The margin is what makes the deadline enforceable: without it the budget the phases stop
         # at is the same instant the rollback would have to start from.
@@ -570,7 +579,7 @@ Test-Case 'A budget that runs out after the swap rolls the tree and the task bac
             ('the task the upgrade removed was not put back: ' + ($run.Journal -join ' / '))
         Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacDeploymentPrevious$') `
             ('the rollback point was discarded on a run that did not commit: ' + ($run.Journal -join ' / '))
-        Assert-True ($run.Console -match 'budget expired after the swap') $run.Console
+        Assert-True ($run.ConsoleText -match 'budget expired after the swap') $run.Console
     }
     finally {
         Remove-TestSandbox -Path $sandbox
@@ -590,7 +599,7 @@ Test-Case 'A capture that cannot be made durable leaves the machine exactly as i
         Assert-Equal 1 $run.ExitCode $run.Console
         Assert-True (Test-JournalHas -Run $run -Pattern '^Write-WacTaskCaptureRecord\|1$') `
             ('the conflict phase never tried to record what it was about to remove: ' + ($run.Journal -join ' / '))
-        Assert-True ($run.Console -match 'left registered and nothing was changed') $run.Console
+        Assert-True ($run.ConsoleText -match 'left registered and nothing was changed') $run.Console
 
         foreach ($forbidden in @('^Switch-WacDeploymentStage$', '^Register-ScheduledTask', '^Remove-WacDeploymentPrevious$')) {
             Assert-False (Test-JournalHas -Run $run -Pattern $forbidden) `
@@ -661,7 +670,7 @@ Test-Case 'A run that finds a capture record re-registers the lost task before i
             ('the run never read the record left by the one that died: ' + ($run.Journal -join ' / '))
         Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + $xml))) `
             ('the lost registration was not put back: ' + ($run.Journal -join ' / '))
-        Assert-True ($run.Console -match 'putting it back') $run.Console
+        Assert-True ($run.ConsoleText -match 'putting it back') $run.Console
 
         # Before anything was staged, and the record is gone once the task is accounted for.
         $reregister = @(0..($run.Journal.Count - 1) | Where-Object { $run.Journal[$_] -match '^Register-ScheduledTask\|xml' })
