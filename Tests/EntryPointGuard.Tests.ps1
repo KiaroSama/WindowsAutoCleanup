@@ -245,7 +245,7 @@ Test-Case 'An untrusted state path refuses both entry points before anything is 
                     Assert-NothingMutated -Run $run -Label $label -ScriptName $name -Refused
 
                     # The refusal came out of the CONSOLE, not through the path it just refused.
-                    Assert-True ($run.Console -match 'Refused before any change') ('{0}: {1}' -f $label, $run.Console)
+                    Assert-True ($run.ConsoleText -match 'Refused before any change') ('{0}: {1}' -f $label, $run.Console)
                 }
             }
         }
@@ -269,7 +269,7 @@ Test-Case 'An unanswered state-trust question and a lost audit log refuse just a
             $indeterminate = Invoke-StubbedEntryPoint -Sandbox $sandbox -ScriptName $name -StateMode 'null'
             Assert-Equal 7 $indeterminate.ExitCode ('{0} indeterminate: {1}' -f $name, $indeterminate.Console)
             Assert-NothingMutated -Run $indeterminate -Label ('{0} indeterminate' -f $name) -ScriptName $name -Refused
-            Assert-True ($indeterminate.Console -match 'never established') $indeterminate.Console
+            Assert-True ($indeterminate.ConsoleText -match 'never established') $indeterminate.Console
 
             $undurable = Invoke-StubbedEntryPoint -Sandbox $sandbox -ScriptName $name -StateMode 'trusted' `
                 -StatePath 'C:\Windows' -StateReason 'stub' -LogDurable $false
@@ -303,7 +303,7 @@ Test-Case 'A benign, trusted machine is let through - and is still benign the se
                 Assert-NothingMutated -Run $run -Label ('{0} {1} pass' -f $name, $pass)
                 Assert-True ($run.Called -contains $script:GatePassedMarker[$name]) `
                     ('{0} {1} pass: a benign run was stopped by the gate; calls: {2}' -f $name, $pass, ($run.Called -join ', '))
-                Assert-False ($run.Console -match 'Refused before any change') `
+                Assert-False ($run.ConsoleText -match 'Refused before any change') `
                     ('{0} {1} pass: a benign steady state produced a security refusal' -f $name, $pass)
 
                 # The other half of the refusal rule: a run the gate LET THROUGH does write its
@@ -341,7 +341,7 @@ Test-Case 'A run whose budget is already gone stops before it inspects or change
             Assert-NothingMutated -Run $run -Label ('{0} expired budget' -f $name)
             Assert-False ($run.Called -contains $script:GatePassedMarker[$name]) `
                 ('{0}: an expired budget did not stop the run; calls: {1}' -f $name, ($run.Called -join ', '))
-            Assert-True ($run.Console -match 'run budget expired') $run.Console
+            Assert-True ($run.ConsoleText -match 'run budget expired') $run.Console
 
             # It crossed the gate, so it IS entitled to its log - and the expiry is recorded in it.
             Assert-True (@($run.LogWrites | Where-Object { $_ -match 'run budget expired' }).Count -gt 0) `
@@ -378,15 +378,15 @@ Test-Case 'Neither wrapper reports an unproven termination as proof, and neither
                 Assert-True ($run.Called -contains 'Stop-WacProcessTree') `
                     ('{0}: the wrapper never tried to terminate the child; calls: {1}' -f $name, ($run.Called -join ', '))
                 Assert-Equal 8 $run.ExitCode ('{0}: an unproven termination did not get its own exit code: {1}' -f $name, $run.Console)
-                Assert-True ($run.Console -match 'could NOT be proven terminated') $run.Console
-                Assert-False ($run.Console -match 'proven gone') `
+                Assert-True ($run.ConsoleText -match 'could NOT be proven terminated') $run.Console
+                Assert-False ($run.ConsoleText -match 'proven gone') `
                     ('{0}: an unproven termination was reported as proof: {1}' -f $name, $run.Console)
                 # The success text ends "...; re-run the installer." and this path must never carry
                 # it. The negative form the CRITICAL line DOES carry is asserted right after, so
                 # this cannot be satisfied by a wrapper that simply stopped saying anything.
-                Assert-False ($run.Console -match ';\s*re-run the ') `
+                Assert-False ($run.ConsoleText -match ';\s*re-run the ') `
                     ('{0}: the operator was told to re-run over a live child: {1}' -f $name, $run.Console)
-                Assert-True ($run.Console -match 'Do NOT re-run the ') `
+                Assert-True ($run.ConsoleText -match 'Do NOT re-run the ') `
                     ('{0}: the operator was not told to leave the live child alone: {1}' -f $name, $run.Console)
 
                 # And the report was accurate: the child really is still there, still holding the
@@ -412,8 +412,8 @@ Test-Case 'Neither wrapper reports an unproven termination as proof, and neither
                 -Admin $false -HostPath $stubHost -ChildPid 0 -Termination 'proven'
 
             Assert-Equal 1 $proven.ExitCode ('{0} proven: {1}' -f $name, $proven.Console)
-            Assert-True ($proven.Console -match 'terminated and proven gone') $proven.Console
-            Assert-False ($proven.Console -match 'could NOT be proven terminated') $proven.Console
+            Assert-True ($proven.ConsoleText -match 'terminated and proven gone') $proven.Console
+            Assert-False ($proven.ConsoleText -match 'could NOT be proven terminated') $proven.Console
         }
     }
     finally {

@@ -250,11 +250,20 @@ function Invoke-StubbedEntryPoint {
     $console = ''
     if (Test-Path -LiteralPath $outFile -PathType Leaf) { $console = [System.IO.File]::ReadAllText($outFile) }
 
+    # The child's HOST wrapped this, so a phrase that reads as one line in the log can arrive with a
+    # newline inside it. Measured in CI: Windows PowerShell 5.1 broke
+    # "...; putting it back from the durable record." after "putting it " and the assertion matching
+    # "putting it back" failed on both images while pwsh passed. ConsoleText collapses every run of
+    # whitespace to one space so a text assertion cannot depend on the console width of whatever host
+    # ran the child; Console keeps the layout, because that is what makes a failure message readable.
+    $consoleText = ($console -replace '\s+', ' ')
+
     return [PSCustomObject]@{
         ExitCode = $exitCode
         Called = @(@([System.IO.File]::ReadAllLines($callFile)) | Where-Object { $_.Trim() })
         LogWrites = @(@([System.IO.File]::ReadAllLines($logFile)) | Where-Object { $_.Trim() })
         Console = $console
+        ConsoleText = $consoleText
         TimedOut = (-not $exited)
     }
 }
