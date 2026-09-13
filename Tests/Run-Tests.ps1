@@ -282,9 +282,17 @@ try {
                 OutFile      = Join-Path -Path $workRoot -ChildPath ('{0}.out' -f $stem)
                 ErrFile      = Join-Path -Path $workRoot -ChildPath ('{0}.err' -f $stem)
                 Process      = $null
-                Start        = [datetime]::UtcNow
-                LastProgress = [datetime]::UtcNow
-                LastSize     = -1L
+                # A STOPWATCH, not UtcNow. These two numbers are the only thing standing between a
+                # hung suite and a run that never ends, and a civil clock moved backwards by an NTP
+                # or DST correction stretches both by however far it jumped - inside the one bound
+                # whose whole purpose is to be bounded. The shipped code made exactly this
+                # correction for its own tree wait (ledger WAC-06R); the runner that enforces the
+                # bounds had been left reading the movable clock.
+                Watch          = [System.Diagnostics.Stopwatch]::StartNew()
+                # Progress is a READING OF THAT STOPWATCH rather than an instant, so the idle
+                # measure is a difference between two monotonic samples and never mixes clocks.
+                LastProgressMs = 0.0
+                LastSize       = -1L
             }
 
             # One pre-quoted string: Start-Process joins an array with plain spaces on Windows
@@ -312,16 +320,17 @@ try {
 
         for ($i = $running.Count - 1; $i -ge 0; $i--) {
             $job = $running[$i]
-            $now = [datetime]::UtcNow
-            $elapsed = ($now - $job.Start).TotalSeconds
+            # One sample per pass, so elapsed and idle cannot disagree about when "now" was.
+            $elapsedMs = $job.Watch.Elapsed.TotalMilliseconds
+            $elapsed = $elapsedMs / 1000
 
             $size = Get-JobOutputSize -Job $job
             if ($size -ne $job.LastSize) {
                 $job.LastSize = $size
-                $job.LastProgress = $now
+                $job.LastProgressMs = $elapsedMs
             }
 
-            $idle = ($now - $job.LastProgress).TotalSeconds
+            $idle = ($elapsedMs - $job.LastProgressMs) / 1000
             $timeoutReason = $null
             if (-not $job.Process.HasExited) {
                 if ($elapsed -ge $TimeoutSeconds) { $timeoutReason = 'wall' }
@@ -357,7 +366,7 @@ try {
                 HostKind   = $job.HostKind
                 ExitCode   = $exitCode
                 TimedOut   = $timeoutReason
-                DurationS  = [math]::Round(([datetime]::UtcNow - $job.Start).TotalSeconds, 1)
+                DurationS  = [math]::Round($job.Watch.Elapsed.TotalSeconds, 1)
                 Output     = (Get-JobText -Path $job.OutFile)
                 ErrorText  = (Get-JobText -Path $job.ErrFile)
             })
