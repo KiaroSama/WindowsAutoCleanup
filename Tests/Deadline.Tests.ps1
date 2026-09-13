@@ -293,7 +293,7 @@ Test-Case 'Invoke-WacBounded cuts off in-process work that blocks, and calls it 
         # it, importing this module - is now charged to the same bound, so a 500 ms budget is one a
         # loaded eight-worker runner can legitimately spend entirely on the prologue: the block is
         # then never scheduled, Started is $false, and this case failed for a reason that is not its
-        # own. That outcome is correct and has its own case ("a slow module import is charged to the
+        # own. That outcome is correct and has its own case ("setup that outlasts the bound schedules
         # bound"); THIS one is about work that really starts and really blocks, so it gets a budget
         # the prologue cannot swallow. The sleep stays comfortably longer than the bound and short
         # enough that the abandoned runspace thread finishes well inside the suite.
@@ -468,25 +468,20 @@ Test-Case 'the directory phase consults a deadline that expired during the sweep
 # WAC-06R: setup is charged to the same bound as the work
 # ---------------------------------------------------------------------------------------------
 
-Test-Case 'a slow module import is charged to the bound, and work that no longer fits is never scheduled' {
-    # Invoke-WacBounded sized its budget, THEN created a runspace, opened it and imported modules -
-    # all synchronous - and only then waited the ORIGINAL number. The real upper bound was therefore
-    # "setup + budget", not "budget", and a module whose own top-level code blocks makes the setup
-    # half arbitrarily large. That is the "delayed module import/open" case: the run deadline exists
-    # to cap total wall time, and an unaccounted prologue defeats it.
+Test-Case 'setup that outlasts the bound schedules no work at all' {
+    # Creating and opening the runspace is still synchronous, still costs real milliseconds, and is
+    # still charged to the same bound - so a budget smaller than that prologue must schedule nothing
+    # rather than grant the work its full allowance afterwards.
     #
-    # The import sleeps rather than the block, because the block is not what was unbounded. An import
-    # failure would surface as Failed, so Incomplete here also proves the module loaded normally.
-    $sandbox = New-TestSandbox -Prefix 'bounded-import'
+    # A blocked MODULE IMPORT is no longer this case's business. The import moved inside the bounded
+    # pipeline, where the same wait that cuts off the work cuts it off too, and
+    # BudgetBoundary.Tests.ps1 proves it returns inside the bound instead of when the import
+    # eventually finishes. What is left here is the prologue itself, driven with a bound no runspace
+    # open can fit into.
     try {
         Reset-WacTestDeadline
-        $slow = Join-Path -Path $sandbox -ChildPath 'SlowImport.psm1'
-        [System.IO.File]::WriteAllText(
-            $slow,
-            "[System.Threading.Thread]::Sleep(600)`r`nfunction Get-SlowImportMarker { 'imported' }`r`n",
-            (New-Object 'System.Text.UTF8Encoding' -ArgumentList $false))
 
-        $result = Invoke-WacBounded -ScriptBlock { 'ran anyway' } -TimeoutMs 250 -ImportModule @($slow)
+        $result = Invoke-WacBounded -ScriptBlock { 'ran anyway' } -TimeoutMs 1
 
         Assert-Equal 'Incomplete' ([string]$result.Outcome) `
             ('setup that outlasted the bound did not report unfinished work: ' + [string]$result.Error)

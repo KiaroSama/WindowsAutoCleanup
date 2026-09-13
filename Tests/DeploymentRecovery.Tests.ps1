@@ -447,13 +447,15 @@ Test-Case 'A TORN transaction record preserves both trees instead of authorising
 
 Test-Case 'A recovery slot nobody can vouch for is never promoted onto the deployment root' {
     # Being OURS is not being SAFE. A slot is promoted into the path SYSTEM executes, so it gets the
-    # same trust walk the deployment root gets - and this case is the one that leaves that walk REAL,
-    # against a TEMP sandbox that genuinely is writable by a non-administrative principal. Everything
-    # else about the fixture is the "empty root" shape that normally promotes.
+    # same trust walk the deployment root gets, and this case proves what the gate DOES with an
+    # untrusted answer. The answer is forced rather than inherited from the machine's TEMP ACL: the
+    # first version left the walk real, passed on a developer profile and failed on the CI runner,
+    # because it was measuring the runner rather than the code. Everything else about the fixture is
+    # the "empty root" shape that normally promotes.
     #
     # Nothing is touched on refusal: an operator who has lost the live tree still has the copy.
     Reset-RecoveryFixture
-    Invoke-InDeploymentSandbox -Prefix 'wac02r-untrusted' -RealTrust -Body {
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-untrusted' -UntrustedSandbox -Body {
         param($sandbox)
 
         [void](Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1')

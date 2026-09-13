@@ -5,7 +5,15 @@
 .DESCRIPTION
     Dot-sourced by Invoke-ElevatedVerification.ps1. Every scenario here runs the real Run.ps1
     against a sandboxed %ProgramData% and leaves this machine's own state alone; the scenarios that
-    deliberately change the machine live in _ElevatedVerification.MachineScenarios.ps1.
+    deliberately change the machine live in _ElevatedVerification.MachineScenarios.ps1 and in
+    _ElevatedVerification.MaintenanceScenario.ps1.
+
+    "Leaves this machine's own state alone" used to be true only of FILES (ledger WAC-10R). The
+    scratch copy replaced the allow-list builder but kept the real maintenance modules, so EXIT2 and
+    the uncontended EXIT3 control executed the real online DISM, the real pnpclean handler and the
+    real Delivery Optimization purge while being reported as sandbox scope. Every child launched
+    from here now also carries _SandboxMaintenanceFixture.psm1, and each scenario PROVES from that
+    fixture's witness which maintenance steps it reached and that every one of them was stopped.
 #>
 
 # ------------------------------------------------------------------------------------------------
@@ -48,7 +56,7 @@ function Invoke-Exit5Scenario {
         $sandbox = New-VerificationSandbox -Prefix 'wac-exit5'
         $baitFile = Join-Path -Path (New-SandboxBait -Sandbox $sandbox) -ChildPath 'bait.txt'
 
-        $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
+        $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox -InterceptMaintenance) `
             -MutexName (New-VerificationMutexName)
         $table = Get-SandboxEnvironment -Sandbox $sandbox -Extra @{ SystemDrive = 'Z:' }
 
@@ -79,6 +87,11 @@ function Invoke-Exit5Scenario {
         else {
             [void]$evidence.Add(('bait intact: {0}' -f $baitFile))
         }
+
+        # The exit-5 gate sits BEFORE the first maintenance step, so this child must have reached
+        # none of them. It is the negative control for the other two scenarios' witness assertions:
+        # a fixture that wrote its lines unconditionally would fail here.
+        Add-MaintenanceEvidence -Evidence $evidence -Problem $problem -Sandbox $sandbox -Label 'the unsupported-drive run'
     }
     catch {
         [void]$problem.Add(('the scenario threw: {0}' -f $_.Exception.Message))
@@ -140,9 +153,9 @@ function Invoke-Exit3Scenario {
 
         # One command line, but a scratch tree each: the fixture in a child's copy is pinned to the
         # sandbox whose environment that child is given, and the two runs use different sandboxes.
-        $firstCommandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $firstSandbox) `
+        $firstCommandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $firstSandbox -InterceptMaintenance) `
             -MutexName $mutexName
-        $secondCommandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $secondSandbox) `
+        $secondCommandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $secondSandbox -InterceptMaintenance) `
             -MutexName $mutexName
 
         $heldMutex = Enter-WacSingleInstance -Name $mutexName
@@ -178,6 +191,10 @@ function Invoke-Exit3Scenario {
             else {
                 [void]$evidence.Add(('locked-out run mutated nothing: {0} intact' -f $secondBait))
             }
+
+            # "Mutated nothing" has to cover the machine as well as the sandbox: the exit-3 branch
+            # is ahead of every maintenance step, so the locked-out run must have reached none.
+            Add-MaintenanceEvidence -Evidence $evidence -Problem $problem -Sandbox $secondSandbox -Label 'the locked-out run'
         }
         finally {
             Exit-WacSingleInstance -Mutex $heldMutex
@@ -202,6 +219,12 @@ function Invoke-Exit3Scenario {
         else {
             [void]$evidence.Add('the uncontended control deleted its own bait')
         }
+
+        # THE CONTROL IS THE ONE THAT USED TO SERVICE THIS MACHINE (ledger WAC-10R). It runs the
+        # whole cleanup phase, so it must have reached every maintenance step and been stopped at
+        # each - the opposite expectation from the locked-out run above, from the same witness.
+        Add-MaintenanceEvidence -Evidence $evidence -Problem $problem -Sandbox $firstSandbox `
+            -Label 'the uncontended control' -ExpectFullSequence
     }
     catch {
         [void]$problem.Add(('the scenario threw: {0}' -f $_.Exception.Message))
@@ -227,6 +250,101 @@ function Invoke-Exit3Scenario {
 # ------------------------------------------------------------------------------------------------
 # Scenario EXIT2 - the run completed with at least one real failure
 # ------------------------------------------------------------------------------------------------
+
+function Test-Exit2TargetEvidence {
+    <#
+    .SYNOPSIS
+        Judges every '[Result] Target complete.' line a run produced against ONE immutable bait
+        directory: all inside the sandbox, and the failure belongs to the bait alone.
+    .DESCRIPTION
+        PURE, and separate from the scenario, because the bug it closes was invisible while the two
+        were one block (ledger WAC-10R). The scenario stored its bait path in $target and then
+        REUSED $target as the loop variable that receives each line's own path, so by the time the
+        bait assertion ran, $target held whichever target the child happened to report LAST. With a
+        single result line the two values are the same string and the defect cannot be seen; with
+        several - which is the normal case, since the fixture always names three - the assertion was
+        checking a different directory than the one the locked subdirectory was planted in.
+
+        So the bait path arrives as a parameter and is never assigned to. Each line's path is read
+        into its OWN variable, compared with the bait by normalised equality rather than by
+        substring (a sibling '...\LocalCopy2' contains '...\LocalCopy'), and the order the child
+        reported the targets in cannot change the answer.
+
+        The failure claim is two-sided. The bait line must carry failed=1, and no other line may
+        carry a failed= field at all - Write-WacTreeResult omits the field entirely at zero, so
+        "failed=0" is not a thing any clean line says, and asking whether the field is PRESENT is
+        what proves the exit 2 came from the bait rather than from something else in the run.
+    .OUTPUTS
+        Evidence and Problem, both string arrays.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Sandbox,
+        [Parameter(Mandatory = $true)][string]$BaitTarget
+    )
+
+    $evidence = New-Object 'System.Collections.Generic.List[string]'
+    $problem = New-Object 'System.Collections.Generic.List[string]'
+
+    $normalizedSandbox = Get-WacNormalizedPath -Path $Sandbox
+    $normalizedBait = Get-WacNormalizedPath -Path $BaitTarget
+    if (-not $normalizedSandbox -or -not $normalizedBait) {
+        [void]$problem.Add(('the sandbox {0} or the bait directory {1} does not normalise, so no result line can be judged' -f $Sandbox, $BaitTarget))
+        return [PSCustomObject]@{ Evidence = @($evidence.ToArray()); Problem = @($problem.ToArray()) }
+    }
+
+    $resultLines = @(Get-MatchingLine -Text $Text -Needle '[Result] Target complete.')
+    if ($resultLines.Count -lt 1) {
+        [void]$problem.Add('the log shows no cleaned target at all, so the sweep never ran')
+    }
+
+    $baitLine = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($line in $resultLines) {
+        [void]$evidence.Add($line)
+
+        # EVERY touched target must lie inside the sandbox: a [Result] line for a path outside it
+        # would mean an allow-list entry on the real machine was cleaned for real. That is the
+        # invariant; the COUNT is not - 'Defender cleanup files' has two entries and a guest where
+        # both exist legitimately completes two targets, which is why this checks each path rather
+        # than demanding one line.
+        $linePath = Get-ResultLinePath -Line $line
+        if ([string]::IsNullOrWhiteSpace($linePath)) {
+            [void]$problem.Add(('a result line carries no readable path, so containment cannot be proven: {0}' -f $line))
+            continue
+        }
+
+        $normalizedLine = Get-WacNormalizedPath -Path $linePath
+        if (-not $normalizedLine) {
+            [void]$problem.Add(('a result path could not be normalised, so containment cannot be proven: {0}' -f $line))
+            continue
+        }
+        if (-not (Test-WacIsWithinRoot -ChildPath $normalizedLine -RootPath $normalizedSandbox)) {
+            [void]$problem.Add(('a target outside the sandbox was cleaned for real: {0}' -f $line))
+            continue
+        }
+
+        if ([string]::Equals($normalizedLine, $normalizedBait, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void]$baitLine.Add($line)
+        }
+        elseif (Test-KeyPresent -Line $line -Key 'failed') {
+            [void]$problem.Add(('a target other than the bait reported a failure, so exit 2 is not attributable to the locked directory: {0}' -f $line))
+        }
+    }
+
+    if ($baitLine.Count -ne 1) {
+        [void]$problem.Add(('expected exactly one result line for the bait directory {0}, got {1}' -f $normalizedBait, $baitLine.Count))
+        return [PSCustomObject]@{ Evidence = @($evidence.ToArray()); Problem = @($problem.ToArray()) }
+    }
+
+    if (-not (Test-KeyValue -Line $baitLine[0] -Pair 'failed=1')) {
+        [void]$problem.Add(('the bait target did not report exactly failed=1, so the locked directory never reached the Failed bucket: {0}' -f $baitLine[0]))
+    }
+    else {
+        [void]$evidence.Add(('the bait target {0} is the one that reported failed=1' -f $normalizedBait))
+    }
+
+    return [PSCustomObject]@{ Evidence = @($evidence.ToArray()); Problem = @($problem.ToArray()) }
+}
 
 function Invoke-Exit2Scenario {
     <#
@@ -274,18 +392,25 @@ function Invoke-Exit2Scenario {
 
     try {
         $sandbox = New-VerificationSandbox -Prefix 'wac-exit2'
-        $target = New-SandboxBait -Sandbox $sandbox
+
+        # IMMUTABLE for the rest of the scenario. It is read back after the child has run, so
+        # nothing below may assign to it - which is exactly what the old spelling did.
+        $baitTarget = New-SandboxBait -Sandbox $sandbox
+
+        # The fixture's other two directories, so the child completes SEVERAL targets and the bait
+        # is not simply the last line in the log by default.
+        [void](New-SandboxSiblingTarget -Sandbox $sandbox)
 
         # bait.txt proves the sweep really ran; the locked subdirectory produces the failure.
-        $deletable = Join-Path -Path $target -ChildPath 'bait.txt'
-        $lockedDirectory = Join-Path -Path $target -ChildPath 'locked'
+        $deletable = Join-Path -Path $baitTarget -ChildPath 'bait.txt'
+        $lockedDirectory = Join-Path -Path $baitTarget -ChildPath 'locked'
         $survivor = Join-Path -Path $lockedDirectory -ChildPath 'inside.txt'
         [void][System.IO.Directory]::CreateDirectory($lockedDirectory)
         [System.IO.File]::WriteAllText($survivor, 'inside', $script:Utf8NoBom)
 
         $handle = [WacVerificationLock]::Open($lockedDirectory)
 
-        $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
+        $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox -InterceptMaintenance) `
             -MutexName (New-VerificationMutexName)
         $child = Start-VerificationChild -CommandLine $commandLine `
             -Environment (Get-SandboxEnvironment -Sandbox $sandbox)
@@ -301,53 +426,12 @@ function Invoke-Exit2Scenario {
 
         $text = Get-SandboxLogText -Sandbox $sandbox
 
-        # EVERY touched target must lie inside the sandbox: a [Result] line for a path outside it
-        # would mean an allow-list entry on the real machine was cleaned for real. That is the
-        # invariant; the count is not. This used to demand exactly one line, which is an
-        # assumption about the MACHINE rather than about containment - 'Defender cleanup files'
-        # has two entries (LocalCopy and Support, Targets.psm1), both built from %ProgramData%
-        # and therefore both redirected into the sandbox, so a guest where the second one exists
-        # legitimately completes two targets. Windows Sandbox happened to have only the first,
-        # and a Hyper-V guest failed the scenario on that difference alone while containment was
-        # intact. Checking every path is strictly stronger than counting lines and carries no
-        # environment assumption.
-        $resultLines = @(Get-MatchingLine -Text $text -Needle '[Result] Target complete.')
-        if ($resultLines.Count -lt 1) {
-            [void]$problem.Add('the log shows no cleaned target at all, so the sweep never ran')
-        }
-        foreach ($line in $resultLines) {
-            [void]$evidence.Add($line)
-            # A SUBSTRING test was wrong in both directions. It accepted a sibling - the sandbox
-            # `...\wac-exit2_ab12` is a substring of `...\wac-exit2_ab12-other`, so a target in
-            # a different directory whose name merely starts with the sandbox's passed - and it
-            # matched the sandbox path wherever it appeared in the line, including inside an
-            # unrelated field. The path is taken from the line's own `path=` field and compared
-            # with the shipped containment rule, which is prefix-safe at the separator.
-            $target = Get-ResultLinePath -Line $line
-            if ([string]::IsNullOrWhiteSpace($target)) {
-                [void]$problem.Add(('a result line carries no readable path, so containment cannot be proven: {0}' -f $line))
-                continue
-            }
-            $normalizedTarget = Get-WacNormalizedPath -Path $target
-            $normalizedSandbox = Get-WacNormalizedPath -Path $sandbox
-            if (-not $normalizedTarget -or -not $normalizedSandbox) {
-                [void]$problem.Add(('a result path could not be normalised, so containment cannot be proven: {0}' -f $line))
-                continue
-            }
-            if (-not (Test-WacIsWithinRoot -ChildPath $normalizedTarget -RootPath $normalizedSandbox)) {
-                [void]$problem.Add(('a target outside the sandbox was cleaned for real: {0}' -f $line))
-            }
-        }
-
-        # The bait target specifically: it is the one the locked subdirectory was planted in, so
-        # it is the one that proves the failure reached the Failed bucket rather than a skip.
-        $baitLines = @($resultLines | Where-Object { $_.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
-        if ($baitLines.Count -ne 1) {
-            [void]$problem.Add(('expected exactly one result line for the sandbox bait directory {0}, got {1}' -f $target, $baitLines.Count))
-        }
-        elseif (-not (Test-KeyValue -Line $baitLines[0] -Pair 'failed=1')) {
-            [void]$problem.Add('the target result did not report exactly failed=1, so the locked directory never reached the Failed bucket')
-        }
+        # Containment and attribution, judged against the IMMUTABLE bait path rather than against
+        # whatever the loop last parsed. Both halves are in one pure function so the ordering they
+        # depend on can be exercised without an elevated child.
+        $targetVerdict = Test-Exit2TargetEvidence -Text $text -Sandbox $sandbox -BaitTarget $baitTarget
+        foreach ($line in @($targetVerdict.Evidence)) { [void]$evidence.Add($line) }
+        foreach ($line in @($targetVerdict.Problem)) { [void]$problem.Add($line) }
 
         # The totals line disambiguates: exactly failed=1 proves the exit 2 came from this
         # deletion and not from an unrelated DISM or pnpclean failure on the operator's machine.
@@ -374,6 +458,13 @@ function Invoke-Exit2Scenario {
         if (-not (Test-Path -LiteralPath $survivor -PathType Leaf)) {
             [void]$problem.Add('the file inside the locked directory was deleted, so the lock did not hold')
         }
+
+        # THIS SCENARIO IS THE ONE THAT USED TO SERVICE THIS MACHINE (ledger WAC-10R). It runs the
+        # entire cleanup phase, so every maintenance step must appear in the witness as reached and
+        # intercepted, and no tool may have been launched - while the file failure above still
+        # drives the exit 2.
+        Add-MaintenanceEvidence -Evidence $evidence -Problem $problem -Sandbox $sandbox `
+            -Label 'the failing run' -ExpectFullSequence
     }
     catch {
         [void]$problem.Add(('the scenario threw: {0}' -f $_.Exception.Message))

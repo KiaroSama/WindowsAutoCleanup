@@ -558,7 +558,8 @@ function Invoke-DriversScenario {
             # could only disable categories the parent was able to name.
             $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
                 -MutexName (New-VerificationMutexName) -PruneSupersededDrivers
-            $child = Start-VerificationChild -CommandLine $commandLine `
+            # -AllowRealMaintenance: MACHINE scope by definition, so the launch gate is told by name.
+            $child = Start-VerificationChild -CommandLine $commandLine -AllowRealMaintenance `
                 -Environment (Get-SandboxEnvironment -Sandbox $sandbox)
             $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs
             $exitCode = $result.ExitCode
@@ -691,7 +692,8 @@ function Invoke-CleanmgrScenario {
             # handlers are the only thing here that reaches the machine.
             $commandLine = Get-RunChildCommandLine -ScriptPath (New-VerificationScratchTree -Sandbox $sandbox) `
                 -MutexName (New-VerificationMutexName) -EnableLegacyDiskCleanup
-            $child = Start-VerificationChild -CommandLine $commandLine `
+            # -AllowRealMaintenance: MACHINE scope by definition, so the launch gate is told by name.
+            $child = Start-VerificationChild -CommandLine $commandLine -AllowRealMaintenance `
                 -Environment (Get-SandboxEnvironment -Sandbox $sandbox)
             $result = Wait-VerificationChild -Child $child -TimeoutMs $TimeoutMs
             $exitCode = $result.ExitCode

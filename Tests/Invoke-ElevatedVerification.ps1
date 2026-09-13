@@ -32,14 +32,20 @@
     not one. The harness proves that root is trusted before it starts anything. So the
     run log, the machine state directory and every cleanup target derived from those roots land
     inside the sandbox instead of on the operator's machine. The Recycle Bin is skipped with
-    -SkipRecycleBin and both destructive opt-ins are off.
+    -SkipRecycleBin and both destructive opt-ins are off. Each of these children also carries
+    Tests\_SandboxMaintenanceFixture.psm1, so no maintenance operation of any kind can reach this
+    machine from the sandboxed set - see the next paragraph but one.
 
-    MACHINE-CHANGING - DRIVERS, CLEANMGR. These exist to test the two opt-in steps, so by definition
-    they change the machine: DRIVERS exports and then deletes superseded oem<n>.inf driver packages,
-    and CLEANMGR runs cleanmgr /sagerun, which enumerates EVERY drive in the computer. They run only
-    when asked for by name or through -Scenario All; -Scenario Sandboxed runs the first three alone.
-    They redirect the same roots, get the same sandbox-only allow-list, and still skip the Recycle
-    Bin, so the only machine state either one may change is the state its own step owns.
+    MACHINE-CHANGING - DRIVERS, CLEANMGR, MAINTENANCE. These exist to test what really services the
+    machine, so by definition they change it: DRIVERS exports and then deletes superseded oem<n>.inf
+    driver packages, CLEANMGR runs cleanmgr /sagerun, which enumerates EVERY drive in the computer,
+    and MAINTENANCE runs the online DISM component store cleanup, the pnpclean driver package
+    handler and the Delivery Optimization cache purge. MAINTENANCE additionally refuses to do
+    anything unless WAC_VM_MAINTENANCE=1 is set for that run, and records Execution=NotArmed when it
+    is not, because a lane that refused has validated nothing. All three run only when asked for by
+    name or through -Scenario All; -Scenario Sandboxed runs the first three alone. They redirect the
+    same roots, get the same sandbox-only allow-list, and still skip the Recycle Bin, so the only
+    machine state any of them may change is the state its own step owns.
 
     DRIVERS is the one scenario whose evidence lives OUTSIDE the sandbox. Its exports go where the
     shipped Get-WacDriverBackupRoot says - %SystemRoot%\Logs\WindowsAutoCleanup\DriverBackup, which
@@ -50,23 +56,36 @@
     un-installable. Every child is launched with -ResetWindowsUpdateBase:$false, and DRIVERS and
     CLEANMGR both assert from the child's own log that it really was off.
 
-    WHAT THIS HARNESS STILL RUNS FOR REAL, and why it cannot be avoided: Steps' Get-WacSystemToolPath
-    resolves dism.exe, rundll32.exe and cleanmgr.exe under %SystemRoot%, so the only way to make
-    those steps report "not found" would be to redirect %SystemRoot%. That is not survivable:
-    measured on this project's two hosts, Windows PowerShell 5.1 refuses to start at all with a
-    redirected SystemRoot ("Internal Windows PowerShell error. Loading managed Windows PowerShell
-    failed with error 8009001d") and PowerShell 7 starts but loses CIM. So the EXIT2 scenario, and
-    the uncontended control of the EXIT3 scenario, do perform the real DISM component-store cleanup (WITHOUT
-    /ResetBase), the real pnpclean driver-package handler and the real Delivery Optimization cache
-    purge. All three are supported, non-destructive maintenance operations, and the harness never
-    kills them: the -BudgetMinutes budget handed to every child is DERIVED from -TimeoutSeconds so
-    that it always expires first, which means a slow tool is terminated by Run.ps1's own production
-    watchdog and never from outside. That ordering used to live in this comment only - any
-    -TimeoutSeconds below the fixed 20-minute budget was accepted and silently inverted it.
+    HOW THE SANDBOXED SET IS KEPT OUT OF THE MACHINE'S MAINTENANCE (ledger WAC-10R). Steps'
+    Get-WacSystemToolPath resolves dism.exe, rundll32.exe, pnputil.exe and cleanmgr.exe under
+    %SystemRoot%, so the obvious way to make those steps report "not found" would be to redirect
+    %SystemRoot%. That is not survivable: measured on this project's two hosts, Windows PowerShell
+    5.1 refuses to start at all with a redirected SystemRoot ("Internal Windows PowerShell error.
+    Loading managed Windows PowerShell failed with error 8009001d") and PowerShell 7 starts but
+    loses CIM. Until this repair, the consequence was that the EXIT2 scenario and the uncontended
+    control of the EXIT3 scenario really did perform the online DISM component-store cleanup, the
+    pnpclean driver-package handler and the Delivery Optimization cache purge, while the summary
+    called them sandbox scope.
+
+    They are cut off above the filesystem instead. The scratch copy each sandboxed child runs from
+    now also carries Tests\_SandboxMaintenanceFixture.psm1 over its Drivers module - the LAST module
+    Run.ps1 imports, so its entry points win - and that fixture also arms the two shipped invoker
+    seams, Set-WacProcessInvoker and Set-WacStepBoundedInvoker, so no external tool and no fresh
+    runspace can reach a real service either. Every interception is recorded in the sandbox, and
+    each sandboxed scenario asserts from that record which maintenance steps it reached and that all
+    of them were stopped. Start-VerificationChild REFUSES to launch a child whose tree has no such
+    fixture unless the caller declares -AllowRealMaintenance, so the safe answer is not something a
+    future scenario can forget. The real operations moved to the armed MAINTENANCE lane.
+
+    Nothing here kills a running tool: the -BudgetMinutes budget handed to every child is DERIVED
+    from -TimeoutSeconds so that it always expires first, which means a slow tool is terminated by
+    Run.ps1's own production watchdog and never from outside. That ordering used to live in this
+    comment only - any -TimeoutSeconds below the fixed 20-minute budget was accepted and silently
+    inverted it.
 
 .PARAMETER Scenario
-    EXIT5, EXIT3, EXIT2, DRIVERS, CLEANMGR, Sandboxed (the three sandboxed exit-code scenarios only)
-    or All (the default: all five).
+    EXIT5, EXIT3, EXIT2, DRIVERS, CLEANMGR, MAINTENANCE, Sandboxed (the three sandboxed exit-code
+    scenarios only) or All (the default: all six).
 
 .PARAMETER ResultPath
     Machine-readable JSON result file. Defaults to a timestamped file under
@@ -95,7 +114,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('EXIT5', 'EXIT3', 'EXIT2', 'DRIVERS', 'CLEANMGR', 'Sandboxed', 'All')][string]$Scenario = 'All',
+    [ValidateSet('EXIT5', 'EXIT3', 'EXIT2', 'DRIVERS', 'CLEANMGR', 'MAINTENANCE', 'Sandboxed', 'All')][string]$Scenario = 'All',
     [string]$ResultPath,
     [ValidateRange(60, 7200)][int]$TimeoutSeconds = 1800
 )
@@ -143,8 +162,10 @@ foreach ($moduleName in @('Core', 'Targets')) {
 # The scenarios and the infrastructure they share. Dot-sourced rather than imported: they run in
 # THIS script's scope, where the parameters above and the state Main sets up are the same variables.
 . (Join-Path -Path $PSScriptRoot -ChildPath '_ElevatedVerification.Harness.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath '_ElevatedVerification.Witness.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath '_ElevatedVerification.SandboxScenarios.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath '_ElevatedVerification.MachineScenarios.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath '_ElevatedVerification.MaintenanceScenario.ps1')
 
 # ------------------------------------------------------------------------------------------------
 # Main
@@ -208,7 +229,7 @@ if (-not $ResultPath) {
 }
 
 $script:SandboxedScenario = @('EXIT5', 'EXIT3', 'EXIT2')
-$script:MachineScenario = @('DRIVERS', 'CLEANMGR')
+$script:MachineScenario = @('DRIVERS', 'CLEANMGR', 'MAINTENANCE')
 
 $selected = @($Scenario)
 if ($Scenario -eq 'Sandboxed') { $selected = @($script:SandboxedScenario) }
@@ -220,8 +241,8 @@ Write-Host ''
 Write-Host ('WindowsAutoCleanup elevated verification - host {0}, scenarios {1}' -f $script:HostExe, ($selected -join ', '))
 Write-Host ('Sandbox root {0}; child budget {1} min (derived); wall timeout {2}s per child.' -f `
     $script:SandboxRoot, $script:ChildBudgetMinutes, $TimeoutSeconds)
-Write-Host 'The EXIT2 scenario and the uncontended EXIT3 control execute the real DISM component cleanup'
-Write-Host '(without /ResetBase), pnpclean and the Delivery Optimization purge; see the .DESCRIPTION.'
+Write-Host 'The sandboxed scenarios intercept every maintenance operation and prove it from their own'
+Write-Host 'witness; only the MACHINE rows below service this computer. See the .DESCRIPTION.'
 if ($machineSelected.Count -gt 0) {
     Write-Host ''
     Write-Host ('*** {0} CHANGE THIS MACHINE and are not sandboxed:' -f ($machineSelected -join ' and '))
@@ -229,6 +250,9 @@ if ($machineSelected.Count -gt 0) {
     Write-Host '***            root under %SystemRoot%\Logs. Nothing here ever deletes from that root, and'
     Write-Host '***            after a real removal the sandbox is KEPT too, for the run log of it.'
     Write-Host '***   CLEANMGR runs cleanmgr /sagerun, which enumerates EVERY drive in this computer.'
+Write-Host '***   MAINTENANCE runs the real online DISM component cleanup, the pnpclean driver package'
+Write-Host '***            handler and the Delivery Optimization cache purge - but ONLY when'
+Write-Host '***            WAC_VM_MAINTENANCE=1 is set for this run; otherwise it records NotArmed.'
     Write-Host '*** /ResetBase is excluded from every scenario. Use -Scenario Sandboxed for the safe set.'
 }
 Write-Host ''
@@ -246,6 +270,7 @@ foreach ($name in $selected) {
         'EXIT2' { $record = Invoke-Exit2Scenario -TimeoutMs $timeoutMs }
         'DRIVERS' { $record = Invoke-DriversScenario -TimeoutMs $timeoutMs }
         'CLEANMGR' { $record = Invoke-CleanmgrScenario -TimeoutMs $timeoutMs }
+        'MAINTENANCE' { $record = Invoke-MaintenanceScenario -TimeoutMs $timeoutMs }
         default { throw ('no scenario is wired up for {0}' -f $name) }
     }
 
@@ -268,6 +293,8 @@ $report = [PSCustomObject]@{
     PassedCount = ($records.Count - $failed.Count)
     FailedCount = $failed.Count
     MachineCount = @($records | Where-Object { $_.Machine }).Count
+    # The number that matters for a machine-changing claim: selected is not the same as performed.
+    ExecutedMachineCount = @($records | Where-Object { $_.Machine -and $_.Execution -ceq 'Executed' }).Count
     OverallPass = ($failed.Count -eq 0)
 }
 
@@ -285,10 +312,10 @@ catch {
     Write-Host ('WARNING the result file could not be written: {0}' -f $_.Exception.Message)
 }
 
-Write-Host '=========================================================================================='
-Write-Host ('{0,-9} {1,-8} {2,-7} {3,-7} {4,-7} {5,11}  {6}' -f `
-    'SCENARIO', 'SCOPE', 'RESULT', 'EXPECT', 'ACTUAL', 'DURATION', 'PROBLEMS')
-Write-Host '------------------------------------------------------------------------------------------'
+Write-Host '======================================================================================================'
+Write-Host ('{0,-12} {1,-8} {2,-12} {3,-7} {4,-7} {5,-7} {6,11}  {7}' -f `
+    'SCENARIO', 'SCOPE', 'EXECUTION', 'RESULT', 'EXPECT', 'ACTUAL', 'DURATION', 'PROBLEMS')
+Write-Host '------------------------------------------------------------------------------------------------------'
 
 # Sandboxed rows first, then a banner, then the rows that changed this machine. The separation is
 # the point: a reader must never have to remember which scenario names touch the real machine.
@@ -298,17 +325,21 @@ foreach ($record in $records) {
         Write-Host '--- these ones CHANGED THIS MACHINE (authorised, not sandboxed) ---------------------------'
         $machineHeaderShown = $true
     }
-    Write-Host ('{0,-9} {1,-8} {2,-7} {3,-7} {4,-7} {5,8} ms  {6}' -f `
+    # EXECUTION beside RESULT, because a PASS alone never says whether the work happened: an armed
+    # lane that refused passes its own guard and has validated nothing (ledger WAC-10R).
+    Write-Host ('{0,-12} {1,-8} {2,-12} {3,-7} {4,-7} {5,-7} {6,8} ms  {7}' -f `
         $record.Name,
         $(if ($record.Machine) { 'MACHINE' } else { 'sandbox' }),
+        $record.Execution,
         $(if ($record.Passed) { 'PASS' } else { 'FAIL' }),
         $record.ExpectedExitCode,
         $record.ActualExitCode,
         $record.DurationMs,
         @($record.Problem).Count)
 }
-Write-Host '=========================================================================================='
-Write-Host ('{0} of {1} scenario(s) passed.' -f $report.PassedCount, $records.Count)
+Write-Host '======================================================================================================'
+Write-Host ('{0} of {1} scenario(s) passed; {2} row(s) really changed this machine.' -f `
+    $report.PassedCount, $records.Count, $report.ExecutedMachineCount)
 if ($written) { Write-Host ('Result file: {0}' -f $written) }
 
 if ($failed.Count -gt 0) { exit 1 }

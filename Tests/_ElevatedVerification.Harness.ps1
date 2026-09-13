@@ -158,6 +158,33 @@ function New-SandboxBait {
     return $target
 }
 
+function New-SandboxSiblingTarget {
+    <#
+    .SYNOPSIS
+        Fills in the fixture's other two allow-list directories, so a run completes SEVERAL targets.
+    .DESCRIPTION
+        The fixture always names three targets and an entry whose directory does not exist is simply
+        unattempted, so a sandbox holding only the bait produced exactly one result line. One line
+        is what let a bait assertion get away with reading whichever target was reported LAST: with
+        a single line the two are the same string. Creating the siblings is what makes the
+        distinction observable in a real run, and it costs two directories and two files.
+    .OUTPUTS
+        The directories created, in the fixture's own order.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Sandbox)
+
+    $edge = Join-Path -Path $Sandbox -ChildPath 'LA\Microsoft\Edge\User Data\Default\Cache\Cache_Data'
+    $explorer = Join-Path -Path $Sandbox -ChildPath 'LA\Microsoft\Windows\Explorer'
+    foreach ($directory in @($edge, $explorer)) { [void][System.IO.Directory]::CreateDirectory($directory) }
+
+    [System.IO.File]::WriteAllText((Join-Path -Path $edge -ChildPath 'data_1'), 'edge', $script:Utf8NoBom)
+    # thumbcache_*.db is one of the two patterns the fixture's Explorer entry carries, so this file
+    # is inside the pattern target rather than merely inside the directory that holds it.
+    [System.IO.File]::WriteAllText((Join-Path -Path $explorer -ChildPath 'thumbcache_96.db'), 'thumbs', $script:Utf8NoBom)
+
+    return @($edge, $explorer)
+}
+
 function Get-SandboxLogText {
     <#
     .SYNOPSIS
@@ -347,8 +374,28 @@ function New-VerificationScratchTree {
 
         The copy is shallow on purpose - Run.ps1 plus the files directly under src\, which is the
         whole module set - so it costs one file copy each and not a directory walk.
+
+        TWO fixtures are injected, not one, because file containment and machine maintenance are
+        different problems (ledger WAC-10R). The allow-list fixture confines what the run may
+        DELETE; it can say nothing about DISM, pnpclean, pnputil, cleanmgr, the Delivery
+        Optimization purge or the global Recycle Bin, none of which reaches the machine through an
+        allow-list path. _SandboxMaintenanceFixture.psm1 stops those, and it goes over the DRIVERS
+        module because Drivers is the LAST module Run.ps1 imports - the only slot whose names win
+        command resolution in the run's own scope. The shipped module is preserved beside it and
+        re-imported by the fixture, so the real driver surface is still there.
+
+        Leaving it out is not an accident anybody can have quietly: Start-VerificationChild REFUSES
+        to launch a tree that has no maintenance fixture unless the caller says -AllowRealMaintenance
+        there too. The gate is on the launch rather than on the copy because the launch is the
+        dangerous act, and because a tree built only to be inspected never runs at all.
+    .PARAMETER InterceptMaintenance
+        Adds the maintenance fixture. Every sandboxed scenario passes it; DRIVERS, CLEANMGR and the
+        armed MAINTENANCE lane deliberately do not, because servicing the machine is what they test.
     #>
-    param([Parameter(Mandatory = $true)][string]$Sandbox)
+    param(
+        [Parameter(Mandatory = $true)][string]$Sandbox,
+        [switch]$InterceptMaintenance
+    )
 
     $scratch = Join-Path -Path $Sandbox -ChildPath 'SRC'
     $scratchSrc = Join-Path -Path $scratch -ChildPath 'src'
@@ -372,6 +419,33 @@ function New-VerificationScratchTree {
     $marker = 'WAC_VERIFY_SANDBOX_ROOT'
     if (([System.IO.File]::ReadAllText($injected)).IndexOf($marker, [System.StringComparison]::Ordinal) -lt 0) {
         throw ('the allow-list builder in {0} is not the sandbox fixture; refusing to launch the child' -f $injected)
+    }
+
+    if ($InterceptMaintenance) {
+        # The shipped driver module is PRESERVED under its own name first - the fixture imports it
+        # back and re-exports the whole driver surface, so nothing is lost - and only then is it
+        # stood in front of. Losing this copy would leave the child without pnputil parsing, the
+        # backup store and the prune step, so the order matters and the copy is checked.
+        $driverSlot = Join-Path -Path $scratchSrc -ChildPath 'WindowsAutoCleanup.Drivers.psm1'
+        $preserved = Join-Path -Path $scratchSrc -ChildPath 'WindowsAutoCleanup.Drivers.Shipped.psm1'
+        Copy-Item -LiteralPath $driverSlot -Destination $preserved -Force -ErrorAction Stop
+
+        $maintenance = Join-Path -Path $script:TestsRoot -ChildPath '_SandboxMaintenanceFixture.psm1'
+        if (-not (Test-Path -LiteralPath $maintenance -PathType Leaf)) {
+            throw ('the sandbox maintenance fixture is missing at {0}; refusing to launch a child that would service this machine' -f $maintenance)
+        }
+        Copy-Item -LiteralPath $maintenance -Destination $driverSlot -Force -ErrorAction Stop
+
+        # Proven, not assumed, for the same reason the allow-list injection is: a copy that silently
+        # failed would leave the SHIPPED maintenance entry points in place and the child would run
+        # the real DISM, pnpclean and Delivery Optimization purge - the exact defect this closes.
+        $maintenanceMarker = 'Write-WacMaintenanceWitness'
+        if (([System.IO.File]::ReadAllText($driverSlot)).IndexOf($maintenanceMarker, [System.StringComparison]::Ordinal) -lt 0) {
+            throw ('the maintenance entry points in {0} are not the sandbox fixture; refusing to launch the child' -f $driverSlot)
+        }
+        if (-not (Test-Path -LiteralPath $preserved -PathType Leaf)) {
+            throw ('the shipped driver module was not preserved at {0}; refusing to launch the child' -f $preserved)
+        }
     }
 
     $runPath = Join-Path -Path $scratch -ChildPath 'Run.ps1'
@@ -427,15 +501,59 @@ function Get-RunChildCommandLine {
     return (ConvertTo-WacCommandLine -ArgumentList $vector)
 }
 
+function Test-ChildMaintenanceFixture {
+    <#
+    .SYNOPSIS
+        $true when the scratch tree this child would run carries the maintenance fixture.
+    .DESCRIPTION
+        Read from the ENVIRONMENT the child is about to be given, because that is the only thing
+        that is true of the child rather than of whatever the caller believes it prepared. The
+        sandbox root it authorises is the sandbox the scratch tree lives in, so the driver slot the
+        child will import is reachable from it without a second parameter that could disagree.
+    #>
+    param([Parameter(Mandatory = $true)][hashtable]$Environment)
+
+    if (-not $Environment.ContainsKey('WAC_VERIFY_SANDBOX_ROOT')) { return $false }
+
+    $sandbox = [string]$Environment['WAC_VERIFY_SANDBOX_ROOT']
+    if ([string]::IsNullOrWhiteSpace($sandbox)) { return $false }
+
+    $driverSlot = Join-Path -Path $sandbox -ChildPath 'SRC\src\WindowsAutoCleanup.Drivers.psm1'
+    if (-not (Test-Path -LiteralPath $driverSlot -PathType Leaf)) { return $false }
+
+    return (([System.IO.File]::ReadAllText($driverSlot)).IndexOf('Write-WacMaintenanceWitness', [System.StringComparison]::Ordinal) -ge 0)
+}
+
 function Start-VerificationChild {
     <#
     .SYNOPSIS
         Starts one Run.ps1 child and immediately begins draining both of its pipes.
+    .DESCRIPTION
+        THE LAUNCH GATE (ledger WAC-10R). A child whose scratch tree has no maintenance fixture will
+        run the real DISM, the real pnpclean handler and the real Delivery Optimization purge on
+        this machine, whatever the scenario calls itself. So launching one is refused here unless
+        the caller states that intent by name, and the refusal happens before the process exists.
+
+        It is on the launch, not on New-VerificationScratchTree, because the copy is harmless and
+        the launch is not - and because a scenario author who forgets -InterceptMaintenance gets a
+        loud refusal rather than a scenario that quietly services the operator's machine and
+        reports sandbox scope, which is the defect this closes.
+    .PARAMETER AllowRealMaintenance
+        This child is MEANT to service the machine. Only DRIVERS, CLEANMGR and the armed
+        MAINTENANCE lane pass it, and each of those records its row as machine-changing.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$CommandLine,
-        [Parameter(Mandatory = $true)][hashtable]$Environment
+        [Parameter(Mandatory = $true)][hashtable]$Environment,
+        [switch]$AllowRealMaintenance
     )
+
+    if (-not $AllowRealMaintenance -and -not (Test-ChildMaintenanceFixture -Environment $Environment)) {
+        throw ('the scratch tree for this child carries no maintenance fixture, so it would run the ' +
+            'real DISM, pnpclean and Delivery Optimization purge on this machine; refusing to launch it. ' +
+            'Build the tree with -InterceptMaintenance, or declare the scenario machine-changing with ' +
+            '-AllowRealMaintenance.')
+    }
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $script:HostExe
@@ -526,15 +644,24 @@ function New-ScenarioRecord {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Evidence,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Problem,
         [Parameter(Mandatory = $true)][int]$DurationMs,
-        # DRIVERS and CLEANMGR change the operator's real machine. The flag rides on the record so
-        # the console summary and the JSON result both say which rows did, rather than relying on
-        # the reader remembering which names are sandboxed.
-        [switch]$Machine
+        # DRIVERS, CLEANMGR and MAINTENANCE change the operator's real machine. The flag rides on
+        # the record so the console summary and the JSON result both say which rows did, rather
+        # than relying on the reader remembering which names are sandboxed.
+        [switch]$Machine,
+        # What the row actually DID, which a pass alone never says (ledger WAC-10R). A lane that
+        # refused because it was not armed passes its own guard and has validated nothing, so the
+        # two are recorded as different words rather than as the same green:
+        #   Executed    the work in the row's name really ran
+        #   NotArmed    the lane is gated and the gate was closed; nothing was touched
+        #   Unsupported this machine cannot run the lane at all
+        #   Failed      the work ran and did not finish
+        [ValidateSet('Executed', 'NotArmed', 'Unsupported', 'Failed')][string]$Execution = 'Executed'
     )
 
     return [PSCustomObject]@{
         Name             = $Name
         Machine          = [bool]$Machine
+        Execution        = $Execution
         Expected         = $Expected
         ExpectedExitCode = $ExpectedExitCode
         ActualExitCode   = $ActualExitCode

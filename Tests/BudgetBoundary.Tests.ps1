@@ -70,8 +70,14 @@ Test-Case 'a blocked initializer returns inside the bound instead of when it eve
 
         Assert-Equal 'Incomplete' ([string]$result.Outcome) `
             ('an initializer that never finished was not reported as unfinished work: ' + [string]$result.Error)
-        Assert-True (-not $result.Started) 'work was scheduled on a runspace that never opened'
-        Assert-Equal 0 (@($result.Output).Count) 'a block that must never run produced output'
+        Assert-True ([bool]$result.TimedOut) 'a bound that was hit was not reported as a timeout'
+        Assert-Equal 0 (@($result.Output).Count) 'a block whose import never finished produced output'
+
+        # Started is $true, and that is the change rather than a regression: the import is the FIRST
+        # STATEMENT OF THE BOUNDED PIPELINE now, so the pipeline genuinely was scheduled and the
+        # conservative answer for a caller asking "could this have had effects" is yes. What must
+        # never happen is waiting the import out, and that is the assertion below.
+        Assert-True ([bool]$result.Started) 'the pipeline carrying the import was not scheduled at all'
 
         # The whole point: the CALL returned, not the import. Four seconds is half the import and
         # five times the bound - generous enough for a loaded runner, far short of waiting it out.
