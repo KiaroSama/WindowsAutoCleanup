@@ -227,9 +227,18 @@ Test-Case 'The ancestor walk is Core''s, not a second copy living in Deploy' {
 
     # Every file of the package, not just the entry point: the walk moved into
     # WindowsAutoCleanup.DeploymentProof.ps1 when the module was split by responsibility, and a
-    # second copy of the rule could come back in any of the four.
+    # second copy of the rule could come back in any of them. The list is the module's dot-source
+    # list, and a part added there without being added here is a part this scan never opens.
     $package = @('WindowsAutoCleanup.Deploy.psm1', 'WindowsAutoCleanup.DeploymentTree.ps1',
-        'WindowsAutoCleanup.DeploymentProof.ps1', 'WindowsAutoCleanup.ScheduledTask.ps1')
+        'WindowsAutoCleanup.DeploymentProof.ps1', 'WindowsAutoCleanup.DeploymentJournal.ps1',
+        'WindowsAutoCleanup.ScheduledTask.ps1', 'WindowsAutoCleanup.TaskRemoval.ps1')
+
+    $module = [System.IO.File]::ReadAllText((Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Deploy.psm1'))
+    foreach ($part in @($package | Where-Object { $_ -ne 'WindowsAutoCleanup.Deploy.psm1' })) {
+        Assert-True ($module -match ([regex]::Escape($part))) ('{0} is scanned here but the module no longer loads it' -f $part)
+    }
+    Assert-Equal (@($package).Count - 1) @([regex]::Matches($module, "ChildPath 'WindowsAutoCleanup\.[A-Za-z]+\.ps1'")).Count `
+        'the Deploy module dot-sources a part this scan never opens'
     $source = (@($package | ForEach-Object {
         [System.IO.File]::ReadAllText((Join-Path -Path $script:RepoRoot -ChildPath ('src\' + $_)))
     }) -join [Environment]::NewLine)

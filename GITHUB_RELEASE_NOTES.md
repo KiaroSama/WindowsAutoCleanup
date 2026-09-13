@@ -48,6 +48,33 @@ refused. Losing that race produces a wrong **refusal**, never a wrong deletion.
   still runs, the older handle-binding walk still proves what it can, and the result says plainly that
   it was not owned rather than implying otherwise. The installer wrappers no longer time out before
   the elevated child they started.
+- **A cleanup this tool could not prove it finished now stops the next one too.** Work that runs
+  inside the tool's own process is bounded; the few blocks that WRITE say so. When a writing block
+  misses its bound inside a blocking Windows call the thread cannot be stopped, so the run refuses
+  every later change and exits `6`. That refusal used to end when the process did - the machine-wide
+  lock was released and the next run, or an installer, learned nothing. It is now written to a marker
+  in the state root and retired only on proof that the process which raised it is gone, identified by
+  process id **and** creation time, because an id alone is recycled. A run that inherits one still
+  logs and reports; it simply starts none of the steps that change the machine, and says so for each.
+- **Every wait a run cannot skip is now paid for.** A termination wait, a pipe drain and a tree kill
+  each used to take a fixed allowance charged to nothing - ten seconds after a kill, five per pipe
+  with a floor underneath - once per tool, on top of a budget that had already expired. They now draw
+  from the run budget while it lasts and from the single recovery reserve afterwards, and a wait
+  nobody can pay for is reported as an unproven stop rather than silently taken.
+- **An upgrade can no longer lose the scheduled task it was replacing.** The installer removes the
+  existing registration before it swaps the new tree in, and the exact definition it captured used to
+  live only in memory - so a machine that lost power between those two steps was left with no task and
+  no record that one had ever existed. The capture is now written to disk BEFORE the unregister, and a
+  capture that cannot be recorded leaves the task registered and stops the install. The next installer
+  run reconciles that record before it stages anything: a task still registered needs nothing, and a
+  missing one is re-registered from the record and read back. Records written by this build carry a
+  new schema; older ones are still read and still drive recovery, so upgrading does not strand a
+  machine that has one.
+- **A recovery copy is checked against what the machine recorded of it, not just against itself.**
+  Putting the previous deployment back used to require only that it was ours, matched its own
+  manifest and was trusted - all of which a tree REWRITTEN since it was set aside still satisfies.
+  It must now also hash to the inventory the durable record took of it. Where no record names one,
+  the log says so explicitly rather than implying a check that did not happen.
 - **Driver deletion and its backup are one commit.** A marker is written before `pnputil` is asked to
   remove anything and cleared only once the backup record is durable on disk, so an interrupted
   deletion can never leave an export that a later run mistakes for residue and reclaims.

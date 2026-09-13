@@ -111,6 +111,7 @@ Import-Module -Name (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsA
 # calls back into Write-InstallerMessage, which is defined below and resolved when it runs.
 . (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.EntryGate.ps1')
 . (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.InstallerTask.ps1')
+. (Join-Path -Path $script:ScriptRoot -ChildPath 'src\WindowsAutoCleanup.InstallerRecovery.ps1')
 
 function Write-InstallerMessage {
     <#
@@ -384,6 +385,17 @@ function Invoke-Main {
         return 1
     }
 
+    # A task-capture record left by an earlier run means this machine may be MISSING a registration
+    # that run removed and never replaced (ledger WAC-02R). Reconciled here, before phase 1: staging
+    # deletes slots and the swap replaces the tree that task would have run, and neither may happen
+    # over a registration nobody has accounted for. It reuses the lookup above rather than asking
+    # the scheduler a second question it has already answered.
+    $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $slots.Root -Lookup $discovery
+    if (-not $reconciled.Ok) {
+        Write-InstallerMessage -Level ERROR -Message ('Refusing to install: {0} Nothing was staged, swapped or registered.' -f [string]$reconciled.Reason)
+        return 1
+    }
+
     $taskHost = Get-WacCanonicalPowerShellHost
     if (-not $taskHost) {
         Write-InstallerMessage -Level ERROR -Message 'No machine-trusted PowerShell host is available for the task action.'
@@ -429,8 +441,8 @@ function Invoke-Main {
         # Nothing went live, but this phase may already have removed one task before refusing on the
         # next, or removed one whose disappearance it could not prove. Either way a registration the
         # machine had is gone and the one that was to replace it will never exist, so whatever was
-        # captured goes back before this returns.
-        foreach ($definition in @($conflict.Captured)) { [void](Restore-CapturedTask -Definition $definition) }
+        # captured goes back before this returns - and the durable record of it ends with it.
+        [void](Complete-TaskCaptureTransaction -DeploymentRoot $slots.Root -CapturedTask @($conflict.Captured))
 
         if ($conflict.Refused) { return 7 }
         return 1
@@ -454,7 +466,7 @@ function Invoke-Main {
     # task to make room for one that will now never exist.
     if (-not (Test-RunBudget -Phase 'the staged tree was switched into place')) {
         [void](Remove-WacDeployment -Path $stage.StagingRoot)
-        foreach ($definition in @($conflict.Captured)) { [void](Restore-CapturedTask -Definition $definition) }
+        [void](Complete-TaskCaptureTransaction -DeploymentRoot $slots.Root -CapturedTask @($conflict.Captured))
         return 1
     }
 
@@ -500,6 +512,10 @@ function Invoke-Main {
     catch {
         Write-InstallerMessage -Level ERROR -Message ('The installation could not be completed: {0}' -f $_.Exception.Message)
         if (Undo-Installation -DeploymentRoot $slots.Root -CapturedTask @($conflict.Captured)) {
+            # Proven back, so the task-capture transaction is over for the next process too. A
+            # rollback that could NOT be proven keeps the record: it is then the only thing on the
+            # machine that says which registration is missing and what it was.
+            [void](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
             Write-InstallerMessage -Level ERROR -Message 'Final status: failed and rolled back. The machine is as it was before this run; re-run the installer once the cause above is fixed.'
         }
         else {
@@ -509,6 +525,11 @@ function Invoke-Main {
     }
 
     [void](Remove-WacDeploymentPrevious)
+
+    # The commit point for the task-capture transaction as well: a registration this run has read
+    # back and proven now stands where the one it removed used to. Left behind, the record would
+    # send the next run looking for a task that is no longer missing.
+    [void](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
 
     Write-InstallerMessage -Level INFO -Message 'Scheduled task registered and verified.' -Data @{
         task = ('{0}{1}' -f $registered.TaskPath, $registered.TaskName)

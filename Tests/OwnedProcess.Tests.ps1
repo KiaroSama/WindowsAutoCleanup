@@ -147,10 +147,12 @@ Test-Case 'a grandchild whose parent already exited keeps the tree unproven, and
     $childId = 0
     try {
         # B and C inherit A's stdout pipe, so the reads cannot EOF while C lives and the run would
-        # otherwise pay the full 5-second read budget. An expired deadline clamps that budget to its
-        # floor without touching the tool's own timeout, which is passed explicitly. It also makes
-        # the incomplete-output witness part of what this case exercises.
+        # otherwise pay the full 5-second read budget. An expired deadline plus a tiny recovery
+        # reserve clamps that budget without touching the tool's own timeout, which is passed
+        # explicitly: past the deadline a drain draws from the reserve, so both knobs are needed.
+        # It also makes the incomplete-output witness part of what this case exercises.
         Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
+        Reset-WacShutdownReserve -ReserveMs 250
 
         $marker = Join-Path -Path $sandbox -ChildPath 'grandchild.pid'
         $result = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 25000 `
@@ -180,6 +182,7 @@ Test-Case 'a grandchild whose parent already exited keeps the tree unproven, and
     finally {
         if ($childId -gt 0) { Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue }
         Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
+        Reset-WacShutdownReserve
         Remove-TestSandbox -Path $sandbox
     }
 }

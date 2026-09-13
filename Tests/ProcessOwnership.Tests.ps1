@@ -194,13 +194,15 @@ Test-Case 'a child holding the inherited pipe after the root exits is reported, 
     # real answer ("pnputil listed no drivers") rather than as a missing one.
     #
     # The fixture owns both processes: the root is this host, the grandchild is a bounded ping whose
-    # pid the root writes out, and the teardown kills it. The expired deadline is what clamps the
-    # read budget to its floor, so the case costs about a second instead of five.
+    # pid the root writes out, and the teardown kills it. The expired deadline plus a deliberately
+    # tiny recovery reserve is what clamps the read budget: past the deadline a drain draws from the
+    # reserve, so the reserve is the knob, and the case costs about a second instead of five.
     $marker = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('wacpipe-{0}.txt' -f [guid]::NewGuid().ToString('N').Substring(0, 10))
     $grandchildId = 0
     try {
         $payload = "`$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','ping -n 4 127.0.0.1 >nul' -NoNewWindow -PassThru; Set-Content -LiteralPath '$marker' -Value ([string]`$p.Id); exit 0"
         Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
+        Reset-WacShutdownReserve -ReserveMs 250
 
         $held = Invoke-WacProcess -FilePath $script:HostExe `
             -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $payload) -TimeoutMs 20000
@@ -223,6 +225,7 @@ Test-Case 'a child holding the inherited pipe after the root exits is reported, 
         if ($grandchildId -gt 0) { Stop-Process -Id $grandchildId -Force -ErrorAction SilentlyContinue }
         Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
         Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
+        Reset-WacShutdownReserve
     }
 }
 

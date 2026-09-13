@@ -54,7 +54,8 @@ function New-StubDeployment {
         Copy-Item -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath $name) `
             -Destination (Join-Path -Path $Sandbox -ChildPath $name) -Force
     }
-    foreach ($part in @('WindowsAutoCleanup.EntryGate.ps1', 'WindowsAutoCleanup.InstallerTask.ps1')) {
+    foreach ($part in @('WindowsAutoCleanup.EntryGate.ps1', 'WindowsAutoCleanup.InstallerTask.ps1',
+            'WindowsAutoCleanup.InstallerRecovery.ps1')) {
         Copy-Item -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath ('src\' + $part)) `
             -Destination (Join-Path -Path $src -ChildPath $part) -Force
     }

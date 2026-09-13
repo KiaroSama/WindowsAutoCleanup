@@ -128,39 +128,31 @@ function Get-WacStepTimeoutMs {
     return $remaining
 }
 
-# ---------------------------------------------------------------------------------------------
-# Abandoned mutators
-# ---------------------------------------------------------------------------------------------
-
-# Abandoning a runspace stuck inside a blocking NATIVE call is not termination and never was
-# (ledger WAC-06R). PowerShell.Stop() cannot interrupt one and Thread.Abort does not exist on
-# .NET Core, so the thread keeps running whatever it was doing while the caller moves on.
-#
-# For a blocking READ - a CIM query, a registry snapshot, a Recycle Bin scan - that costs two or
-# three threads and nothing else, which is the trade this project accepts. For a block that MUTATES
-# it is a different fact entirely: the run would schedule the next mutation on top of one that is
-# still in progress. External mutators are not affected because every one of them is a child process
-# under job ownership, where a timeout is a proven TerminateJobObject rather than an abandonment.
-# This counter covers the remaining case - an in-process block that writes.
-$script:AbandonedMutatorCount = 0
-
-function Reset-WacAbandonedMutator { $script:AbandonedMutatorCount = 0 }
-
-function Get-WacAbandonedMutatorCount { return [int]$script:AbandonedMutatorCount }
-
-function Add-WacAbandonedMutator {
-    $script:AbandonedMutatorCount++
-    return [int]$script:AbandonedMutatorCount
-}
-
-function Test-WacMutationAllowed {
+function Request-WacWaitMs {
     <#
     .SYNOPSIS
-        $false once a mutating bounded block has been abandoned without proof that it stopped.
+        Milliseconds a shutdown-critical wait may take: the run budget first, then the single
+        recovery reserve, then zero.
     .DESCRIPTION
-        Fail-closed and deliberately not self-clearing: nothing in this process can observe the
-        abandoned thread finishing, so there is no evidence that would justify clearing it. The run
-        reports the remaining mutations as unfinished rather than racing one it cannot see.
+        ONE rule for every wait this run cannot skip - a post-termination WaitForExit, a pipe drain,
+        a tree kill. Each of them used to take a fixed allowance of its own (10 s after a kill, 5 s
+        per pipe with a 250 ms floor under it), charged to nothing, so N tools cost N times that on
+        top of a budget that was already gone. That is how a run meets Task Scheduler's four-hour
+        kill in the middle of a write.
+
+        While the run budget still has time the wait draws from it, which the deadline already
+        accounts for. Once it is gone the wait draws from the same reserve rollbacks use, claimed at
+        grant time so a wait that burns its whole allowance cannot leave the reserve looking
+        untouched for the next caller. When both are spent this returns 0 - and 0 means do not wait,
+        which the caller reports as an unproven stop or an incomplete read. That is the honest
+        answer: a wait nobody can pay for did not happen.
     #>
-    return ($script:AbandonedMutatorCount -eq 0)
+    param([Parameter(Mandatory = $true)][int]$RequestedMs)
+
+    if ($RequestedMs -le 0) { return 0 }
+
+    $fromRun = Get-WacStepTimeoutMs -RequestedMs $RequestedMs
+    if ($fromRun -gt 0) { return [int]$fromRun }
+
+    return (Request-WacShutdownReserveMs -RequestedMs $RequestedMs)
 }

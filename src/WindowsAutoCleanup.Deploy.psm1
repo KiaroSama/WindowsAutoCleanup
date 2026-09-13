@@ -39,7 +39,9 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanu
 
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentTree.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentProof.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentJournal.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ScheduledTask.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TaskRemoval.ps1')
 
 # ONE machine-wide lock covers runtime, install, upgrade and uninstall (ledger B2-3). Until now the
 # entry points took 'Global\WindowsAutoCleanupInstaller' while Run.ps1 took 'Global\WindowsAutoCleanup',
@@ -174,17 +176,25 @@ function Resolve-WacDeploymentRecoverySlot {
     # The record is corroborated, never believed: the slot has to still hash to the inventory taken
     # before that run's first move. A stale record, a record copied from another machine, or a slot
     # something has since rewritten all fail here and fall through to the refusal.
-    $interrupted = $false
-    if ($journal -and $previous.Promotable) {
-        $inventory = Get-WacDeploymentFingerprint -DeploymentRoot $Slots.Previous
-        $interrupted = ($inventory.Complete -and
-            -not [string]::IsNullOrWhiteSpace([string]$journal.OriginalFingerprint) -and
-            [string]::Equals([string]$inventory.Fingerprint, [string]$journal.OriginalFingerprint, [System.StringComparison]::OrdinalIgnoreCase))
-    }
+    #
+    # ONE comparison, read by BOTH promotion branches below. It used to be computed only for the
+    # "interrupted" determination, so the first branch - the root holds nothing of its own - promoted
+    # whatever stood in the slot with no content check at all, and a slot that was ours, healthy and
+    # trusted but REWRITTEN since the record was taken became what SYSTEM executes (ledger WAC-02R).
+    $corroboration = Test-WacRecoverySlotMatchesRecord -Path $Slots.Previous -Record $journal
+    $interrupted = ($previous.Promotable -and [bool]$corroboration.Corroborated)
 
     if ((-not $live.Exists) -or ($live.IsOurs -and $live.IsEmpty)) {
         if (-not $previous.Promotable) {
             throw ("A recovery slot from an earlier run is still present and could not be put back, so nothing was touched: {0} ({1})" -f $Slots.Previous, [string]$previous.Reason)
+        }
+
+        # Matches is TRUE when no record names a fingerprint - there is then nothing to corroborate
+        # against and the provenance checks above stand alone, which the log line below says in so
+        # many words. It is FALSE only when a record does name one and the slot no longer hashes to
+        # it, and that is a slot this machine cannot vouch for at all.
+        if (-not $corroboration.Matches) {
+            throw ("A recovery slot from an earlier run is still present and no longer matches the durable record of what was moved aside, so nothing was touched: {0} ({1})" -f $Slots.Previous, [string]$corroboration.Reason)
         }
 
         if ($live.Exists) {
@@ -200,6 +210,7 @@ function Resolve-WacDeploymentRecoverySlot {
         $result.Reason = 'The deployment root held nothing of its own, so the recovery slot held the only installation on this machine and was put back.'
         Write-WacLog -Level WARNING -Component 'Deploy' -Message 'An interrupted run left the only deployment in the recovery slot; it was restored before staging.' -Data @{
             previous = $Slots.Previous; root = $Slots.Root; proof = [string]$previous.Reason
+            corroborated = [bool]$corroboration.Corroborated; corroboration = [string]$corroboration.Reason
         }
         return $result
     }
@@ -707,7 +718,8 @@ Export-ModuleMember -Function @(
     'Get-WacOperationLockName', 'Get-WacDeploymentVersion', 'Get-WacDeploymentProjectId',
     'Get-WacDeploymentManifestPath', 'New-WacDeploymentManifest', 'Read-WacDeploymentManifest',
     'Get-WacDeploymentFileHash', 'Get-WacDeploymentOwnership', 'Get-WacDeploymentFingerprint',
-    'Get-WacDeploymentJournalPath', 'Read-WacDeploymentJournal',
+    'Get-WacDeploymentJournalPath', 'Read-WacDeploymentJournal', 'Test-WacRecoverySlotMatchesRecord',
+    'Write-WacTaskCaptureRecord', 'Read-WacTaskCaptureRecord', 'Remove-WacTaskCaptureRecord',
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
     'New-WacDeploymentStage', 'Switch-WacDeploymentStage',

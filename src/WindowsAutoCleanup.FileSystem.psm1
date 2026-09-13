@@ -602,6 +602,16 @@ function Remove-WacFilesByPattern {
         return (New-WacTreeResult -Category $Category -Path $normalizedRoot -Stats $stats -Attempted $false)
     }
 
+    # The same latch Remove-WacTree carries, for the same reason and at the same point. This path
+    # deletes exactly as much and never had it: Run.ps1 now refuses the whole sweep while a mutation
+    # is unproven, but the primitive is exported, and a guard that lives only in one caller is the
+    # shape of defect this round exists to remove.
+    if (-not (Test-WacMutationAllowed)) {
+        $stats.SkippedDeadline++
+        Write-WacLog -Level ERROR -Component 'FileSystem' -Message 'A pattern target was skipped: an earlier operation could not be proven stopped.' -Data @{ category = $Category; path = $normalizedRoot }
+        return (New-WacTreeResult -Category $Category -Path $normalizedRoot -Stats $stats -Attempted $false)
+    }
+
     Write-WacLog -Level DEBUG -Component 'FileSystem' -Message 'Cleaning pattern target.' -Data @{ category = $Category; path = $normalizedRoot; patterns = ($Pattern -join ',') }
 
     # The matched-file loop is bounded exactly like the traversal, and for the same reason: one

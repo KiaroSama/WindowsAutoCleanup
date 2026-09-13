@@ -87,6 +87,20 @@ function Get-SlotRunContent {
     return ([System.IO.File]::ReadAllText($path))
 }
 
+function Test-WacRecoverySlotIsPromotableProbe {
+    <#
+    .SYNOPSIS
+        The module's own promotion gate, reached through its scope rather than by adding it to the
+        export list.
+    .DESCRIPTION
+        A case that asserts a slot was refused for one reason has to show it passed the OTHER checks
+        first, or the refusal it observed could be coming from anywhere.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return [bool](& $script:DeployModule { param($p) (Test-WacRecoverySlotIsPromotable -Path $p).Promotable } $Path)
+}
+
 # ---------------------------------------------------------------------------------------------
 # "Ours" is not "a healthy replacement"
 # ---------------------------------------------------------------------------------------------
@@ -473,6 +487,175 @@ Test-Case 'A recovery slot nobody can vouch for is never promoted onto the deplo
         Assert-True ($reason -match 'cannot be trusted') ('the refusal did not name the trust walk: ' + $reason)
         Assert-True (Test-Path -LiteralPath (Join-Path -Path $slots.Previous -ChildPath 'Run.ps1')) `
             'the copy was destroyed by the very refusal that exists to protect it'
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The schema window, and what the record is allowed to corroborate
+# ---------------------------------------------------------------------------------------------
+
+function Set-FixtureJournalSchema {
+    <#
+    .SYNOPSIS
+        Rewrites the Schema number of the record on disk and leaves every other field alone.
+    .DESCRIPTION
+        Exactly the shape a record written by a DIFFERENT build has: same fields, same values,
+        different version number. Nothing else is touched, so a case using this differs from the
+        same case without it by precisely the number under test.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][int]$Schema
+    )
+
+    $path = Get-WacDeploymentJournalPath -DeploymentRoot $Root
+    $record = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($path))
+    $record.Schema = $Schema
+    [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $record -Depth 5),
+        (New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
+Test-Case 'A record written at the OLDEST schema this build supports still drives recovery' {
+    # The compatibility state's whole reason for existing. Adding fields bumped the schema this build
+    # WRITES, and an exact-match test on that number would make every already-installed machine read
+    # its own in-flight record as unreadable - which Resolve-WacDeploymentRecoverySlot turns into a
+    # THROW, so the upgrade that carried the new schema could never run on the machines that needed
+    # it. The window is one-sided on purpose: older, down to the declared minimum, is still actionable.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-schema-old' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+        $originalHash = Get-WacDeploymentFileHash -Path $live.RunScript
+        $slots = Get-WacDeploymentSlotPath
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+        [void](Set-FixtureJournalSchema -Root $slots.Root -Schema 1)
+        Stop-FixtureProcess
+
+        $read = Read-WacDeploymentJournal -DeploymentRoot $slots.Root
+        Assert-Equal 'Valid' ([string]$read.State) ('a record one schema old was refused: ' + [string]$read.Reason)
+        Assert-Equal 1 ([int]$read.Schema) 'the read did not report the schema it actually found'
+
+        # And it is not merely readable: the interrupted install it describes is still rolled back.
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v3' -RunContent '# replacement v3')
+
+        Assert-Equal '# original v1' (Get-SlotRunContent -Slot $slots.Root) `
+            'a machine carrying the previous schema could not recover its own interrupted install'
+        Assert-Equal $originalHash (Get-WacDeploymentFileHash -Path $live.RunScript) 'the tree put back is not the one that was moved aside'
+        Assert-False (Test-Path -LiteralPath $slots.Previous) 'the recovery slot was left behind after it was reconciled'
+    }
+}
+
+Test-Case 'A record from a NEWER build than this one is refused rather than half-understood' {
+    # The other side of the window. A later build's record may carry fields that change what the ones
+    # here mean, and acting on a guess about them is exactly what the three-state read exists to stop:
+    # it is Unreadable, so both trees are left for the build that wrote it.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-schema-new' -Body {
+        param($sandbox)
+
+        [void](Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1')
+        $slots = Get-WacDeploymentSlotPath
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+        [void](Set-FixtureJournalSchema -Root $slots.Root -Schema 3)
+        Stop-FixtureProcess
+
+        $read = Read-WacDeploymentJournal -DeploymentRoot $slots.Root
+        Assert-Equal 'Unreadable' ([string]$read.State) 'a record from a build this one knows nothing about was acted on'
+        Assert-Equal 3 ([int]$read.Schema) 'the read did not report the schema it actually found'
+
+        $refused = $false
+        $reason = ''
+        try { [void](New-FixtureStage -Sandbox $sandbox -Name 'v3' -RunContent '# replacement v3') }
+        catch { $refused = $true; $reason = [string]$_.Exception.Message }
+
+        Assert-True $refused 'a record this build cannot understand was treated as no record at all'
+        Assert-True ($reason -match 'could not be read') ('the refusal did not name the reason: ' + $reason)
+        Assert-Equal '# original v1' (Get-SlotRunContent -Slot $slots.Previous) 'the copy in the recovery slot was destroyed'
+        Assert-Equal '# replacement v2' (Get-SlotRunContent -Slot $slots.Root) 'the refusal changed what stands at the deployment root'
+    }
+}
+
+Test-Case 'A recovery slot REWRITTEN since the record was taken is not promoted onto an empty root' {
+    # Ledger WAC-02R, the promotion half. The empty-root branch promoted on provenance alone - ours,
+    # holds a Run.ps1, healthy against its own manifest, trusted - and a slot rewritten after the
+    # record was taken answers yes to every one of those. What it does NOT match is the inventory the
+    # durable record took of the tree that was actually moved aside, and what comes out of the slot
+    # becomes what SYSTEM executes.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-slot-rewritten' -Body {
+        param($sandbox)
+
+        [void](Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1')
+        $slots = Get-WacDeploymentSlotPath
+
+        [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2')
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+        Assert-True (Test-Path -LiteralPath (Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root) -PathType Leaf) `
+            'the swap left no durable record, so this case would prove nothing about corroborating one'
+
+        # The empty directory a half-finished move leaves, which is the shape that promotes.
+        [void](Remove-WacDeployment -Path $slots.Root)
+        [void][System.IO.Directory]::CreateDirectory($slots.Root)
+
+        # And a slot that is still ours and still self-consistent - manifest regenerated - but is no
+        # longer the tree the record describes.
+        [System.IO.File]::WriteAllText((Join-Path -Path $slots.Previous -ChildPath 'Run.ps1'), '# rewritten since the record was taken')
+        [void](New-WacDeploymentManifest -StagingRoot $slots.Previous)
+        Stop-FixtureProcess
+
+        $promotable = Test-WacRecoverySlotIsPromotableProbe -Path $slots.Previous
+        Assert-True $promotable 'the fixture no longer reproduces a slot that passes every provenance check'
+
+        $refused = $false
+        $reason = ''
+        try { [void](New-FixtureStage -Sandbox $sandbox -Name 'v3' -RunContent '# replacement v3') }
+        catch { $refused = $true; $reason = [string]$_.Exception.Message }
+
+        Assert-True $refused 'a slot rewritten since the record was taken was promoted onto the path SYSTEM executes'
+        Assert-True ($reason -match 'no longer matches the durable record') ('the refusal did not name the corroboration: ' + $reason)
+        Assert-Equal '# rewritten since the record was taken' (Get-SlotRunContent -Slot $slots.Previous) `
+            'the refusal destroyed the tree it could not identify'
+        Assert-False (Test-Path -LiteralPath (Join-Path -Path $slots.Root -ChildPath 'Run.ps1')) `
+            'the unidentified slot was moved onto the deployment root anyway'
+    }
+}
+
+Test-Case 'With no record to corroborate against, the provenance checks still stand alone' {
+    # The benign half, and the reason Matches and Corroborated are two answers rather than one: a
+    # first install, or any run whose transaction committed, leaves no record - and refusing then
+    # would strand every machine whose recovery slot is the only installation it has left.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-no-record' -Body {
+        param($sandbox)
+
+        $live = Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1'
+        $slots = Get-WacDeploymentSlotPath
+        Assert-False (Test-Path -LiteralPath (Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root)) `
+            'the committed install left a record, so this case would not be the no-record shape'
+
+        $verdict = Test-WacRecoverySlotMatchesRecord -Path $slots.Root -Record $null
+        Assert-True $verdict.Matches 'a slot with no record to check against was reported as a mismatch'
+        Assert-False $verdict.Corroborated 'an unchecked slot was reported as corroborated, which is the one thing it must never read as'
+        Assert-True ([string]$verdict.Reason -match 'no durable record') ([string]$verdict.Reason)
+
+        # And a real record naming this very tree does corroborate, so the comparison is load-bearing
+        # rather than a function that answers yes to everything.
+        $inventory = Get-WacDeploymentFingerprint -DeploymentRoot $slots.Root
+        Assert-True $inventory.Complete ([string]$inventory.Reason)
+        $matched = Test-WacRecoverySlotMatchesRecord -Path $slots.Root -Record ([PSCustomObject]@{ OriginalFingerprint = [string]$inventory.Fingerprint })
+        Assert-True $matched.Matches ([string]$matched.Reason)
+        Assert-True $matched.Corroborated ([string]$matched.Reason)
+
+        $wrong = Test-WacRecoverySlotMatchesRecord -Path $slots.Root -Record ([PSCustomObject]@{ OriginalFingerprint = ('0' * 64) })
+        Assert-False $wrong.Matches 'a fingerprint that does not match was accepted'
+        Assert-False $wrong.Corroborated 'a mismatch was reported as corroboration'
+        Assert-Equal ($live.RunScript) (Join-Path -Path $slots.Root -ChildPath 'Run.ps1')
     }
 }
 

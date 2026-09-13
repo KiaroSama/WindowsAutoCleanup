@@ -203,7 +203,7 @@ foreach ($module in @($WacModulePath)) {
             # process can ever observe it finishing. The run stops scheduling mutations rather than
             # racing one it cannot see.
             if ($Mutating) {
-                [void](Add-WacAbandonedMutator)
+                [void](Add-WacAbandonedMutator -Reason ('{0} exceeded its {1} ms bound' -f $Component, $budgetMs))
                 Write-WacLog -Level CRITICAL -Component $Component -Message 'A mutating block was abandoned and cannot be proven stopped; no further mutation will be scheduled.' -Data @{
                     budgetMs = $budgetMs; waitMs = $waitMs
                 }

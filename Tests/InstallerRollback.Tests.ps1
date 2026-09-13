@@ -81,7 +81,8 @@ function New-RollbackSandbox {
 
     Copy-Item -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'Install-WindowsAutoCleanupTask.ps1') `
         -Destination (Join-Path -Path $Sandbox -ChildPath 'Install-WindowsAutoCleanupTask.ps1') -Force
-    foreach ($part in @('WindowsAutoCleanup.EntryGate.ps1', 'WindowsAutoCleanup.InstallerTask.ps1')) {
+    foreach ($part in @('WindowsAutoCleanup.EntryGate.ps1', 'WindowsAutoCleanup.InstallerTask.ps1',
+        'WindowsAutoCleanup.InstallerRecovery.ps1')) {
         Copy-Item -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath ('src\' + $part)) `
             -Destination (Join-Path -Path $src -ChildPath $part) -Force
     }
@@ -151,6 +152,32 @@ function New-RollbackSandbox {
         'function Restore-WacDeploymentPrevious { Add-Journal ''Restore-WacDeploymentPrevious''; return ([PSCustomObject]@{ Restored = $true; HadPrevious = $true; Reason = ''stub'' }) }',
         'function Remove-WacDeploymentPrevious { Add-Journal ''Remove-WacDeploymentPrevious''; return $true }',
         'function Remove-WacDeployment { param([string]$Path, [string]$DeploymentRoot) Add-Journal (''Remove-WacDeployment|'' + $Path); return ([PSCustomObject]@{ Path = $Path; Removed = $true; Reason = $null }) }',
+        # The durable capture record, as REAL file I/O rather than a flag: the conflict phase
+        # writes it, the reconciliation at the top of a run reads it, and the commit deletes it,
+        # so the assertions below are about a file the shipped code actually drove.
+        'function Get-WacDeploymentJournalPath { param([string]$DeploymentRoot, [string]$Kind = ''Swap'') $root = (Get-WacDeploymentSlotPath).Root; if ($Kind -eq ''TaskCapture'') { return ($root + ''.taskcapture.json'') }; return ($root + ''.transaction.json'') }',
+        'function Write-WacTaskCaptureRecord {',
+        '    param([object[]]$Capture, [string]$DeploymentRoot)',
+        '    Add-Journal (''Write-WacTaskCaptureRecord|'' + @($Capture).Count)',
+        '    if ($env:WAC_RB_RECORD -eq ''fail'') { return $false }',
+        '    [System.IO.File]::WriteAllText((Get-WacDeploymentJournalPath -Kind ''TaskCapture''), (ConvertTo-Json -InputObject @($Capture) -Depth 5))',
+        '    return $true',
+        '}',
+        'function Read-WacTaskCaptureRecord {',
+        '    param([string]$DeploymentRoot)',
+        '    $path = Get-WacDeploymentJournalPath -Kind ''TaskCapture''',
+        '    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return ([PSCustomObject]@{ State = ''Absent''; Schema = 0; Capture = @(); Reason = '''' }) }',
+        '    $items = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($path)))',
+        '    Add-Journal (''Read-WacTaskCaptureRecord|'' + @($items).Count)',
+        '    return ([PSCustomObject]@{ State = ''Valid''; Schema = 2; Capture = @($items); Reason = ''stub'' })',
+        '}',
+        'function Remove-WacTaskCaptureRecord {',
+        '    param([string]$DeploymentRoot)',
+        '    Add-Journal ''Remove-WacTaskCaptureRecord''',
+        '    $path = Get-WacDeploymentJournalPath -Kind ''TaskCapture''',
+        '    if (Test-Path -LiteralPath $path -PathType Leaf) { [System.IO.File]::Delete($path) }',
+        '    return $true',
+        '}',
         'function New-StubRegisteredTask {',
         '    param([switch]$Broken)',
         '    $slots = Get-WacDeploymentSlotPath',
@@ -178,13 +205,22 @@ function New-RollbackSandbox {
         '    return ([PSCustomObject]@{ State = ''Found''; Task = @($task); Failure = @() })',
         '}',
         'function Remove-WacInstalledTask {',
-        '    param($Task, [string]$DeploymentRoot, [switch]$AllowLegacyMigration, [switch]$RequireDefinitionCapture)',
+        '    param($Task, [string]$DeploymentRoot, [switch]$AllowLegacyMigration, [switch]$RequireDefinitionCapture, [AllowNull()][scriptblock]$OnCaptured)',
         '    $outcome = Get-StepBehaviour -Name ''Remove-WacInstalledTask'' -Plan $env:WAC_RB_REMOVE -Fallback ''Verified''',
         '    $captured = ($env:WAC_RB_CAPTURE -ne ''no'')',
         '    Add-Journal (''Remove-WacInstalledTask|'' + $outcome + ''|captured='' + $captured)',
-        '    $result = [PSCustomObject]@{ TaskName = (Get-WacTaskName); TaskPath = (Get-WacTaskFolder); Removed = $false; Verified = $false; Captured = $captured; Definition = $null; CaptureReason = ''stub''; Reason = ''stub'' }',
+        '    $result = [PSCustomObject]@{ TaskName = (Get-WacTaskName); TaskPath = (Get-WacTaskFolder); Removed = $false; Verified = $false; Captured = $captured; CaptureDurable = $null; Definition = $null; CaptureReason = ''stub''; Reason = ''stub'' }',
         '    if ($captured) { $result.Definition = $env:WAC_RB_XML }',
         '    if ($RequireDefinitionCapture -and -not $captured) { $result.Reason = ''the definition could not be captured first''; return $result }',
+        # The transaction boundary, modelled here because Remove-WacInstalledTask is one of the
+        # things this sandbox replaces: the capture is made durable BEFORE anything is removed,
+        # and on a write that failed the task stays registered.
+        '    if ($OnCaptured -and $captured) {',
+        '        $durable = $false',
+        '        try { $durable = [bool](& $OnCaptured $result) } catch { $durable = $false }',
+        '        $result.CaptureDurable = $durable',
+        '        if (-not $durable) { $result.Reason = ''the captured definition could not be recorded where a later run would find it''; return $result }',
+        '    }',
         '    if ($outcome -eq ''Refused'') { $result.Reason = ''the task is not ours''; return $result }',
         '    $result.Removed = $true',
         '    if ($outcome -eq ''Verified'') { $result.Verified = $true }',
@@ -229,6 +265,9 @@ function Invoke-RollbackScenario {
         [string]$Remove = 'Verified',
         [ValidateSet('yes', 'no')][string]$Capture = 'yes',
         [ValidateSet('ok', 'throw')][string]$Register = 'ok',
+        # Whether the durable capture record can be written at all. 'fail' is the transaction
+        # boundary: the task stays registered and the upgrade stops before it changes anything.
+        [ValidateSet('ok', 'fail')][string]$Record = 'ok',
         # Zero-based index of the first budget check that finds the deadline gone; -1 never expires.
         [ValidateRange(-1, 32)][int]$Budget = -1,
         [ValidateRange(10, 300)][int]$TimeoutSeconds = 90
@@ -272,6 +311,7 @@ function Invoke-RollbackScenario {
     $psi.EnvironmentVariables['WAC_RB_REMOVE'] = $Remove
     $psi.EnvironmentVariables['WAC_RB_CAPTURE'] = $Capture
     $psi.EnvironmentVariables['WAC_RB_REGISTER'] = $Register
+    $psi.EnvironmentVariables['WAC_RB_RECORD'] = $Record
     $psi.EnvironmentVariables['WAC_RB_BUDGET'] = ([string]$Budget)
     $psi.EnvironmentVariables['WAC_RB_XML'] = (Get-CapturedTaskXml -Sandbox $Sandbox)
 
@@ -531,6 +571,104 @@ Test-Case 'A budget that runs out after the swap rolls the tree and the task bac
         Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacDeploymentPrevious$') `
             ('the rollback point was discarded on a run that did not commit: ' + ($run.Journal -join ' / '))
         Assert-True ($run.Console -match 'budget expired after the swap') $run.Console
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A capture that cannot be made durable leaves the machine exactly as it was found' {
+    # Ledger WAC-02R, at the phase level. The unregister is what costs the machine its registration,
+    # so the record of what is about to be removed has to be on disk FIRST - and when it cannot be
+    # written, the upgrade stops before it has changed anything at all.
+    $sandbox = New-TestSandbox -Prefix 'rb-record-fail'
+    try {
+        New-RollbackSandbox -Sandbox $sandbox
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Found' -Remove 'Verified' -Record 'fail'
+
+        Assert-False $run.TimedOut 'the installer never finished inside its bound'
+        Assert-Equal 1 $run.ExitCode $run.Console
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Write-WacTaskCaptureRecord\|1$') `
+            ('the conflict phase never tried to record what it was about to remove: ' + ($run.Journal -join ' / '))
+        Assert-True ($run.Console -match 'left registered and nothing was changed') $run.Console
+
+        foreach ($forbidden in @('^Switch-WacDeploymentStage$', '^Register-ScheduledTask', '^Remove-WacDeploymentPrevious$')) {
+            Assert-False (Test-JournalHas -Run $run -Pattern $forbidden) `
+                ('a run that could not record its capture still reached ' + $forbidden + ': ' + ($run.Journal -join ' / '))
+        }
+
+        # And no record was left behind either: a write that failed leaves nothing to reconcile.
+        Assert-False (Test-Path -LiteralPath (Join-Path -Path $sandbox -ChildPath 'WindowsAutoCleanup.taskcapture.json')) `
+            'a record survived the write that failed'
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A clean upgrade records the capture, commits, and ends the transaction' {
+    # The steady state of the new record: written before the removal, deleted once a registration
+    # this run read back stands in place of the one it removed. Left behind, it would send every
+    # later run looking for a task that is not missing.
+    $sandbox = New-TestSandbox -Prefix 'rb-record-clean'
+    try {
+        New-RollbackSandbox -Sandbox $sandbox
+        $record = Join-Path -Path $sandbox -ChildPath 'WindowsAutoCleanup.taskcapture.json'
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Found' -Remove 'Verified'
+
+        Assert-False $run.TimedOut 'the installer never finished inside its bound'
+        Assert-Equal 0 $run.ExitCode $run.Console
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Write-WacTaskCaptureRecord\|1$') ($run.Journal -join ' / ')
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Remove-WacTaskCaptureRecord$') `
+            ('the committed install left its capture transaction open: ' + ($run.Journal -join ' / '))
+        Assert-False (Test-Path -LiteralPath $record) 'the committed install left its capture record on disk'
+
+        # Order: the record is written before the task is removed, and ended only after the commit.
+        $write = [array]::IndexOf($run.Journal, 'Write-WacTaskCaptureRecord|1')
+        $remove = @(0..($run.Journal.Count - 1) | Where-Object { $run.Journal[$_] -match '^Remove-WacInstalledTask\|' })
+        $commit = [array]::IndexOf($run.Journal, 'Remove-WacDeploymentPrevious')
+        $ended = [array]::IndexOf($run.Journal, 'Remove-WacTaskCaptureRecord')
+        Assert-True ($remove.Count -eq 1 -and $remove[0] -lt $write) `
+            ('the record was written outside the removal it describes: ' + ($run.Journal -join ' / '))
+        Assert-True ($commit -ge 0 -and $commit -lt $ended) `
+            ('the capture transaction ended before the install committed: ' + ($run.Journal -join ' / '))
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A run that finds a capture record re-registers the lost task before it stages anything' {
+    # The defect, at the phase level: an earlier run removed the registration and died, so the record
+    # is on disk and the scheduler reports nothing. The next run has to put the task back BEFORE it
+    # stages - staging deletes slots and the swap replaces the tree that task would have run.
+    $sandbox = New-TestSandbox -Prefix 'rb-record-reconcile'
+    try {
+        New-RollbackSandbox -Sandbox $sandbox
+        $xml = Get-CapturedTaskXml -Sandbox $sandbox
+        $record = Join-Path -Path $sandbox -ChildPath 'WindowsAutoCleanup.taskcapture.json'
+        [System.IO.File]::WriteAllText($record, (ConvertTo-Json -InputObject @(@{
+            TaskName = 'WindowsAutoCleanup'; TaskPath = '\WindowsAutoCleanup\'
+            Definition = $xml; Captured = $true; CaptureReason = 'recorded by the run that died'
+        }) -Depth 5))
+
+        # Absent at the first lookup - the registration the dead run removed - and found from then on.
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Absent,Found,Found,Found' -Remove 'Verified'
+
+        Assert-False $run.TimedOut 'the installer never finished inside its bound'
+        Assert-Equal 0 $run.ExitCode $run.Console
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Read-WacTaskCaptureRecord\|1$') `
+            ('the run never read the record left by the one that died: ' + ($run.Journal -join ' / '))
+        Assert-True (Test-JournalHas -Run $run -Pattern ([regex]::Escape('Register-ScheduledTask|xml|' + $xml))) `
+            ('the lost registration was not put back: ' + ($run.Journal -join ' / '))
+        Assert-True ($run.Console -match 'putting it back') $run.Console
+
+        # Before anything was staged, and the record is gone once the task is accounted for.
+        $reregister = @(0..($run.Journal.Count - 1) | Where-Object { $run.Journal[$_] -match '^Register-ScheduledTask\|xml' })
+        $stage = [array]::IndexOf($run.Journal, 'New-WacDeploymentStage')
+        Assert-True ($reregister.Count -eq 1 -and $stage -ge 0 -and $reregister[0] -lt $stage) `
+            ('the lost task was put back after the run had already staged over it: ' + ($run.Journal -join ' / '))
+        Assert-False (Test-Path -LiteralPath $record) 'the reconciled record was left on disk'
     }
     finally {
         Remove-TestSandbox -Path $sandbox

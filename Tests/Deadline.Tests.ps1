@@ -42,13 +42,23 @@ function New-FlatFixture {
     }
 }
 
+# An abandoned MUTATOR is no longer only a module variable: it writes a durable marker under the
+# state root so the next process on this machine learns about it. Two cases here drive that path
+# deliberately, so the state root is redirected into a sandbox for the whole suite - otherwise a test
+# run would leave a real quarantine marker in the operator's %ProgramData% and the next real run
+# would refuse to clean anything. The variable is process-local and this suite is its own process.
+$env:ProgramData = New-TestSandbox -Prefix 'deadline-state'
+
 function Reset-WacTestDeadline {
     # Leaving an expired deadline armed would poison every later case in this process, and so would
     # a spent reserve or an outstanding abandoned mutator: all three are run-scoped state and are
-    # reset together or not at all.
+    # reset together or not at all. The durable marker goes with them - Reset-WacAbandonedMutator
+    # deliberately cannot retire one, so a case that wrote it removes the file itself.
     Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
     Reset-WacShutdownReserve
     Reset-WacAbandonedMutator
+    $marker = Get-WacQuarantineMarkerPath
+    if ($marker -and [System.IO.File]::Exists($marker)) { [System.IO.File]::Delete($marker) }
 }
 
 Test-Case 'A deadline that expires MID-directory stops the sweep' {

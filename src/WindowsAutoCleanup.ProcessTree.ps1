@@ -393,8 +393,13 @@ function Stop-WacProcessTree {
             # before the process is gone. This wait is the deterministic signal that it finished.
             # The floor keeps a caller's very short bound from turning "asked" into "gave up"; the
             # ceiling keeps a long one from being spent here rather than on the rescan.
+            #
+            # The floor is itself capped by $TimeoutMs, which the caller claimed from the run budget
+            # or the recovery reserve. Without that cap a bound of 200 ms still waited a full second
+            # here - a small overrun, but an unaccounted one, and per tree (ledger WAC-06R).
+            $floor = [int][Math]::Min(1000, $TimeoutMs)
             $left = [int][Math]::Max(0, ($waitDeadline - [datetime]::UtcNow).TotalMilliseconds)
-            $killDeadline = [datetime]::UtcNow.AddMilliseconds([Math]::Min(5000, [Math]::Max(1000, $left)))
+            $killDeadline = [datetime]::UtcNow.AddMilliseconds([Math]::Min(5000, [Math]::Max($floor, $left)))
             foreach ($entry in $pending) {
                 $wait = [int][Math]::Max(0, ($killDeadline - [datetime]::UtcNow).TotalMilliseconds)
                 [void][WacNative]::WaitForProcessExit($entry.Handle, $wait)

@@ -164,4 +164,70 @@ Test-Case 'a clock moved forwards still stops the run' {
     }
 }
 
+Test-Case 'a shutdown wait past the deadline draws from the one reserve and cannot draw twice' {
+    # WAC-06R, the half that stayed open. Termination waits and pipe drains each took a FIXED
+    # allowance - ten seconds after a kill, five seconds per pipe with a 250 ms floor under it -
+    # charged to nothing at all. Past the deadline the run-budget clamp returned 0 and the floor
+    # went straight back on top, once per pipe per tool, which is an unbounded shutdown dressed up
+    # as a bounded one.
+    try {
+        Reset-WacTestBudget
+        Reset-WacShutdownReserve -ReserveMs 4000
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddSeconds(-1))
+        Assert-Equal 0 (Get-WacRemainingMs) 'the deadline under test was not actually expired'
+
+        $first = Request-WacWaitMs -RequestedMs 5000
+        Assert-Equal 4000 $first 'a wait past the deadline was not capped by what the reserve holds'
+        Assert-Equal 0 (Get-WacShutdownReserveMs) 'the reserve was not debited by the wait it granted'
+
+        # The whole point of ONE reserve: the second tool does not get a fresh allowance, and the
+        # zero is the honest answer - the caller reports an unproven stop rather than waiting on
+        # time nobody can pay for.
+        Assert-Equal 0 (Request-WacWaitMs -RequestedMs 5000) 'a second shutdown wait was granted from an empty reserve'
+    }
+    finally {
+        Reset-WacTestBudget
+    }
+}
+
+Test-Case 'a wait inside the run budget leaves the recovery reserve alone' {
+    # The control. Without it, "always charge the reserve" satisfies the case above and every
+    # ordinary tool would eat the allowance rollbacks depend on.
+    try {
+        Reset-WacTestBudget
+        Reset-WacShutdownReserve -ReserveMs 4000
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
+
+        Assert-Equal 5000 (Request-WacWaitMs -RequestedMs 5000) 'a wait well inside the budget was shortened'
+        Assert-Equal 4000 (Get-WacShutdownReserveMs) 'an ordinary wait spent the recovery reserve'
+    }
+    finally {
+        Reset-WacTestBudget
+    }
+}
+
+Test-Case 'a timed-out tool charges its own shutdown waits to the reserve' {
+    # The CALL SITE, not the helper. An isolated gate proves the arithmetic and nothing about
+    # whether Invoke-WacProcess actually asks for it, which is precisely the gap this round exists
+    # to close. The child is told to sleep far past its bound, so the termination wait and both
+    # pipe drains all run with the run budget already gone.
+    $host5 = if ($env:WAC_PROBE_HOST) { [string]$env:WAC_PROBE_HOST } else { [string](Get-Process -Id $PID).Path }
+
+    try {
+        Reset-WacTestBudget
+        Reset-WacShutdownReserve -ReserveMs 3000
+        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddSeconds(-1))
+
+        $result = Invoke-WacProcess -FilePath $host5 -TimeoutMs 500 `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 300')
+
+        Assert-True ([bool]$result.TimedOut) 'the child under test did not reach its deadline'
+        Assert-True ((Get-WacShutdownReserveMs) -lt 3000) `
+            ('a timed-out tool took its shutdown waits without charging the reserve: {0} ms still there' -f (Get-WacShutdownReserveMs))
+    }
+    finally {
+        Reset-WacTestBudget
+    }
+}
+
 Complete-TestRun

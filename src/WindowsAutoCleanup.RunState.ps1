@@ -452,9 +452,8 @@ function Initialize-WacRun {
     if ($ShutdownMarginSeconds -gt 0) { Reset-WacShutdownReserve -ReserveMs ($ShutdownMarginSeconds * 1000) }
     else { Reset-WacShutdownReserve }
 
-    # A new run starts with no outstanding mutation. The flag is per RUN, not per process:
-    # a suite that drove the abandoned path must not close the door on the next run in the
-    # same host.
+    # Only what this PROCESS carries. The machine-wide half is reconciled below, once the log this
+    # run will report it in exists.
     Reset-WacAbandonedMutator
     $script:LogDegraded = $false
     $script:LogOpened = $false
@@ -593,6 +592,11 @@ function Initialize-WacRun {
             path = [string]$script:StateTrust.Path; reason = [string]$script:StateTrust.Reason
         }
     }
+
+    # LAST, and only now: the durable quarantine an earlier process may have left (ledger WAC-05R).
+    # It logs at CRITICAL when it refuses this run every mutation, and that line is the whole audit
+    # trail of why the run did nothing - so it cannot run before there is a log to write it to.
+    [void](Resolve-WacQuarantine)
 
     return $true
 }
