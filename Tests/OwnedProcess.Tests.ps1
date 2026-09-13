@@ -77,6 +77,26 @@ function New-OrphanMakerArgument {
     return @('-NoProfile', '-NonInteractive', '-Command', $aSource)
 }
 
+function New-DirectChildArgument {
+    <#
+    .SYNOPSIS
+        Arguments for a root A that starts ONE long-lived child, records its id, then holds.
+    .DESCRIPTION
+        The shallow fixture. A -> C is enough to prove a deadline terminates more than the root, and
+        it costs two process startups rather than three - which is what keeps the case from racing a
+        loaded runner instead of testing the behaviour.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$MarkerPath,
+        [int]$KeepRootAliveSeconds = 30
+    )
+
+    $c = ConvertTo-EncodedCommand -Source 'Start-Sleep -Seconds 90'
+    $aSource = "`$c = Start-Process -FilePath '$script:HostExe' -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','$c' -NoNewWindow -PassThru; Set-Content -LiteralPath '$MarkerPath' -Value ([string]`$c.Id); Start-Sleep -Seconds $KeepRootAliveSeconds; exit 0"
+
+    return @('-NoProfile', '-NonInteractive', '-Command', $aSource)
+}
+
 function Wait-ProcessGone {
     <#
     .SYNOPSIS
@@ -171,13 +191,14 @@ Test-Case 'a deadline terminates the whole owned tree in one call, and says so' 
     $childId = 0
     try {
         $marker = Join-Path -Path $sandbox -ChildPath 'grandchild.pid'
-        # A waits on B - which returns at once - then holds. The bound has to land AFTER the marker
-        # is written and long before the hold ends, and the marker costs three PowerShell startups:
-        # 2500 ms was enough on an idle machine and lost the race on a loaded eight-worker runner,
-        # where the case then failed saying the fixture never recorded the grandchild. 6000 ms
-        # clears it with margin and still cuts off 24 s before A would have finished.
+        # ONE level, not two. This case is about what a DEADLINE does - one TerminateJobObject over
+        # the whole job - and the missing-intermediate property is proved by the case above. Waiting
+        # for a three-deep chain to record its marker before the bound expires made the fixture race
+        # the machine: 2500 ms lost it on a loaded runner, 6000 ms still lost it at 16 concurrent
+        # suites. A starts the child directly and records it immediately, so the bound only has to
+        # outlast two startups rather than three.
         $result = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 6000 `
-            -ArgumentList (New-OrphanMakerArgument -MarkerPath $marker -KeepRootAliveSeconds 30) `
+            -ArgumentList (New-DirectChildArgument -MarkerPath $marker -KeepRootAliveSeconds 30) `
             -Component 'Test'
 
         $childId = Get-MarkedProcessId -MarkerPath $marker

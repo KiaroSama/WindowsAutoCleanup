@@ -126,63 +126,50 @@ function Invoke-WacBounded {
     $abandoned = $false
 
     try {
-        $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
-        if ($modules.Count -gt 0) { $state.ImportPSModule([string[]]$modules.ToArray()) }
-
-        $runspace = [runspacefactory]::CreateRunspace($state)
-
-        # OpenAsync, not Open. Charging the setup to the budget afterwards measured the overshoot; it
-        # did not BOUND it. A module whose top-level code blocks forever made Open() block forever
-        # too, and the promised bound was never returned within - the call simply came back whenever
-        # initialization finished, which for a wedged initializer is never.
+        # The runspace opens with NOTHING of ours in it, and the modules are imported by the FIRST
+        # statement of the bounded pipeline instead of by the InitialSessionState.
         #
-        # Opening on its own thread lets the caller give up on it. An initializer that has not
-        # finished inside the bound is ABANDONED exactly the way a wedged work item is: not disposed,
-        # because disposing waits for the very thing that is stuck.
-        $runspace.OpenAsync()
+        # Three attempts got here. ImportPSModule with a synchronous Open() imports reliably but
+        # blocks: a module whose top-level code hangs hangs the open, so the promised bound was never
+        # returned within (measured 8293 ms for an 800 ms bound). OpenAsync makes the open
+        # interruptible but not the import - RunspaceStateInfo says Opened and RunspaceAvailability
+        # says Available while the import is still in flight, and a probe pipeline runs fine and
+        # still cannot see the imported commands, so work started against a runspace whose modules
+        # were missing ("The term 'Get-WacCleanupTarget' is not recognized"). Polling for the module
+        # names instead simply spent the whole budget waiting and got a full run force-killed.
+        #
+        # Importing inside the pipeline makes the import subject to the ONE bound this function
+        # already enforces, which is what was wanted all along: a blocked import is now abandoned by
+        # exactly the same path as a blocked work item.
+        $state = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+        $runspace = [runspacefactory]::CreateRunspace($state)
+        $runspace.Open()
 
-        # BOTH signals. RunspaceStateInfo reaches Opened while the InitialSessionState's own module
-        # import is still running on it, and handing that runspace a pipeline answers "a pipeline is
-        # already running". Availability is what says the runspace will actually accept work.
-        $openDeadline = [datetime]::UtcNow.AddMilliseconds([Math]::Max(1, $budgetMs))
-        $opened = $false
-        while ([datetime]::UtcNow -lt $openDeadline) {
-            $openState = $runspace.RunspaceStateInfo.State
-            if ($openState -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened -and
-                $runspace.RunspaceAvailability -eq [System.Management.Automation.Runspaces.RunspaceAvailability]::Available) {
-                $opened = $true
-                break
-            }
-            if ($openState -eq [System.Management.Automation.Runspaces.RunspaceState]::Broken -or
-                $openState -eq [System.Management.Automation.Runspaces.RunspaceState]::Closed) { break }
-            Start-Sleep -Milliseconds 20
-        }
-
-        if (-not $opened) {
-            $abandoned = $true
-            $watch.Stop()
-            $openState = '{0}/{1}' -f [string]$runspace.RunspaceStateInfo.State, [string]$runspace.RunspaceAvailability
-            if ($Mutating) { [void](Add-WacAbandonedMutator) }
-
-            Write-WacLog -Level WARNING -Component $Component -Message 'The bounded work could not be initialised inside its bound; it was abandoned rather than waited on.' -Data @{
-                budgetMs = $budgetMs; runspaceState = $openState; mutating = [bool]$Mutating
-            }
-            return [PSCustomObject]@{
-                Outcome = 'Incomplete'; Started = $false; TimedOut = $true
-                Output = @(); HadErrors = $false
-                Error = ('Preparing the bounded work did not complete within {0} ms (runspace state {1}).' -f $budgetMs, $openState)
-                DurationMs = [int]$watch.Elapsed.TotalMilliseconds
-            }
-        }
+        # ONE AddScript, still. The header records why a batched pipeline is not an option: it turns
+        # a throw into an error-stream record, and abandoning a batched pipeline crashes the host at
+        # process exit. The wrapper therefore carries the import AND the caller's block, and the
+        # block is rebuilt from its own text so its param() is still the first statement of ITS
+        # scriptblock rather than of this one.
+        $wrapper = @'
+param($WacModulePath, $WacSource, $WacArgument)
+foreach ($module in @($WacModulePath)) {
+    if ([string]::IsNullOrWhiteSpace($module)) { continue }
+    Import-Module -Name $module -DisableNameChecking -ErrorAction Stop
+}
+& ([scriptblock]::Create($WacSource)) @WacArgument
+'@
 
         $shell = [powershell]::Create()
         $shell.Runspace = $runspace
-        [void]$shell.AddScript($ScriptBlock.ToString())
-        foreach ($argument in $ArgumentList) { [void]$shell.AddArgument($argument) }
+        [void]$shell.AddScript($wrapper)
+        [void]$shell.AddArgument([string[]]$modules.ToArray())
+        [void]$shell.AddArgument($ScriptBlock.ToString())
+        [void]$shell.AddArgument([object[]]$ArgumentList)
 
         # The budget was measured before the runspace existed. Creating one, opening it and
-        # importing this module is SYNCHRONOUS and costs ~80-100 ms on both hosts - more on a cold
-        # or contended machine, and an arbitrary amount when a module's own top-level code blocks.
+        # opening it costs ~80-100 ms on both hosts and more on a cold or contended machine. The
+        # module import no longer happens here at all - it is the first statement of the pipeline
+        # below, so it is bounded by the same wait as the work.
         # Waiting the ORIGINAL budget after that makes this call's real upper bound "setup + budget"
         # rather than "budget", which is precisely the accounting hole the run deadline exists to
         # close. Charge the setup to the same budget and reclamp against the live deadline here,

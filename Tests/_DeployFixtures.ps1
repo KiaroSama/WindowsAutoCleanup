@@ -24,9 +24,14 @@ function Invoke-InDeploymentSandbox {
     param(
         [Parameter(Mandatory = $true)][string]$Prefix,
         [Parameter(Mandatory = $true)][scriptblock]$Body,
-        # Leaves the REAL trust walk in place. A TEMP sandbox is genuinely user-writable, so this is
-        # how a case proves the gate refuses one rather than proving the forcing works.
-        [switch]$RealTrust
+        # Forces the trust walk to answer UNTRUSTED, so a case can prove the promotion gate refuses.
+        #
+        # NOT the real walk against the real sandbox ACL: that is a property of the MACHINE, not of
+        # this code. It held on a developer profile, where TEMP grants a non-administrative principal
+        # write access, and failed on the CI runner where it does not - the test was measuring the
+        # runner. The walk itself is measured against real injected roots in DeploymentProof.Tests.ps1;
+        # what belongs here is only what the gate does with its answer.
+        [switch]$UntrustedSandbox
     )
 
     $sandbox = New-TestSandbox -Prefix $Prefix
@@ -40,17 +45,18 @@ function Invoke-InDeploymentSandbox {
     # it REAL so the gate itself is still proved.
     $deployModule = Get-Module -Name 'WindowsAutoCleanup.Deploy'
     $realTrustBody = $null
-    if ($deployModule -and -not $RealTrust) {
+    if ($deployModule) {
         $realTrustBody = & $deployModule { (Get-Command Test-WacDeploymentTrusted).ScriptBlock }
-        & $deployModule {
-            Set-Item -Path 'function:script:Test-WacDeploymentTrusted' -Value {
-                param([string]$DeploymentRoot)
-                return [PSCustomObject]@{
-                    Root = $DeploymentRoot; IsTrusted = $true; Reason = 'sandbox trust forced for this suite'
-                    CheckedCount = 0; Findings = @()
-                }
-            }
-        }
+        $forcedAnswer = -not $UntrustedSandbox
+        & $deployModule { param($trusted)
+            Set-Item -Path 'function:script:Test-WacDeploymentTrusted' -Value ([scriptblock]::Create((@(
+                'param([string]$DeploymentRoot)'
+                'return [PSCustomObject]@{'
+                ('    Root = $DeploymentRoot; IsTrusted = ${0}' -f $trusted.ToString().ToLowerInvariant())
+                "    Reason = 'sandbox trust forced for this suite'"
+                '    CheckedCount = 0; Findings = @()'
+                '}') -join [System.Environment]::NewLine)))
+        } $forcedAnswer
     }
 
     try {
