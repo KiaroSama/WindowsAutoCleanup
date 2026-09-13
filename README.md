@@ -477,7 +477,8 @@ unlocked scratch files, so do not run it during work that depends on those files
 | `src/WindowsAutoCleanup.FileSystem.psm1` | The single no-follow, reparse-safe, long-path-safe traversal, over the handle-bound delete in `BoundDelete`. |
 | `src/WindowsAutoCleanup.Targets.psm1` | The `C:`-only allow-list. |
 | `src/WindowsAutoCleanup.Steps.psm1` | Package entry point over `StepContract`, `RecycleBin` and `DiskCleanup`: the shared result vocabulary, DISM, Delivery Optimization, the Recycle Bin sweep and the opt-in cleanmgr step. |
-| `src/WindowsAutoCleanup.Drivers.psm1` | Package entry point over `DriverInventory` and `DriverBackup`: pnpclean, the structured pnputil inventory, and opt-in package pruning with content-addressed backups. |
+| `src/WindowsAutoCleanup.Drivers.psm1` | Package entry point over `DriverHandler`, `DriverInventory` and `DriverBackup`: the structured pnputil inventory and opt-in package pruning with content-addressed backups. |
+| `src/WindowsAutoCleanup.DriverHandler.ps1` | The other driver step: the pnpclean sweep of packages Windows itself reports as orphaned, and the driver-store size it reports before and after. |
 | `src/WindowsAutoCleanup.Deploy.psm1` | Package entry point over `DeploymentTree`, `DeploymentProof`, `DeploymentJournal`, `ScheduledTask` and `TaskRemoval`: the shared operation lock, staging and rollback, ownership proof, and task action parsing. |
 | `Install-WindowsAutoCleanupTask.ps1` | Deploys the runtime and registers the daily task. |
 | `Uninstall-WindowsAutoCleanupTask.ps1` | Removes the task and the deployment. |

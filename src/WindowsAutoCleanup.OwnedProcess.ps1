@@ -68,7 +68,7 @@ function Set-WacOwnedProcessFault {
         later launch in the process fail.
     #>
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('None', 'JobAssign', 'BeforeResume', 'AfterResume', 'OutStream', 'ErrStream', 'TerminateRefused')][string]$Phase,
+        [Parameter(Mandatory = $true)][ValidateSet('None', 'JobAssign', 'BeforeResume', 'AfterResume', 'OutStream', 'ErrStream', 'TerminateRefused', 'TerminateNotConfirmed')][string]$Phase,
         [AllowEmptyString()][string]$Message = 'injected by a test'
     )
 
@@ -82,9 +82,27 @@ function Set-WacOwnedProcessFault {
         'OutStream'    { [WacOwnedProcess]::FaultAtOutStream = $Message }
         'ErrStream'    { [WacOwnedProcess]::FaultAtErrStream = $Message }
         'TerminateRefused' { [WacOwnedProcess]::FaultTerminateRefused = $true }
+        # The one state a real suspended process will not produce on demand: the request is GRANTED
+        # and the process has still not exited when the confirmation budget runs out. Without this
+        # the wait can never change an answer in a test, because a suspended process dies at once.
+        'TerminateNotConfirmed' { [WacOwnedProcess]::FaultConfirmNotSignalled = $true }
         default        { $null = $Phase }
     }
     return $true
+}
+
+function Get-WacOwnedProcessRawCloseCount {
+    <#
+    .SYNOPSIS
+        How many pipe read ends the last launch closed RAW, rather than leaving to their owner.
+    .DESCRIPTION
+        Reset by Set-WacOwnedProcessFault, so a case arms its fault and then reads a number that
+        belongs to its own launch. -1 means the helper is not available, which is not zero: no
+        launch happened, so nothing can be concluded either way.
+    #>
+
+    if (-not (Initialize-WacOwnedProcessNative)) { return -1 }
+    return [int][WacOwnedProcess]::RawReadHandleClosures
 }
 
 function Initialize-WacOwnedProcessNative {
@@ -160,6 +178,13 @@ public static class WacOwnedProcess
     public static string FaultAtErrStream = null;
     // A termination REQUEST that fails, which no test can provoke against a real suspended process.
     public static bool FaultTerminateRefused = false;
+    public static bool FaultConfirmNotSignalled = false;
+
+    // Counts the read ends this frame closed RAW - that is, ones no SafeFileHandle had adopted.
+    // It exists because the ownership rule it measures has no other observable: a double close on
+    // Windows usually does nothing visible in-process, so the ordering that prevents one could be
+    // reverted with every test still green. Diagnostic only; nothing branches on it.
+    public static int RawReadHandleClosures = 0;
 
     public static void ClearFaults()
     {
@@ -169,6 +194,8 @@ public static class WacOwnedProcess
         FaultAtOutStream = null;
         FaultAtErrStream = null;
         FaultTerminateRefused = false;
+        FaultConfirmNotSignalled = false;
+        RawReadHandleClosures = 0;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -514,7 +541,8 @@ public static class WacOwnedProcess
                 try { asked = !FaultTerminateRefused && TerminateProcess(launch.Process, 1); } catch { asked = false; }
                 if (asked && terminateConfirmMs > 0)
                 {
-                    launch.Stopped = WaitForSingleObject(launch.Process, (uint)terminateConfirmMs) == WAIT_OBJECT_0;
+                    launch.Stopped = !FaultConfirmNotSignalled &&
+                        WaitForSingleObject(launch.Process, (uint)terminateConfirmMs) == WAIT_OBJECT_0;
                 }
                 if (!launch.Stopped)
                 {
@@ -532,9 +560,12 @@ public static class WacOwnedProcess
             if (outWrite != IntPtr.Zero) { CloseHandle(outWrite); }
             if (errWrite != IntPtr.Zero) { CloseHandle(errWrite); }
             if (nul != IntPtr.Zero) { CloseHandle(nul); }
-            // Only a read end NO SafeFileHandle took responsibility for.
-            if (!outAdopted && outRead != IntPtr.Zero) { CloseHandle(outRead); }
-            if (!errAdopted && errRead != IntPtr.Zero) { CloseHandle(errRead); }
+            // Only a read end NO SafeFileHandle took responsibility for. The counter makes that
+            // condition observable: it is the only way a test can tell this frame stood down from a
+            // handle it no longer owned, rather than closing it a second time and getting away with
+            // it because Windows rarely complains.
+            if (!outAdopted && outRead != IntPtr.Zero) { RawReadHandleClosures++; CloseHandle(outRead); }
+            if (!errAdopted && errRead != IntPtr.Zero) { RawReadHandleClosures++; CloseHandle(errRead); }
             // Adopted, but the stream never took it: this frame is still the single owner, so it
             // closes deterministically here rather than leaving it to a finalizer.
             if (outSafe != null) { try { outSafe.Dispose(); } catch { } }
