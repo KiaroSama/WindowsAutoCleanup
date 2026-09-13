@@ -27,6 +27,14 @@ $script:BackupManifestSchema = 2
 # that failed all look alike from outside - so the directory is protected until a human resolves it.
 $script:BackupPendingName = 'wac-driver-delete.pending'
 
+# The stronger neighbour of the pending marker, and the two say different things. Pending means an
+# attempt was made and its result is not known YET - a later run asks the store and settles it.
+# Abandoned means the tool that made the attempt could not be proven finished, so work nobody owns
+# may still be in flight against the driver store. No store reading can settle that: the answer it
+# gives is a snapshot taken next to a writer that may not have stopped. So this one is never
+# retired automatically (ledger WAC-05R).
+$script:BackupAbandonedName = 'wac-driver-delete.abandoned'
+
 # ---------------------------------------------------------------------------------------------
 # 4. Recoverable backups
 # ---------------------------------------------------------------------------------------------
@@ -324,6 +332,16 @@ function Test-WacDriverBackupIsResidue {
 
     $result = [PSCustomObject]@{ IsResidue = $true; Reason = 'it carries no backup manifest, so an earlier export never completed' }
 
+    # Before even the pending marker, because it is the stronger of the two. A directory whose
+    # attempt was abandoned may be being written to right now by something this tool never owned,
+    # and reclaiming is a RECURSIVE DELETE. Proven absence is the only thing that clears it.
+    $abandoned = Read-WacDriverBackupControlFile -Path $Path -Name $script:BackupAbandonedName
+    if ($abandoned.Kind -cne 'Missing') {
+        $result.IsResidue = $false
+        $result.Reason = 'it carries a deletion attempt that was abandoned by a tool nobody could prove had finished, so what is in it, and what is still writing to it, are both unknown'
+        return $result
+    }
+
     # Checked FIRST and without reading anything: once a deletion may have happened, no manifest
     # state - absent, unreadable or unstamped - can turn this directory back into ordinary residue.
     # Only a PROVED absence clears it; a marker this tool cannot open, or a directory whose trust
@@ -449,6 +467,8 @@ function Export-WacDriverBackup {
           collision  - the identity directory name appeared between the check and the create, or a
                        control file name inside it is already taken. REFUSED rather than adopted.
           timeout    - the export was killed on its deadline, so what is on disk is unknown.
+          unsettled  - the export could not be proven finished. It is the only outcome that LEAVES
+                       the directory behind, because something may still be writing into it.
           empty      - /export-driver reported success and produced no .inf. Nothing recoverable.
           mismatch   - the export changed between being hashed and being trusted.
 
@@ -463,6 +483,10 @@ function Export-WacDriverBackup {
     )
 
     $result = [PSCustomObject]@{ Outcome = 'SafeSkip'; Reason = ''; Directory = ''; FileCount = 0; Manifest = $null }
+
+    # Set only where the finally clause below must NOT reclaim the directory. Declared out here
+    # because the flag is read in the finally and written inside the try.
+    $keepDirectory = $false
 
     $identity = Get-WacDriverBackupIdentity -Driver $Driver
     $directory = Get-WacNormalizedPath -Path (Join-Path -Path $BackupRoot -ChildPath $identity.Name)
@@ -555,6 +579,30 @@ function Export-WacDriverBackup {
         $export = Invoke-WacProcess -FilePath $PnpUtil -ArgumentList @('/export-driver', [string]$Driver.DriverName, $directory) `
             -TimeoutMs $timeoutMs -Component $Component
 
+        # ASKED FIRST, because it outranks every answer below it (ledger WAC-05R). An exit code and
+        # a timeout are both things the ROOT process says about itself; neither says whether a child
+        # pnputil started is still writing into this directory. Two things happen next and both are
+        # wrong over a live writer: the hash becomes the manifest of a copy that never settled, and
+        # the finally clause deletes a tree something else still has open. The second is the worse
+        # of the two - it is a deletion made on the strength of a state nobody established, which is
+        # the whole class of defect this ledger item exists to close.
+        $settled = Test-WacToolLifetimeSettled -Run $export
+        if (-not $settled.Settled) {
+            # THE DIRECTORY STAYS. It is the only record on this machine that the export was ever
+            # attempted, and it may still be growing. A later run reclaims it through the residue
+            # rule, which reads it once nothing is holding it - and until then it correctly refuses
+            # this package rather than re-exporting over an unfinished copy.
+            #
+            # Arming the latch is the other half: without it this run starts the NEXT export, and
+            # the deletion that follows a successful one, on top of a pnputil it could not finish.
+            $keepDirectory = $true
+            [void](Set-WacDriverBackupAbandoned -Path $directory `
+                -Reason ('a driver export could not be proven finished: {0}' -f $settled.Reason))
+            $result.Outcome = 'Incomplete'
+            $result.Reason = 'the export could not be proven finished ({0}), so what is in its directory is unknown and it was left where it stands' -f $settled.Reason
+            return $result
+        }
+
         if ($export.TimedOut) {
             $result.Outcome = 'Incomplete'
             $result.Reason = 'the export exceeded its deadline and its process tree was terminated'
@@ -608,6 +656,12 @@ function Export-WacDriverBackup {
     finally {
         # Nothing that fails to reach Succeeded deleted anything, so the directory is a copy of a
         # package that is still installed - worth nothing, and in the way of every later run.
-        if ($result.Outcome -cne 'Succeeded') { [void](Remove-WacDriverBackupDirectory -Path $directory) }
+        #
+        # The one exception is an export nobody could prove finished. "Worth nothing" is a claim
+        # about CONTENTS, and the contents of that directory are exactly what is unknown; removing
+        # it would be this function racing whatever is still writing into it.
+        if ($result.Outcome -cne 'Succeeded' -and -not $keepDirectory) {
+            [void](Remove-WacDriverBackupDirectory -Path $directory)
+        }
     }
 }

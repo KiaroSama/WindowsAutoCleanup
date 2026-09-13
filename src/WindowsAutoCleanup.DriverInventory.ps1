@@ -320,6 +320,21 @@ function Test-WacDriverPackageRemoved {
     $enum = Invoke-WacProcess -FilePath $PnpUtil -ArgumentList $script:PnpUtilEnumArgument `
         -TimeoutMs $TimeoutMs -Component $Component
 
+    # THE TRI-STATE EXISTS FOR EXACTLY THIS, and this function was not using it (ledger WAC-05R).
+    # An enumeration whose output never finished arriving still parses, and the package being looked
+    # for is then absent from it for a reason that has nothing to do with the driver store. Absence
+    # is read here as Removed - the single answer that licenses committing a backup and reclaiming
+    # an export - so a truncated read could retire the only copy of a package that is still there.
+    #
+    # Unknown is the truthful answer. Arming the latch is the second half: a pnputil that cannot be
+    # proven finished may still be writing to the store the caller is about to delete from next.
+    $settled = Test-WacToolLifetimeSettled -Run $enum
+    if (-not $settled.Settled) {
+        [void](Add-WacAbandonedMutator -Reason ('a confirming driver enumeration could not be proven finished: {0}' -f $settled.Reason))
+        $result.Reason = 'the confirming enumeration could not be proven finished: {0}' -f $settled.Reason
+        return $result
+    }
+
     if ($enum.TimedOut) {
         $result.Reason = 'the confirming enumeration exceeded its deadline'
         return $result

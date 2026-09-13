@@ -120,6 +120,7 @@ function Remove-WacInstalledTask {
 
 function Register-ScheduledTask {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '', Justification = 'A stub keeps the signature its production caller binds against; not every parameter has to change its answer.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Shadowing the real cmdlet IS the mechanism: the production caller resolves the name in this scope, and the shadow lives and dies with this test script.')]
     param($TaskName, $TaskPath, $Xml, $InputObject, [switch]$Force, $ErrorAction)
 
     # Registers what the XML actually says, so Restore-CapturedTask's read-back is compared against

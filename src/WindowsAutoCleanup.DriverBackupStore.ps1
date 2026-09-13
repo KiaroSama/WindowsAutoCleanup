@@ -275,6 +275,57 @@ function Set-WacDriverBackupDeletePending {
     return (Test-WacDriverBackupDeletePending -Path $Path)
 }
 
+function Set-WacDriverBackupAbandoned {
+    <#
+    .SYNOPSIS
+        Records - durably, and for this run - that an attempt against this directory was abandoned
+        by a tool nobody could prove had finished.
+    .DESCRIPTION
+        ONE fact, written to the two places it has to be known (ledger WAC-05R).
+
+        In the RUN, because nothing else may start on top of work that may still be in flight: that
+        is the same latch an abandoned in-process mutator raises, and it is armed FIRST so a failed
+        disk write cannot leave this run believing it may carry on.
+
+        On DISK, because the run ends and the question does not. The pending marker beside this one
+        is settled by a later run asking the driver store what happened; that works because the tool
+        that made the attempt is over. Here it is not known to be over, so the store's answer is a
+        snapshot taken beside a writer that may still be running, and no number of later runs turns
+        that into evidence. The directory is therefore held until a person looks at it - which is
+        the honest end state, not a gap: this tool cannot observe an unowned descendant of an
+        external tool exiting, so it does not pretend the question was answered.
+
+        The create is collision-failing like every other control file here, so a name already taken
+        is a refusal rather than a truncation. A false return means the durable half did not land;
+        the run half still did, and the caller reports it.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Reason
+    )
+
+    [void](Add-WacAbandonedMutator -Reason $Reason)
+
+    $record = 'abandonedUtc={0} executionId={1} reason={2}' -f
+        (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'), [string](Get-WacExecutionId), $Reason
+
+    return (Write-WacDriverBackupControlFile -Path $Path -Name $script:BackupAbandonedName -Content $record).Ok
+}
+
+function Test-WacDriverBackupIsAbandoned {
+    <#
+    .SYNOPSIS
+        True unless this directory is PROVED to carry no abandoned attempt.
+    .DESCRIPTION
+        The same rule as the pending marker and for a sharper reason: a wrong no here lets a later
+        run commit a backup, clear the protection and go on deleting, all next to a process nobody
+        established had stopped.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return ((Read-WacDriverBackupControlFile -Path $Path -Name $script:BackupAbandonedName).Kind -cne 'Missing')
+}
+
 function Test-WacDriverBackupDeletePending {
     <#
     .SYNOPSIS
@@ -517,6 +568,22 @@ function Resolve-WacDriverBackupPending {
 
         $result.Count++
         [void]$held.Add($name)
+
+        # ASKED BEFORE THE STORE IS, because the store cannot answer it (ledger WAC-05R). An
+        # abandoned attempt is one whose tool could not be proven finished, so a Removed answer here
+        # would be read next to a writer that may still be running - and Removed is the one answer
+        # that commits the backup, clears the protection and lets the run carry on deleting. Held,
+        # reported, and left for a person: a restart is what ends the work this cannot see, and
+        # nothing on this machine lets an unattended run prove that happened.
+        if (Test-WacDriverBackupIsAbandoned -Path $path) {
+            $result.Incomplete++
+            $result.Outcome = Get-WacHigherOutcome -Current $result.Outcome -Candidate 'Incomplete'
+            [void](Add-WacAbandonedMutator -Reason ('a driver deletion attempt at {0} was abandoned by an earlier run' -f $path))
+            Write-WacLog -Level CRITICAL -Component $Component -Message 'A deletion attempt an earlier run could not prove finished is held; it needs an operator, and nothing further will be changed by this run.' -Data @{
+                directory = $path
+            }
+            continue
+        }
 
         # Asked in its own right and BEFORE its manifest is read, for the reason Export-WacDriverBackup
         # gives: a directory a standard user can rewrite must not be allowed to name the package

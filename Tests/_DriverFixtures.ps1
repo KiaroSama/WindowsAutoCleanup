@@ -123,7 +123,7 @@ $script:RecordingInvoker = {
         }
     }
 
-    return [PSCustomObject]@{
+    $result = [PSCustomObject]@{
         ExitCode       = $exitCode
         TimedOut       = $timedOut
         StandardOutput = $standardOutput
@@ -131,6 +131,18 @@ $script:RecordingInvoker = {
         DurationMs     = 5
         Started        = (-not $timedOut)
     }
+
+    # The LIFETIME facts - whether the tool was proven stopped, whether anything it started is still
+    # alive, whether its output all arrived - are attached only when a case asks for one. A result
+    # that does not carry a fact cannot contradict one, and the production reader treats a missing
+    # property as settled, so every suite written before these existed keeps its meaning.
+    foreach ($fact in @('TerminationProven', 'OwnedTreeState', 'OutputComplete')) {
+        if ($canned.ContainsKey($fact)) {
+            Add-Member -InputObject $result -MemberType NoteProperty -Name $fact -Value $canned[$fact]
+        }
+    }
+
+    return $result
 }
 
 function Set-ModuleFunctionBody {
