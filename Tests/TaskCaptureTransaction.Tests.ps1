@@ -218,6 +218,23 @@ function Get-TestCaptureRecordPath {
     return (Get-WacDeploymentJournalPath -DeploymentRoot $Root -Kind 'TaskCapture')
 }
 
+function New-TestRegisteredTask {
+    <#
+    .SYNOPSIS
+        A registered task that is OURS and points into the deployment root, but is not the task the
+        fixture's capture describes - the shape an interrupted upgrade leaves standing.
+    .DESCRIPTION
+        Same name, same path, same host, same working directory, DIFFERENT arguments: exactly what
+        an upgrade that added a switch to the command line produces. Nothing but the semantic
+        comparison can tell it from the captured task, which is the whole point.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $task = New-TestOwnedTask -Root $Root
+    $task.Actions[0].Arguments = [string]$task.Actions[0].Arguments + ' -PruneSupersededDrivers'
+    return $task
+}
+
 # ---------------------------------------------------------------------------------------------
 # The seam: the capture is made durable before the task is unregistered
 # ---------------------------------------------------------------------------------------------
@@ -422,7 +439,8 @@ Test-Case 'A task removed by a process that then died is re-registered by the ne
             $scheduler = Initialize-TestCase -Root $root
             $scheduler.Registered = @()
 
-            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy)
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
 
             Assert-True $reconciled.Ok ([string]$reconciled.Reason)
             Assert-Equal 1 ([int]$reconciled.Restored) 'the lost registration was not put back'
@@ -454,13 +472,159 @@ Test-Case 'A recorded task that is still registered is left alone and the record
                 TaskName = 'WindowsAutoCleanup'; TaskPath = '\WindowsAutoCleanup\'; Definition = $scheduler.Export
             }))
 
-            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy)
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
 
             Assert-True $reconciled.Ok ([string]$reconciled.Reason)
             Assert-Equal 0 ([int]$reconciled.Restored) 'a task that was still registered was re-registered over'
             Assert-Equal 1 ([int]$reconciled.Accounted) 'the registered task was not accounted for'
             Assert-False ($scheduler.Order -contains 'register') ('the scheduler was written to: ' + ($scheduler.Order -join ','))
             Assert-False (Test-Path -LiteralPath (Get-TestCaptureRecordPath -Root $root)) 'a fully accounted record was kept'
+        }
+        finally {
+            Clear-TestScheduler
+        }
+    }
+}
+
+Test-Case 'A DIFFERENT task wearing the captured name does not account for the capture' {
+    # THE COUNTEREXAMPLE, at the unit level. Reconciliation counted any same-name task as accounted
+    # for and deleted the record, so an upgrade interrupted after it registered its replacement lost
+    # the definition of the task it had displaced - and the file half then put the ORIGINAL tree
+    # back under the REPLACEMENT registration. The name is only how the candidate is found; the
+    # semantic comparison is what decides.
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-name-not-identity' -Body {
+        param($sandbox)
+
+        $null = $sandbox
+        $root = (Get-WacDeploymentSlotPath).Root
+        $scheduler = Initialize-TestCase -Root $root
+        try {
+            [void](Write-WacTaskCaptureRecord -DeploymentRoot $root -Capture @([PSCustomObject]@{
+                TaskName = 'WindowsAutoCleanup'; TaskPath = '\WindowsAutoCleanup\'; Definition = $scheduler.Export
+            }))
+
+            # Ours, at the captured name, pointing into the deployment root - and NOT the captured
+            # task. No swap record, so nothing on this machine says a run that replaced it finished.
+            $scheduler.Registered = @(New-TestRegisteredTask -Root $root)
+
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
+
+            Assert-False $reconciled.Ok 'a different task under the captured name was counted as accounting for it'
+            Assert-Equal 0 ([int]$reconciled.Accounted) 'the capture was retired against a task that is not the one it describes'
+            Assert-True ([string]$reconciled.Reason -match 'not the one the durable record describes') ([string]$reconciled.Reason)
+
+            # Nothing was written to the scheduler, and the evidence is still on disk.
+            Assert-False ($scheduler.Order -contains 'register') ('the scheduler was written to: ' + ($scheduler.Order -join ','))
+            Assert-False ($scheduler.Order -contains 'unregister') ('a task was removed on an ambiguous state: ' + ($scheduler.Order -join ','))
+            Assert-True (Test-Path -LiteralPath (Get-TestCaptureRecordPath -Root $root) -PathType Leaf) `
+                'the only description of the displaced registration was deleted'
+        }
+        finally {
+            Clear-TestScheduler
+        }
+    }
+}
+
+Test-Case 'A FOREIGN task at the captured name is never removed and never registered over' {
+    # The hard boundary. Whatever the records say, a task this project cannot prove is its own is
+    # left exactly as it was found - Register-ScheduledTask -Force would have overwritten it.
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-foreign-name' -Body {
+        param($sandbox)
+
+        $null = $sandbox
+        $root = (Get-WacDeploymentSlotPath).Root
+        $scheduler = Initialize-TestCase -Root $root
+        try {
+            [void](Write-WacTaskCaptureRecord -DeploymentRoot $root -Capture @([PSCustomObject]@{
+                TaskName = 'WindowsAutoCleanup'; TaskPath = '\WindowsAutoCleanup\'; Definition = $scheduler.Export
+            }))
+
+            # Somebody else's task, at our name: no sentinel in its description, and it runs a
+            # program that has nothing to do with this deployment.
+            $foreign = New-StubTask -TaskPath '\WindowsAutoCleanup\' -Description 'somebody else entirely' `
+                -Action @(New-StubAction -Execute 'C:\Windows\System32\cmd.exe' -Arguments '/c echo hello' -WorkingDirectory 'C:\Windows')
+            $scheduler.Registered = @($foreign)
+
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
+
+            Assert-False $reconciled.Ok 'a foreign task under our name was counted as accounting for our capture'
+            Assert-True ([string]$reconciled.Reason -match 'cannot be proven ours') ([string]$reconciled.Reason)
+            Assert-False ($scheduler.Order -contains 'register') ('a foreign task was registered over: ' + ($scheduler.Order -join ','))
+            Assert-False ($scheduler.Order -contains 'unregister') ('a foreign task was unregistered: ' + ($scheduler.Order -join ','))
+            Assert-True (Test-Path -LiteralPath (Get-TestCaptureRecordPath -Root $root) -PathType Leaf) 'the record was cleared over a foreign task'
+        }
+        finally {
+            Clear-TestScheduler
+        }
+    }
+}
+
+Test-Case 'A record whose entry carries no definition is refused whole, not read in part' {
+    # Schema, project id and root prove the record describes THIS deployment; they prove nothing
+    # about the transaction being complete. An entry with no definition used to be dropped, and a
+    # record every entry of which was dropped came back Valid naming nothing - which the installer
+    # retired as debris, destroying the evidence of a removal it could not describe.
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-partial-record' -Body {
+        param($sandbox)
+
+        $null = $sandbox
+        $root = (Get-WacDeploymentSlotPath).Root
+        $scheduler = Initialize-TestCase -Root $root
+        try {
+            # A write that refuses is the first half: an incomplete capture is recorded not at all.
+            Assert-False (Write-WacTaskCaptureRecord -DeploymentRoot $root -Capture @(
+                [PSCustomObject]@{ TaskName = 'WindowsAutoCleanup'; TaskPath = '\WindowsAutoCleanup\'; Definition = $scheduler.Export },
+                [PSCustomObject]@{ TaskName = 'WindowsAutoCleanup'; TaskPath = '\'; Definition = '' })) `
+                'a record was written naming fewer removals than the caller had made'
+            Assert-False (Test-Path -LiteralPath (Get-TestCaptureRecordPath -Root $root)) 'the refused write left a partial record behind'
+
+            # And the read is the second: a record already on disk in that shape is Unreadable, not
+            # a shorter valid one.
+            [System.IO.File]::WriteAllText((Get-TestCaptureRecordPath -Root $root), (ConvertTo-Json -Depth 5 -InputObject ([PSCustomObject]@{
+                Schema = 2; ProjectId = (Get-WacDeploymentProjectId); Root = $root; Stage = 'TaskCapture'
+                CapturedTask = @(
+                    [PSCustomObject]@{ TaskName = 'WindowsAutoCleanup'; TaskPath = '\WindowsAutoCleanup\'; Definition = $scheduler.Export },
+                    [PSCustomObject]@{ TaskName = 'WindowsAutoCleanup'; TaskPath = '\' })
+            })))
+
+            $read = Read-WacTaskCaptureRecord -DeploymentRoot $root
+            Assert-Equal 'Unreadable' ([string]$read.State) 'a record this build cannot decode in full was half-read'
+            Assert-Equal 0 @($read.Capture).Count 'the readable half of an undecodable record was handed back anyway'
+
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
+            Assert-False $reconciled.Ok 'an undecodable record was treated as proof that no task had been removed'
+            Assert-True (Test-Path -LiteralPath (Get-TestCaptureRecordPath -Root $root) -PathType Leaf) 'the undecodable record was deleted'
+        }
+        finally {
+            Clear-TestScheduler
+        }
+    }
+}
+
+Test-Case 'A DIRECTORY standing at the record path is unreadable, not absent' {
+    # Both readers probed with Test-Path -PathType Leaf, which answers $false for a directory, a
+    # dangling link and a refused inspection alike - and $false meant "no transaction here".
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-record-directory' -Body {
+        param($sandbox)
+
+        $null = $sandbox
+        $root = (Get-WacDeploymentSlotPath).Root
+        [void](Initialize-TestCase -Root $root)
+        try {
+            [void][System.IO.Directory]::CreateDirectory((Get-TestCaptureRecordPath -Root $root))
+
+            $read = Read-WacTaskCaptureRecord -DeploymentRoot $root
+            Assert-Equal 'Unreadable' ([string]$read.State) 'a directory at the record path was read as no record at all'
+            Assert-True ([string]$read.Reason -match 'directory') ([string]$read.Reason)
+
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
+            Assert-False $reconciled.Ok 'an uninspectable record path was treated as proof that no task had been removed'
+            Assert-True (Test-Path -LiteralPath (Get-TestCaptureRecordPath -Root $root) -PathType Container) 'the directory was deleted'
         }
         finally {
             Clear-TestScheduler
@@ -485,7 +649,8 @@ Test-Case 'A reconciliation that cannot finish KEEPS the record and refuses the 
             $scheduler.Registered = @()
             $scheduler.RegisterThrows = $true
 
-            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy)
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
 
             Assert-False $reconciled.Ok 'a reconciliation that could not put the task back reported success'
             Assert-Equal 0 ([int]$reconciled.Restored) 'a failed re-registration was counted as a restoration'
@@ -512,7 +677,8 @@ Test-Case 'A record that cannot be read refuses the install rather than burying 
             # A write that stopped half way: valid JSON never starts and ends like this.
             [System.IO.File]::WriteAllText((Get-TestCaptureRecordPath -Root $root), '{"Schema":2,"CapturedTask":[{"TaskN')
 
-            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy)
+            $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $root -Lookup (Get-WacInstalledTask -IncludeLegacy) `
+                -Plan (Get-WacDeploymentRecoveryPlan -DeploymentRoot $root)
 
             Assert-False $reconciled.Ok 'a torn record was treated as proof that no task had been removed'
             Assert-True ([string]$reconciled.Reason -match 'could not be read') ([string]$reconciled.Reason)

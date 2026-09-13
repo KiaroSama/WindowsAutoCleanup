@@ -26,6 +26,14 @@
     lock - the next scheduled run, an installer, the uninstaller - aware that a mutation of unknown
     completion had been left behind. Releasing the mutex erased the one fact that mattered.
 
+    WHERE IT LIVES (ledger WAC-14). Not under the state root any more. That root's own trust rule
+    explicitly permits a non-administrative principal to create new names in it, which for a file
+    that decides whether the next run may change this machine is the decision itself - and the old
+    writer also wrote a predictable `.new` with no check on it at all. The record is now one
+    collision-failing create in the strict, administrator-only control store; there is no temporary
+    name and no replace. WindowsAutoCleanup.ControlFile.ps1 carries that contract and the reasoning
+    behind each of its three properties.
+
     WHAT CLEARS IT. Evidence, never time and never a fresh start. The marker records the process
     that raised it by id AND creation time, which is the same identity proof the termination path
     uses, because an id on its own is recycled. The next run binds that identity:
@@ -66,39 +74,30 @@ function Test-WacMutationAllowed {
     return ($script:AbandonedMutatorCount -eq 0)
 }
 
-function Get-WacQuarantineMarkerPath {
+function Get-WacQuarantineMarkerName {
     <#
     .SYNOPSIS
-        Where the durable marker lives: in the machine-wide state root, beside the logs.
+        The control file this quarantine is recorded in. A NAME, never a path.
     .DESCRIPTION
-        Not in TEMP and not beside the deployment. The state root is the one location every entry
-        point already proves machine-trusted before it writes anything, and Initialize-WacRun has
-        done that by the time either side of this file runs.
+        It used to be a path under the state root, and that was the defect (ledger WAC-14): the
+        caller then owned resolving it, and resolving a predictable name in a directory other people
+        may create names in is the whole attack. The store owns resolution now, and the only thing
+        outside it is which name to ask for.
     #>
-    $root = Get-WacDataRoot
-    if ([string]::IsNullOrWhiteSpace($root)) { return $null }
-    return (Join-Path -Path $root -ChildPath $script:QuarantineMarkerName)
+    return $script:QuarantineMarkerName
 }
 
 function Write-WacQuarantineMarker {
     <#
     .SYNOPSIS
-        Records the abandonment durably. $false when it could not be written.
+        Records the abandonment durably. $false when it could not be recorded at all.
     .DESCRIPTION
-        Written beside and swapped in, for the reason the deployment journal is: a crash mid-write
-        would otherwise leave a torn file, and a torn marker is worse than none because it destroys
-        a complete one while looking like an answer. Here the torn case is also read fail-closed, so
-        the cost of a bad write is a quarantined run rather than a silent one.
-
-        Never through a reparse point. The marker sits in an administrative directory and writing
-        through a link somebody else left at that name would write wherever they chose.
+        One collision-failing create in the strict control store. There is no temporary name and no
+        replace: an existing record means this machine is ALREADY carrying an unresolved mutation,
+        which is exactly the fact this call was going to write, and overwriting it would discard the
+        older and more conservative evidence.
     #>
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Reason)
-
-    $path = Get-WacQuarantineMarkerPath
-    if (-not $path) { return $false }
-
-    if ((Test-Path -LiteralPath $path) -and (Test-WacIsReparsePoint -Path $path)) { return $false }
 
     $record = [PSCustomObject]@{
         ProcessId = [int]$PID
@@ -108,51 +107,10 @@ function Write-WacQuarantineMarker {
         Reason = [string]$Reason
     }
 
-    $staging = $path + '.new'
-    try {
-        $directory = Split-Path -Path $path -Parent
-        if ($directory -and -not (Test-Path -LiteralPath $directory -PathType Container)) {
-            New-Item -Path $directory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
+    $written = Write-WacControlFile -Name (Get-WacQuarantineMarkerName) `
+        -Content (ConvertTo-Json -InputObject $record -Depth 3)
 
-        [System.IO.File]::WriteAllText($staging, (ConvertTo-Json -InputObject $record -Depth 3),
-            (New-Object System.Text.UTF8Encoding($false)))
-
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            [System.IO.File]::Replace($staging, $path, $null, $true)
-        }
-        else {
-            [System.IO.File]::Move($staging, $path)
-        }
-        return $true
-    }
-    catch {
-        try { if (Test-Path -LiteralPath $staging -PathType Leaf) { [System.IO.File]::Delete($staging) } } catch { $null = $_ }
-        return $false
-    }
-}
-
-function Get-WacCurrentProcessCreated {
-    <#
-    .SYNOPSIS
-        This process's creation time as the termination path reads it, or 0 when it cannot be read.
-    .DESCRIPTION
-        Through the same binding every other identity proof in this project uses, so the value a
-        marker records and the value a later run compares against come from one source. A 0 is
-        recorded honestly and read fail-closed: a marker with no creation time can never be retired,
-        because a recycled id could not then be ruled out.
-    #>
-    $created = 0L
-    try {
-        [void](Initialize-WacNative)
-        $binding = Open-WacProcessBinding -ProcessId $PID
-        if ($binding.Handle -ne [IntPtr]::Zero) {
-            try { if ($binding.IdentityKnown) { $created = [long]$binding.Created } }
-            finally { try { [WacNative]::CloseProcessHandle($binding.Handle) } catch { $null = $_ } }
-        }
-    }
-    catch { $created = 0L }
-    return [long]$created
+    return ([string]$written.Kind -ceq 'Created' -or [string]$written.Kind -ceq 'Present')
 }
 
 function Read-WacQuarantineMarker {
@@ -160,30 +118,30 @@ function Read-WacQuarantineMarker {
     .SYNOPSIS
         The abandonment an earlier PROCESS left behind. Three answers, never two.
     .DESCRIPTION
-        Absent, Valid and Unreadable are different facts and only one of them is permission to
-        proceed. "There was no abandonment" may license mutating this machine; "there is a marker
-        and it cannot be read" must never do so.
+        Absent, Valid and Unreadable are different facts and only the first is permission to
+        proceed. The store separates them from the OPEN's own outcome rather than from a pathname
+        probe, so a directory standing at the name, a denied open, a dangling link and a file that
+        genuinely is not there stop reading alike.
     .OUTPUTS
         State (Absent | Valid | Unreadable), Record, Reason.
     #>
     $result = [PSCustomObject]@{ State = 'Absent'; Record = $null; Reason = '' }
 
-    $path = Get-WacQuarantineMarkerPath
-    if (-not $path) {
+    $file = Read-WacControlFile -Name (Get-WacQuarantineMarkerName)
+
+    if ([string]$file.State -ceq 'Unreadable') {
         $result.State = 'Unreadable'
-        $result.Reason = 'the quarantine marker path could not be resolved'
+        $result.Reason = [string]$file.Reason
         return $result
     }
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $result }
-    if (Test-WacIsReparsePoint -Path $path) {
-        $result.State = 'Unreadable'
-        $result.Reason = 'a reparse point stands where the quarantine marker should be'
+    if ([string]$file.State -ceq 'Absent') {
+        $result.Reason = [string]$file.Reason
         return $result
     }
 
     $record = $null
     $failure = ''
-    try { $record = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($path)) }
+    try { $record = ConvertFrom-Json -InputObject ([string]$file.Text) }
     catch { $record = $null; $failure = [string]$_.Exception.Message }
 
     if (-not $record) {
@@ -213,15 +171,30 @@ function Remove-WacQuarantineMarker {
     .SYNOPSIS
         Retires the marker. Only Resolve-WacQuarantine calls this, and only on proof.
     #>
-    $path = Get-WacQuarantineMarkerPath
-    if (-not $path) { return $false }
-    if (-not (Test-Path -LiteralPath $path)) { return $true }
+    return (Remove-WacControlFile -Name (Get-WacQuarantineMarkerName))
+}
 
+function Get-WacCurrentProcessCreated {
+    <#
+    .SYNOPSIS
+        This process's creation time as the termination path reads it, or 0 when it cannot be read.
+    .DESCRIPTION
+        Through the same binding every other identity proof in this project uses, so the value a
+        marker records and the value a later run compares against come from one source. A 0 is
+        recorded honestly and read fail-closed: a marker with no creation time can never be retired,
+        because a recycled id could not then be ruled out.
+    #>
+    $created = 0L
     try {
-        [System.IO.File]::Delete((Get-WacLongPath -Path $path))
-        return $true
+        [void](Initialize-WacNative)
+        $binding = Open-WacProcessBinding -ProcessId $PID
+        if ($binding.Handle -ne [IntPtr]::Zero) {
+            try { if ($binding.IdentityKnown) { $created = [long]$binding.Created } }
+            finally { try { [WacNative]::CloseProcessHandle($binding.Handle) } catch { $null = $_ } }
+        }
     }
-    catch { return $false }
+    catch { $created = 0L }
+    return [long]$created
 }
 
 function Test-WacQuarantineProcessGone {
@@ -324,6 +297,19 @@ function Resolve-WacQuarantine {
     #>
     $script:AbandonedMutatorCount = 0
 
+    # MIGRATION, and deliberately conservative. A build before the store moved wrote this marker
+    # into the state root, where a name can be created by somebody else - so its contents may not be
+    # believed AND it may not be deleted, because deleting it would discard a real operator's real
+    # uncertainty on the strength of the same distrust. Present or Unknown both quarantine.
+    $legacy = Test-WacLegacyControlFile -Name (Get-WacQuarantineMarkerName)
+    if ([string]$legacy -cne 'Absent') {
+        $script:AbandonedMutatorCount++
+        Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'A quarantine marker from an earlier build is still in the old, non-administrative location; it is neither believed nor removed, and this run will not mutate anything. Inspect it and delete it by hand once you are satisfied nothing from that run is still going.' -Data @{
+            root = [string](Get-WacLegacyControlRoot); name = (Get-WacQuarantineMarkerName); state = [string]$legacy
+        }
+        return [PSCustomObject]@{ State = 'Quarantined'; Reason = 'a marker from an earlier build is still in the old location' }
+    }
+
     $marker = Read-WacQuarantineMarker
     if ([string]$marker.State -ceq 'Absent') {
         return [PSCustomObject]@{ State = 'Clear'; Reason = 'no earlier run left an unfinished mutation' }
@@ -332,7 +318,7 @@ function Resolve-WacQuarantine {
     if ([string]$marker.State -ceq 'Unreadable') {
         $script:AbandonedMutatorCount++
         Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'A quarantine marker is present and could not be read, so this run will not mutate anything.' -Data @{
-            path = [string](Get-WacQuarantineMarkerPath); reason = [string]$marker.Reason
+            store = [string](Get-WacControlRoot); reason = [string]$marker.Reason
         }
         return [PSCustomObject]@{ State = 'Quarantined'; Reason = [string]$marker.Reason }
     }
@@ -349,7 +335,7 @@ function Resolve-WacQuarantine {
     if (-not (Remove-WacQuarantineMarker)) {
         $script:AbandonedMutatorCount++
         Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'An earlier abandonment is over but its marker could not be removed, so this run will not mutate anything rather than act against a marker it cannot retire.' -Data @{
-            path = [string](Get-WacQuarantineMarkerPath)
+            store = [string](Get-WacControlRoot); name = (Get-WacQuarantineMarkerName)
         }
         return [PSCustomObject]@{ State = 'Quarantined'; Reason = 'the quarantine marker could not be removed' }
     }

@@ -207,7 +207,7 @@ function Invoke-WacPnpCleanHandler {
 
     # rundll32 returns as soon as it has handed the work over, so its code is the weakest of the
     # three facts available. The shared rule keeps the other two from being dropped.
-    $settled = Get-WacSettledOutcome -Outcome $outcome -Detail $detail -Run $run
+    $settled = Resolve-WacSettledOutcome -Outcome $outcome -Detail $detail -Run $run
 
     return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
         -Outcome $settled.Outcome -Attempted $true -DurationMs ([int]$run.DurationMs) -Detail $settled.Detail))

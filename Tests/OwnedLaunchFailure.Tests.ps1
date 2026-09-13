@@ -77,6 +77,28 @@ function Wait-ProcessGone {
     return (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue))
 }
 
+function Stop-FixtureByCommandLine {
+    <#
+    .SYNOPSIS
+        Reaps a fixture child identified by a unique string in its command line, and says how many
+        it stopped.
+    .DESCRIPTION
+        Needed only by the case that deliberately leaves a SUSPENDED process behind: the shared
+        result contract carries no process id, and a suspended child writes no pid file because it
+        has executed nothing. Matching on this case's own sandbox path cannot touch anything else -
+        the path contains a fresh GUID.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Marker)
+
+    $stopped = 0
+    foreach ($row in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Marker) -and $_.ProcessId -ne $PID })) {
+        Stop-Process -Id ([int]$row.ProcessId) -Force -ErrorAction SilentlyContinue
+        $stopped++
+    }
+    return $stopped
+}
+
 Test-Case 'a failure AFTER the child was resumed reports it and never runs the command twice' {
     # THE regression. The child is already executing when the launcher fails, so the only correct
     # number of invocations is the one that already happened.
@@ -174,6 +196,173 @@ Test-Case 'a jobless launch that times out is still terminated, not merely repor
     finally {
         if ($childId -gt 0) { Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue }
         [void](Set-WacOwnedProcessFault -Phase None)
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a suspended process that could not be terminated is never reported as stopped' {
+    # WAC-13 defect 1. TerminateProcess is a REQUEST and it is asynchronous; the launcher used to
+    # discard even the request's own return value, close the handle, and have the dispatch report
+    # TerminationProven=true regardless. A root this run can no longer see is exactly the thing it
+    # must not claim to have stopped.
+    #
+    # Driven through the launcher rather than through Invoke-WacProcess, because with the request
+    # refused the suspended process really is left behind and this case has to reap it.
+    $sandbox = New-TestSandbox -Prefix 'owned-terminate'
+    $launch = $null
+    try {
+        $counter = Join-Path -Path $sandbox -ChildPath 'ran.txt'
+        [void](Set-WacOwnedProcessFault -Phase BeforeResume -Message 'injected pre-resume failure')
+        [WacOwnedProcess]::FaultTerminateRefused = $true
+
+        $argv = New-CountingArgument -CounterPath $counter
+        $commandLine = (ConvertTo-WacCommandLineArgument -Value $script:HostExe) + ' ' + (ConvertTo-WacCommandLine -ArgumentList $argv)
+        # The same working directory the shipped launcher derives; CreateProcessW is handed a
+        # real one rather than a null, exactly as production does.
+        $workingDirectory = [System.IO.Path]::GetDirectoryName($script:HostExe)
+        $launch = [WacOwnedProcess]::Start($script:HostExe, $commandLine, $workingDirectory, 2000)
+
+        Assert-Equal 'Created' ([string]$launch.State) 'the fixture did not reach the suspended state this case is about'
+        Assert-False ([bool]$launch.Stopped) 'a termination request that was refused was reported as a confirmed stop'
+        Assert-True (([string]$launch.Degraded).Length -gt 0) 'an unconfirmed termination said nothing about why'
+        Assert-Equal 0 (Get-InvocationCount -Path $counter) 'a process that was never resumed executed the command'
+    }
+    finally {
+        [WacOwnedProcess]::FaultTerminateRefused = $false
+        [void](Set-WacOwnedProcessFault -Phase None)
+        # The case deliberately left it suspended; nothing else will reap it.
+        if ($launch -and $launch.ProcessId -gt 0) {
+            Stop-Process -Id ([int]$launch.ProcessId) -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a suspended process that WAS terminated reports a confirmed stop' {
+    # The control for the case above. Without it "never proven" satisfies that assertion and every
+    # ordinary failed start would start reporting an unaccounted live root.
+    $sandbox = New-TestSandbox -Prefix 'owned-terminate-ok'
+    try {
+        $counter = Join-Path -Path $sandbox -ChildPath 'ran.txt'
+        [void](Set-WacOwnedProcessFault -Phase BeforeResume -Message 'injected pre-resume failure')
+
+        $result = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 30000 `
+            -ArgumentList (New-CountingArgument -CounterPath $counter) -Component 'Test'
+
+        Assert-False ([bool]$result.Started) 'a process that never ran was reported as started'
+        Assert-True ([bool]$result.TerminationProven) 'a confirmed termination was not reported as proven'
+        Assert-Equal 'Complete' ([string]$result.OwnedTreeState) 'a confirmed termination left the tree state unresolved'
+        Assert-Equal 0 (Get-InvocationCount -Path $counter) 'a process that was never resumed executed the command'
+    }
+    finally {
+        [void](Set-WacOwnedProcessFault -Phase None)
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'an UNOWNED tool that fails after it started is stopped, not merely reported' {
+    # WAC-13 defect 2, and the reason the existing jobless-timeout case does not cover it: that one
+    # is reached from the TIMEOUT branch. This one throws while the tool is running, which used to
+    # land in a catch whose finally only called Close - and with Job zero, closing handles terminates
+    # nothing at all. The tool kept running while the run reported an exception.
+    $sandbox = New-TestSandbox -Prefix 'owned-unowned-throw'
+    $childId = 0
+    try {
+        $counter = Join-Path -Path $sandbox -ChildPath 'ran.txt'
+        $pidPath = Join-Path -Path $sandbox -ChildPath 'child.pid'
+
+        [void](Set-WacOwnedProcessFault -Phase JobAssign -Message 'injected assignment failure')
+        [void](Set-WacOwnedRunFault -Phase 'ReadAcquire')
+
+        $result = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 30000 `
+            -ArgumentList (New-CountingArgument -CounterPath $counter -PidPath $pidPath -HoldSeconds 60) -Component 'Test'
+
+        Assert-True ([bool]$result.Started) 'a tool that had already started was reported as not started'
+        Assert-False ([bool]$result.Owned) 'a launch whose job assignment failed claimed ownership'
+
+        if (Test-Path -LiteralPath $pidPath) {
+            $recorded = (Get-Content -LiteralPath $pidPath -Raw).Trim()
+            if ($recorded -match '^[0-9]+$') { $childId = [int]$recorded }
+        }
+
+        # The TOOL is what matters, not the message. Either it wrote its pid - in which case that
+        # process has to be gone - or it was stopped before it got that far.
+        if ($childId -gt 0) {
+            Assert-True (Wait-ProcessGone -ProcessId $childId) `
+                ('an unowned tool that failed after starting was left running: pid {0}' -f $childId)
+        }
+        Assert-True ([bool]$result.TerminationProven) `
+            'the walk stopped the tool but its verdict was not carried into the result'
+    }
+    finally {
+        [void](Set-WacOwnedRunFault -Phase 'None')
+        [void](Set-WacOwnedProcessFault -Phase None)
+        if ($childId -gt 0) { Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a stream that cannot be constructed leaves nothing created and no damaged handle' {
+    # WAC-13 defect 3. A SafeFileHandle adopts the raw pipe handle the moment it is constructed, so
+    # a throw from the FileStream over it used to be followed by the raw cleanup closing the SAME
+    # handle - a double close on a number the OS may already have reissued. The visible consequence
+    # is not an exception here but damage LATER, so the assertion is that the very next launch in
+    # this process still works.
+    $sandbox = New-TestSandbox -Prefix 'owned-stream'
+    try {
+        $counter = Join-Path -Path $sandbox -ChildPath 'ran.txt'
+        [void](Set-WacOwnedProcessFault -Phase OutStream -Message 'injected stream construction failure')
+
+        $first = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 30000 `
+            -ArgumentList (New-CountingArgument -CounterPath $counter) -Component 'Test'
+
+        # The streams are built BEFORE CreateProcessW, so nothing was created and the managed
+        # fallback is the safe answer - it runs the command exactly once.
+        Assert-Equal 1 (Get-InvocationCount -Path $counter) 'the fallback after a pre-creation failure did not run the command exactly once'
+        Assert-True ([bool]$first.Started) 'the fallback did not report the tool as started'
+
+        [void](Set-WacOwnedProcessFault -Phase None)
+        $secondCounter = Join-Path -Path $sandbox -ChildPath 'ran2.txt'
+        $second = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 30000 `
+            -ArgumentList (New-CountingArgument -CounterPath $secondCounter) -Component 'Test'
+
+        Assert-Equal 0 ([int]$second.ExitCode) 'the launch after a stream failure did not work, which is what a damaged handle looks like'
+        Assert-True ([bool]$second.Owned) 'ownership was lost after a stream failure in an earlier launch'
+        Assert-Equal 1 (Get-InvocationCount -Path $secondCounter) 'the launch after a stream failure did not run its command once'
+    }
+    finally {
+        [void](Set-WacOwnedProcessFault -Phase None)
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a termination that was never confirmed is reported unproven by the caller too' {
+    # The CONSUMER half of WAC-13 defect 1. The launcher answering Stopped=$false is only useful if
+    # the dispatch reads it: that branch used to return TerminationProven=$true unconditionally, so
+    # a suspended root nobody could stop was reported to the run as cleanly terminated.
+    #
+    # The process really is left behind here - that is the whole point - so the case reaps it by the
+    # unique sandbox path in its own command line.
+    $sandbox = New-TestSandbox -Prefix 'owned-unconfirmed'
+    try {
+        $counter = Join-Path -Path $sandbox -ChildPath 'ran.txt'
+        [void](Set-WacOwnedProcessFault -Phase BeforeResume -Message 'injected pre-resume failure')
+        [WacOwnedProcess]::FaultTerminateRefused = $true
+
+        $result = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 30000 `
+            -ArgumentList (New-CountingArgument -CounterPath $counter) -Component 'Test'
+
+        Assert-False ([bool]$result.Started) 'a process that never ran was reported as started'
+        Assert-False ([bool]$result.TerminationProven) `
+            'a suspended root that could not be confirmed stopped was reported as proven terminated'
+        Assert-Equal 'Unknown' ([string]$result.OwnedTreeState) `
+            'an unconfirmed termination reported a resolved tree state'
+        Assert-Equal 0 (Get-InvocationCount -Path $counter) 'a process that was never resumed executed the command'
+    }
+    finally {
+        [WacOwnedProcess]::FaultTerminateRefused = $false
+        [void](Set-WacOwnedProcessFault -Phase None)
+        [void](Stop-FixtureByCommandLine -Marker $sandbox)
         Remove-TestSandbox -Path $sandbox
     }
 }

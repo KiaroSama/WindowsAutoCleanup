@@ -45,6 +45,7 @@ function Get-WacTestPlan {
         stateTrusted = $true
         logDegraded = $false
         deadlineExpired = $false
+        quarantined = $false
         targets = @()
         dismOutcome = 'Succeeded'
         deliveryOutcome = 'SafeSkip'
@@ -162,6 +163,12 @@ function Initialize-WacRun {
     # Real module state, not a faked return value: Get-WacLogHealth, Get-WacStateTrust and
     # Test-WacDeadlineExpired stay the shipped functions reading the shipped variables.
     if ($plan.logDegraded) { Set-WacLogDegraded -Reason 'test shim: a log write failed' }
+
+    # AFTER the real Initialize-WacRun, which is what resolves the durable record. Arming the latch
+    # here is how an orchestration case gets a quarantined run without needing a control store the
+    # child could never create: what those cases are about is whether the STEP SEQUENCE reads the
+    # latch, and QuarantineStore.Tests.ps1 is where the record itself is proven.
+    if ($plan.quarantined) { [void](Add-WacAbandonedMutator -Reason 'test shim: an abandoned mutator') }
     if ($plan.deadlineExpired) { $script:DeadlineUtc = (Get-Date).ToUniversalTime().AddMinutes(-1) }
     if (-not $plan.stateEvaluated) { $script:StateTrust = $null }
 

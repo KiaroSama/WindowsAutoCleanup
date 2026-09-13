@@ -153,4 +153,76 @@ Test-Case 'a step that states no outcome fails closed rather than passing' {
     Assert-Equal 'Failed' (Get-WacStepOutcome -Step $miscased) 'a lowercase outcome property was accepted as the contract'
 }
 
+Test-Case 'a tool that cannot be proven finished stops the next mutation, not just the verdict' {
+    # WAC-05R. Raising the outcome to Incomplete told the FOOTER something was unfinished and
+    # stopped nothing: an unsettled DISM could be followed straight away by pnpclean, by the driver
+    # loop, or by cleanmgr's profile restore racing a write that may still be in flight.
+    try {
+        Reset-WacAbandonedMutator
+        Assert-True (Test-WacMutationAllowed) 'the latch was already armed, so this case proves nothing'
+
+        $unsettled = [PSCustomObject]@{
+            ExitCode = 0; TimedOut = $false; Started = $true
+            TerminationProven = $false; OutputComplete = $true
+            Owned = $true; OwnedTreeState = 'Alive'
+        }
+
+        $result = Resolve-WacSettledOutcome -Outcome 'Succeeded' -Detail 'the tool exited 0.' -Run $unsettled
+
+        Assert-Equal 'Incomplete' ([string]$result.Outcome) 'an unsettled tool was still reported as a success'
+        Assert-False (Test-WacMutationAllowed) `
+            'an unsettled tool raised the verdict but left the run free to start another mutation'
+    }
+    finally { Reset-WacAbandonedMutator }
+}
+
+Test-Case 'a settled tool leaves the run free to continue' {
+    # The control. Without it "always quarantine" satisfies the case above and one ordinary DISM
+    # would stop every later step of every run.
+    try {
+        Reset-WacAbandonedMutator
+
+        $settled = [PSCustomObject]@{
+            ExitCode = 0; TimedOut = $false; Started = $true
+            TerminationProven = $true; OutputComplete = $true
+            Owned = $true; OwnedTreeState = 'Complete'
+        }
+
+        $result = Resolve-WacSettledOutcome -Outcome 'Succeeded' -Detail 'the tool exited 0.' -Run $settled
+
+        Assert-Equal 'Succeeded' ([string]$result.Outcome) 'a settled tool was downgraded'
+        Assert-True (Test-WacMutationAllowed) 'a settled tool quarantined the run anyway'
+    }
+    finally { Reset-WacAbandonedMutator }
+}
+
+Test-Case 'a result that says nothing is not a settled one' {
+    # A null contract, and a contract whose tree state is Unknown, were both read as settled - the
+    # shared consumer only ever looked for the literal value 'Alive'.
+    try {
+        Reset-WacAbandonedMutator
+        Assert-False ((Test-WacToolLifetimeSettled -Run $null).Settled) 'a missing result was treated as a finished tool'
+
+        $unknown = [PSCustomObject]@{
+            ExitCode = 0; TimedOut = $false; Started = $true
+            TerminationProven = $true; OutputComplete = $true
+            Owned = $true; OwnedTreeState = 'Unknown'
+        }
+        Assert-False ((Test-WacToolLifetimeSettled -Run $unknown).Settled) `
+            'an owned launch whose tree could not be read was treated as a finished tool'
+
+        # The documented exception, and the reason it is one: an UNOWNED launch has no job to ask,
+        # so Unknown is the only tree answer it can ever give, and its pipe reaching EOF is the
+        # independent witness that stands in for one. Refusing that would refuse every unowned tool.
+        $unowned = [PSCustomObject]@{
+            ExitCode = 0; TimedOut = $false; Started = $true
+            TerminationProven = $true; OutputComplete = $true
+            Owned = $false; OwnedTreeState = 'Unknown'
+        }
+        Assert-True ((Test-WacToolLifetimeSettled -Run $unowned).Settled) `
+            'an unowned tool whose output completed was refused, which would refuse every managed fallback'
+    }
+    finally { Reset-WacAbandonedMutator }
+}
+
 Complete-TestRun

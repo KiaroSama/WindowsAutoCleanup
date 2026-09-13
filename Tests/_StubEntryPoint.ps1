@@ -103,6 +103,10 @@ function New-StubDeployment {
         'function Test-WacIsWithinRoot { param($ChildPath, $RootPath) return $false }',
         'function ConvertTo-WacCommandLine { param($ArgumentList) return (@($ArgumentList) -join '' '') }',
         'function Get-WacRelaunchArgument { param($ScriptPath, $BooleanSwitch, $PresentSwitch, $NamedValue, $HostSwitch) return @($ScriptPath) }',
+        # The quarantine admission the shared gate now makes (ledger WAC-05R). Default is clear, so
+        # every existing case is unchanged; WAC_STUB_QUARANTINED is what a case sets to prove the
+        # installer and the uninstaller refuse before they change anything.
+        'function Test-WacMutationAllowed { return ($env:WAC_STUB_QUARANTINED -ne ''True'') }',
         'function Get-WacLogHealth {',
         '    return [PSCustomObject]@{',
         '        Path = (Get-WacLogPath)',
@@ -172,6 +176,7 @@ function Invoke-StubbedEntryPoint {
         [string]$StatePath = '',
         [string]$StateReason = '',
         [bool]$LogDurable = $true,
+        [bool]$Quarantined = $false,
         [bool]$Admin = $true,
         [ValidateSet('ok', 'expired')][string]$Budget = 'ok',
         [string]$HostPath = '',
@@ -222,6 +227,7 @@ function Invoke-StubbedEntryPoint {
     $psi.EnvironmentVariables['WAC_STUB_STATE_PATH'] = $StatePath
     $psi.EnvironmentVariables['WAC_STUB_STATE_REASON'] = $StateReason
     $psi.EnvironmentVariables['WAC_STUB_LOG_DURABLE'] = ([string]$LogDurable)
+    $psi.EnvironmentVariables['WAC_STUB_QUARANTINED'] = ([string]$Quarantined)
     $psi.EnvironmentVariables['WAC_STUB_ADMIN'] = ([string]$Admin)
     $psi.EnvironmentVariables['WAC_STUB_BUDGET'] = $Budget
     $psi.EnvironmentVariables['WAC_STUB_HOST'] = $HostPath

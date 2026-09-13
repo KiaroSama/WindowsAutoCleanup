@@ -392,6 +392,44 @@ function Remove-InstalledDeployment {
     return $result
 }
 
+function Close-OutstandingJournal {
+    <#
+    .SYNOPSIS
+        Ends any deployment transaction record left beside a deployment this run has just removed.
+    .DESCRIPTION
+        Ledger WAC-02R. The records live BESIDE the slots - that is what stops a move or a delete of
+        a slot carrying them off - so deleting the deployment root, the staging slot and the recovery
+        slot left both of them exactly where they were. An authorized uninstall that succeeded and a
+        crashed upgrade then looked identical on disk, and the next install read that leftover
+        capture record and RE-REGISTERED a scheduled task whose files the operator had just asked to
+        have removed, pointing at a deployment root that no longer exists.
+
+        Only after the removal is proven clean, and only then: while any part of the deployment is
+        still there, the records are still the truth about it. Every task was unregistered and
+        verified absent before this point, so nothing the capture record names is missing any more -
+        the transaction it describes is genuinely over.
+    .OUTPUTS
+        [bool] $true when nothing outstanding is left on disk.
+    #>
+    param([Parameter(Mandatory = $true)]$Slots)
+
+    $ok = $true
+    foreach ($kind in @('Swap', 'TaskCapture')) {
+        $path = Get-WacDeploymentJournalPath -DeploymentRoot $Slots.Root -Kind $kind
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { continue }
+
+        if (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root -Kind $kind) {
+            Write-UninstallerMessage -Level INFO -Message 'A deployment transaction record an earlier run left behind was ended with the deployment it describes.' -Data @{ record = $path }
+            continue
+        }
+
+        Write-UninstallerMessage -Level ERROR -Message 'A deployment transaction record could not be deleted; a later install may try to re-register a task whose files this run removed. Delete it by hand.' -Data @{ record = $path }
+        $ok = $false
+    }
+
+    return $ok
+}
+
 function Remove-RetainedLog {
     <#
     .SYNOPSIS
@@ -490,6 +528,7 @@ function Invoke-Main {
     }
     else {
         $deployment = Remove-InstalledDeployment -Slots $slots
+        if ($deployment.Clean) { [void](Close-OutstandingJournal -Slots $slots) }
     }
 
     if ($RemoveLogs -and $KeepLogs) {

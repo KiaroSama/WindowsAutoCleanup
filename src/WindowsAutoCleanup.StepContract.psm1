@@ -261,12 +261,29 @@ function Test-WacToolLifetimeSettled {
     param([Parameter(Mandatory = $true)][AllowNull()]$Run)
 
     $result = [PSCustomObject]@{ Settled = $true; Reason = '' }
-    if ($null -eq $Run) { return $result }
+
+    # A NULL result is not a settled one. Nothing ran that could be asked, and "we have no answer"
+    # was being read as "the answer was yes" - which is the shape of every other defect in this
+    # ledger (ledger WAC-05R).
+    if ($null -eq $Run) {
+        $result.Settled = $false
+        $result.Reason = 'no run result was produced at all, so nothing about the tool could be established'
+        return $result
+    }
 
     $names = @()
     try { $names = @($Run.PSObject.Properties.Name) } catch { $names = @() }
 
     $reasons = New-Object 'System.Collections.Generic.List[string]'
+
+    # UNKNOWN IS NOT SETTLED. The tree state was only consulted for the value 'Alive', so a launch
+    # that could not be asked about its own descendants - a jobless one, or one whose job could not
+    # be read - passed whenever the two booleans beside it happened to look good.
+    if ($names -ccontains 'OwnedTreeState' -and ([string]$Run.OwnedTreeState) -ceq 'Unknown' -and
+        -not ($names -ccontains 'Owned' -and -not [bool]$Run.Owned -and
+              $names -ccontains 'OutputComplete' -and [bool]$Run.OutputComplete)) {
+        [void]$reasons.Add('whether work this run started is still alive could not be established')
+    }
 
     if ($names -ccontains 'TerminationProven' -and -not [bool]$Run.TerminationProven) {
         [void]$reasons.Add('the tool could not be proven stopped')
@@ -319,13 +336,24 @@ function Invoke-WacGuardedStep {
         -Detail 'The step was not started: an earlier mutation was abandoned and cannot be proven finished, so nothing further on this machine may be changed by this run.'))
 }
 
-function Get-WacSettledOutcome {
+function Resolve-WacSettledOutcome {
     <#
     .SYNOPSIS
-        Raises a step outcome to Incomplete when the tool's lifetime is not settled, and explains it.
+        Raises a step outcome to Incomplete when the tool's lifetime is not settled, explains it, AND
+        stops the run from scheduling another mutation.
     .DESCRIPTION
         Combined through Get-WacHigherOutcome, never assigned: an unsettled lifetime can only make a
         verdict worse. A recorded Failed stays Failed.
+
+        IT ARMS THE QUARANTINE, and that is the whole point of the rename (ledger WAC-05R). Raising
+        the outcome only told the FOOTER something was unfinished - it did not stop anything, so an
+        unsettled DISM could be followed straight away by pnpclean, by the driver loop, or by
+        cleanmgr's profile restore racing a write that may still be in flight. "This tool cannot be
+        proven finished" and "nothing else may start" are the same fact, and one of them was being
+        reported while the other was not acted on.
+
+        A function named Get- that changes the run's state would be the wrong shape, so it is not
+        one: every caller was updated with the rename rather than left pointing at an older answer.
     .OUTPUTS
         Outcome and Detail.
     #>
@@ -341,14 +369,20 @@ function Get-WacSettledOutcome {
         return [PSCustomObject]@{ Outcome = $Outcome; Detail = $Detail }
     }
 
+    # THE STOP. Whatever this tool left behind may still be writing, so nothing else this run would
+    # do may start on top of it. Add-WacAbandonedMutator is the same latch an abandoned in-process
+    # mutator raises, and it is fail-closed for the same reason: nothing here can observe the
+    # unsettled work finishing.
+    [void](Add-WacAbandonedMutator -Reason ('an external tool could not be proven finished: {0}' -f $settled.Reason))
+
     return [PSCustomObject]@{
         Outcome = (Get-WacHigherOutcome -Current $Outcome -Candidate 'Incomplete')
-        Detail = ('{0} The step cannot be reported finished: {1}.' -f $Detail, $settled.Reason).Trim()
+        Detail = ('{0} The step cannot be reported finished: {1}. No further change will be made by this run.' -f $Detail, $settled.Reason).Trim()
     }
 }
 
 Export-ModuleMember -Function @(
-    'Test-WacToolLifetimeSettled', 'Get-WacSettledOutcome',
+    'Test-WacToolLifetimeSettled', 'Resolve-WacSettledOutcome',
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath',
     'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded', 'Invoke-WacGuardedStep',
     'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable'

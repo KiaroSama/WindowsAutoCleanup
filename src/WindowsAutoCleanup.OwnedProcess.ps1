@@ -68,7 +68,7 @@ function Set-WacOwnedProcessFault {
         later launch in the process fail.
     #>
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('None', 'JobAssign', 'BeforeResume', 'AfterResume')][string]$Phase,
+        [Parameter(Mandatory = $true)][ValidateSet('None', 'JobAssign', 'BeforeResume', 'AfterResume', 'OutStream', 'ErrStream', 'TerminateRefused')][string]$Phase,
         [AllowEmptyString()][string]$Message = 'injected by a test'
     )
 
@@ -79,6 +79,9 @@ function Set-WacOwnedProcessFault {
         'JobAssign'    { [WacOwnedProcess]::FaultAtJobAssign = $Message }
         'BeforeResume' { [WacOwnedProcess]::FaultBeforeResume = $Message }
         'AfterResume'  { [WacOwnedProcess]::FaultAfterResume = $Message }
+        'OutStream'    { [WacOwnedProcess]::FaultAtOutStream = $Message }
+        'ErrStream'    { [WacOwnedProcess]::FaultAtErrStream = $Message }
+        'TerminateRefused' { [WacOwnedProcess]::FaultTerminateRefused = $true }
         default        { $null = $Phase }
     }
     return $true
@@ -131,6 +134,13 @@ public sealed class WacOwnedLaunch
     // logical invocation executing twice, and closing the first job cannot undo what it already did.
     public string State = "NeverCreated";
     public string Failure = "";
+
+    // ONLY meaningful for State == "Created": whether that suspended process is CONFIRMED gone.
+    // TerminateProcess is documented as asynchronous - it asks, and returns before the process has
+    // exited - and the previous code discarded even the request's own return value, then reported
+    // TerminationProven=true regardless. A request that failed, and one that succeeded but had not
+    // finished when the handle was closed, both read as proof.
+    public bool Stopped = false;
 }
 
 public static class WacOwnedProcess
@@ -143,12 +153,22 @@ public static class WacOwnedProcess
     public static string FaultAtJobAssign = null;
     public static string FaultBeforeResume = null;
     public static string FaultAfterResume = null;
+    // The window between a SafeFileHandle adopting a raw pipe handle and the FileStream taking the
+    // SafeFileHandle. Nothing else can produce it on demand, and it is the one window in which two
+    // owners could close the same handle.
+    public static string FaultAtOutStream = null;
+    public static string FaultAtErrStream = null;
+    // A termination REQUEST that fails, which no test can provoke against a real suspended process.
+    public static bool FaultTerminateRefused = false;
 
     public static void ClearFaults()
     {
         FaultAtJobAssign = null;
         FaultBeforeResume = null;
         FaultAfterResume = null;
+        FaultAtOutStream = null;
+        FaultAtErrStream = null;
+        FaultTerminateRefused = false;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -352,7 +372,8 @@ public static class WacOwnedProcess
         if (launch.Job != IntPtr.Zero) { CloseHandle(launch.Job); launch.Job = IntPtr.Zero; }
     }
 
-    public static WacOwnedLaunch Start(string applicationName, string commandLine, string workingDirectory)
+    public static WacOwnedLaunch Start(string applicationName, string commandLine, string workingDirectory,
+        int terminateConfirmMs)
     {
         WacOwnedLaunch launch = new WacOwnedLaunch();
 
@@ -368,6 +389,12 @@ public static class WacOwnedProcess
         // finally block must not close it too - the previous version could close both, which is a
         // double close on a handle the OS may already have recycled.
         bool outAdopted = false, errAdopted = false;
+        // Held only while THIS frame owns them. A SafeFileHandle adopts the raw handle the moment it
+        // is constructed, so the raw cleanup below has to stand down at that instant - not after the
+        // FileStream over it has also succeeded. Constructing the stream can throw, and the previous
+        // ordering then closed a handle the SafeFileHandle finalizer still owned: a double close on
+        // a number the OS may already have handed to something else.
+        SafeFileHandle outSafe = null, errSafe = null;
 
         try
         {
@@ -396,10 +423,17 @@ public static class WacOwnedProcess
             // ResumeThread is unrecoverable in the only sense that matters: the tool has already
             // started doing whatever it does. The pipes exist independently of the child, so every
             // allocation that can throw moves ahead of the resume.
-            launch.StandardOutput = new FileStream(new SafeFileHandle(outRead, true), FileAccess.Read, 4096, false);
+            outSafe = new SafeFileHandle(outRead, true);
             outAdopted = true;
-            launch.StandardError = new FileStream(new SafeFileHandle(errRead, true), FileAccess.Read, 4096, false);
+            if (FaultAtOutStream != null) { throw new InvalidOperationException(FaultAtOutStream); }
+            launch.StandardOutput = new FileStream(outSafe, FileAccess.Read, 4096, false);
+            outSafe = null;
+
+            errSafe = new SafeFileHandle(errRead, true);
             errAdopted = true;
+            if (FaultAtErrStream != null) { throw new InvalidOperationException(FaultAtErrStream); }
+            launch.StandardError = new FileStream(errSafe, FileAccess.Read, 4096, false);
+            errSafe = null;
 
             PROCESS_INFORMATION pi;
             StringBuilder line = new StringBuilder(commandLine);
@@ -472,9 +506,22 @@ public static class WacOwnedProcess
             }
             else if (launch.State == "Created")
             {
-                // Suspended and never resumed, so it has executed nothing and has no descendants.
-                // Terminating it here makes the cleanup complete rather than leaving a hung root.
-                try { TerminateProcess(launch.Process, 1); } catch { }
+                // Suspended and never resumed, so it has executed nothing and has no descendants -
+                // but "asked it to stop" is not "it stopped". The REQUEST's own result is checked,
+                // and then confirmed on the bound process handle BEFORE that handle is closed,
+                // because after the close there is nothing left to ask.
+                bool asked = false;
+                try { asked = !FaultTerminateRefused && TerminateProcess(launch.Process, 1); } catch { asked = false; }
+                if (asked && terminateConfirmMs > 0)
+                {
+                    launch.Stopped = WaitForSingleObject(launch.Process, (uint)terminateConfirmMs) == WAIT_OBJECT_0;
+                }
+                if (!launch.Stopped)
+                {
+                    launch.Degraded = asked
+                        ? "the suspended process was asked to terminate and had not exited when its handle was released"
+                        : "the suspended process could not be asked to terminate";
+                }
                 Close(launch);
             }
             // Resumed keeps its handles: the caller still has to wait on it, read it and stop it.
@@ -488,6 +535,10 @@ public static class WacOwnedProcess
             // Only a read end NO SafeFileHandle took responsibility for.
             if (!outAdopted && outRead != IntPtr.Zero) { CloseHandle(outRead); }
             if (!errAdopted && errRead != IntPtr.Zero) { CloseHandle(errRead); }
+            // Adopted, but the stream never took it: this frame is still the single owner, so it
+            // closes deterministically here rather than leaving it to a finalizer.
+            if (outSafe != null) { try { outSafe.Dispose(); } catch { } }
+            if (errSafe != null) { try { errSafe.Dispose(); } catch { } }
         }
     }
 }
@@ -537,7 +588,13 @@ function Start-WacOwnedProcess {
     # or in the returned object - may become $null, because $null is what licenses the caller to run
     # the same command again.
     try {
-        $launch = [WacOwnedProcess]::Start($FilePath, $commandLine, $directory)
+        # The confirmation budget for a suspended process that has to be terminated before it ever
+        # ran. Drawn from the RUN BUDGET only, never claimed from the recovery reserve: this number
+        # is computed on EVERY launch and the overwhelming majority of launches never use it, so
+        # claiming it here would debit the reserve once per tool for a confirmation that does not
+        # happen - which measurably starved the drain that does. Past the deadline it is 0, the
+        # confirmation does not run, and Stopped stays false, which is the honest answer.
+        $launch = [WacOwnedProcess]::Start($FilePath, $commandLine, $directory, (Get-WacStepTimeoutMs -RequestedMs 5000))
     }
     catch {
         Write-WacLog -Level WARNING -Component 'Process' -Message 'The owned launcher failed before any process could be created; an unowned start is safe.' -Data @{

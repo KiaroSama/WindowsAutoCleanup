@@ -38,6 +38,7 @@ $script:CoreModulePath      = $PSCommandPath
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TrustedStore.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Locations.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Budget.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ControlFile.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Quarantine.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.RunState.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Process.ps1')
@@ -58,6 +59,9 @@ Export-ModuleMember -Function @(
     'Test-WacTrustedDirectoryDescriptor', 'Test-WacStrictAclIsAdministrative',
     'Set-WacDirectoryCreateProbe', 'Set-WacDirectoryTrustJudge',
     'Get-WacDataRoot', 'Get-WacFallbackDataRoot', 'Get-WacDeploymentRoot', 'Get-WacDriverBackupRoot', 'Get-WacLegacyDriverBackupRoot',
+    'Get-WacControlRoot', 'Set-WacControlRoot', 'Get-WacLegacyControlRoot',
+    'Write-WacControlFile', 'Read-WacControlFile', 'Remove-WacControlFile', 'Test-WacLegacyControlFile',
+    'Test-WacControlStorePresence',
     'Initialize-WacRun', 'Write-WacLog', 'Close-WacLog', 'Get-WacLogPath', 'Get-WacExecutionId',
     'Get-WacLogDirectory', 'Get-WacLogHealth', 'Get-WacStateTrust',
     'Set-WacLogFallbackWriter', 'Set-WacLogWriter',
@@ -66,7 +70,7 @@ Export-ModuleMember -Function @(
     'Reset-WacShutdownReserve', 'Get-WacShutdownReserveMs', 'Request-WacShutdownReserveMs',
     'Request-WacWaitMs',
     'Reset-WacAbandonedMutator', 'Get-WacAbandonedMutatorCount', 'Test-WacMutationAllowed',
-    'Add-WacAbandonedMutator', 'Resolve-WacQuarantine', 'Get-WacQuarantineMarkerPath',
+    'Add-WacAbandonedMutator', 'Resolve-WacQuarantine', 'Get-WacQuarantineMarkerName',
     'Read-WacQuarantineMarker', 'Remove-WacQuarantineMarker', 'Test-WacQuarantineProcessGone',
     'Write-WacQuarantineMarker', 'Get-WacCurrentProcessCreated',
     'ConvertTo-WacCommandLineArgument', 'ConvertTo-WacCommandLine',
@@ -74,7 +78,7 @@ Export-ModuleMember -Function @(
     'Stop-WacProcessTree', 'Set-WacProcessHandleOpener',
     'Start-WacOwnedProcess', 'Get-WacOwnedTreeState', 'Set-WacOwnedProcessLauncher',
     'Set-WacOwnedProcessFault',
-    'Wait-WacOwnedTreeQuiet',
+    'Wait-WacOwnedTreeQuiet', 'Set-WacOwnedRunFault',
     'Initialize-WacOwnedProcessNative',
     'Invoke-WacProcess', 'Set-WacProcessInvoker', 'Get-WacProcessInvoker', 'Invoke-WacBounded',
     'Enter-WacSingleInstance', 'Exit-WacSingleInstance',

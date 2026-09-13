@@ -112,13 +112,17 @@ function Invoke-WacComponentCleanup {
         # The exit code is what DISM believes about ITSELF. Servicing hands work to children, so a
         # clean code with a live descendant or truncated output is not a finished step - one shared
         # rule answers that for every tool rather than each step inventing its own.
-        $settled = Get-WacSettledOutcome -Outcome 'Succeeded' -Detail ('dism.exe exited with {0}.' -f $exitCode) -Run $run
+        $settled = Resolve-WacSettledOutcome -Outcome 'Succeeded' -Detail ('dism.exe exited with {0}.' -f $exitCode) -Run $run
         return (Write-WacStepResult -Component $component -Result (New-WacStepResult -Category $category -Outcome $settled.Outcome -Attempted $true `
             -RebootRequired ($exitCode -eq 3010) -DurationMs ([int]$run.DurationMs) -Detail $settled.Detail))
     }
 
+    # THE FAILURE PATH GOES THROUGH THE GATE TOO. A non-zero exit says DISM believes it failed; it
+    # says nothing about whether the servicing children it started are still running, and a step that
+    # failed is exactly the one after which another mutation must not begin (ledger WAC-05R).
     $detail = if ($null -eq $exitCode) { 'dism.exe did not start.' } else { 'dism.exe exited with {0}.' -f $exitCode }
-    return (Write-WacStepResult -Component $component -Result (New-WacStepResult -Category $category -Outcome 'Failed' -Attempted $true -DurationMs ([int]$run.DurationMs) -Detail $detail))
+    $failed = Resolve-WacSettledOutcome -Outcome 'Failed' -Detail $detail -Run $run
+    return (Write-WacStepResult -Component $component -Result (New-WacStepResult -Category $category -Outcome $failed.Outcome -Attempted $true -DurationMs ([int]$run.DurationMs) -Detail $failed.Detail))
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -280,11 +284,12 @@ Export-ModuleMember -Function @(
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath', 'Get-WacDiskCleanupCategory',
     'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded', 'Invoke-WacGuardedStep',
     'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable',
-    'Test-WacToolLifetimeSettled', 'Get-WacSettledOutcome',
+    'Test-WacToolLifetimeSettled', 'Resolve-WacSettledOutcome',
     'Invoke-WacComponentCleanup',
     'Test-WacRecycleBinEntryName', 'Get-WacRecycleBinScan', 'Clear-WacRecycleBin',
     'Get-WacDeliveryOptimizationCacheLocation', 'Clear-WacDeliveryOptimizationCache',
     'Test-WacRegistryValueEqual', 'Get-WacRegistryValueFact',
     'Get-WacDiskCleanupStateFlag', 'Restore-WacDiskCleanupStateFlag', 'Enable-WacDiskCleanupCategory',
+    'Test-WacDiskCleanupProfileExact',
     'Invoke-WacLegacyDiskCleanup'
 )

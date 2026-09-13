@@ -31,6 +31,10 @@ $script:VolumeCacheKeyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Ex
 # Never select Offline Pages Files; it still receives an explicit off value.
 $script:DiskCleanupSkipHandler = @('Offline Pages Files')
 
+# The durable copy of somebody else's cleanmgr selection, written BEFORE this step borrows the
+# profile and retired only once every value is proven back (ledger WAC-05R).
+$script:CleanMgrSnapshotName = 'cleanmgr-profile.json'
+
 $script:DiskCleanupCategory = @(
     'Update Cleanup'
     'Microsoft Defender'
@@ -566,6 +570,18 @@ function Invoke-WacLegacyDiskCleanup {
                 $detail = 'The cleanmgr profile could not be snapshotted, so nothing was changed: {0}' -f $snapshotRun.Error
             }
         }
+        elseif (@('Created', 'Present') -cnotcontains [string](Write-WacControlFile -Name $script:CleanMgrSnapshotName `
+                    -Content (ConvertTo-Json -InputObject @($snapshot) -Depth 4)).Kind) {
+            # BEFORE the first mutation, and this is the whole point (ledger WAC-05R). The original
+            # values lived only in this process's memory, so a run that wrote the profile and was
+            # then abandoned left somebody else's cleanmgr selection recoverable only from a
+            # variable that no longer exists - and a later run, having proved this host gone, would
+            # retire the quarantine and lose it for ever.
+            #
+            # Declining here costs nothing: not one value has been written yet.
+            $outcome = 'SafeSkip'
+            $detail = 'The original cleanmgr profile could not be recorded durably, so nothing was changed.'
+        }
         elseif (-not (Test-WacMutationAllowed)) {
             # Writing the sage profile IS a mutation, and it is followed by a whole-machine
             # /sagerun. Neither may start while an earlier mutator could still be running.
@@ -668,7 +684,7 @@ function Invoke-WacLegacyDiskCleanup {
 
                     # cleanmgr drives shell handlers, several of which outlive the process that
                     # started them. Its exit code alone was deciding this step.
-                    $settled = Get-WacSettledOutcome -Outcome $outcome -Detail $detail -Run $run
+                    $settled = Resolve-WacSettledOutcome -Outcome $outcome -Detail $detail -Run $run
                     $outcome = $settled.Outcome
                     $detail = $settled.Detail
                 }
@@ -709,7 +725,19 @@ function Invoke-WacLegacyDiskCleanup {
                 # exit 6. Get-WacHigherOutcome keeps the worse of the two, so a restore failure can
                 # only ever raise the verdict. Both facts stay in $detail; neither erases the other.
                 $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
-                $detail = '{0} The pre-existing cleanmgr profile could not be restored for {1} handler(s).' -f $detail, $restoreFailed
+                $detail = '{0} The pre-existing cleanmgr profile could not be restored for {1} handler(s). The original values are kept in the control store for recovery.' -f $detail, $restoreFailed
+            }
+            else {
+                # PROVEN BACK, so the durable copy has nothing left to protect. Retiring it only
+                # here is what makes it a recovery record rather than a formality: a restore that
+                # failed, or one this run never reached, leaves the originals on disk for the next
+                # run or an operator - which is the whole reason they were written before the first
+                # value was touched.
+                if (-not (Remove-WacControlFile -Name $script:CleanMgrSnapshotName)) {
+                    Write-WacLog -Level WARNING -Component $component -Message 'The cleanmgr profile was restored but its recovery copy could not be retired; it is harmless and can be removed by hand.' -Data @{
+                        store = [string](Get-WacControlRoot); name = $script:CleanMgrSnapshotName
+                    }
+                }
             }
         }
     }
@@ -725,5 +753,9 @@ Export-ModuleMember -Function @(
     'Get-WacDiskCleanupCategory',
     'Test-WacRegistryValueEqual', 'Get-WacRegistryValueFact',
     'Get-WacDiskCleanupStateFlag', 'Restore-WacDiskCleanupStateFlag', 'Enable-WacDiskCleanupCategory',
+    # EXPORTED BECAUSE A BOUNDED WORKER CALLS IT. Invoke-WacStepBounded runs its block as text in a
+    # fresh runspace that imports the package, so an unexported name is simply not there - and the
+    # read-back failing is what stops cleanmgr from ever being launched on an enabled run.
+    'Test-WacDiskCleanupProfileExact',
     'Invoke-WacLegacyDiskCleanup'
 )
