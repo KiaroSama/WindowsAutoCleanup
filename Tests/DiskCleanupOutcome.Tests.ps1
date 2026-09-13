@@ -75,7 +75,7 @@ Test-Case 'a failed restore never lowers a recorded cleanmgr failure' {
         # so anything armed before the call is wiped before the step ever runs.
         Invoke-WithStubbedTool -StubToolPath -Body {
             $script:StubResult = @{ '/sagerun:9999' = @{ ExitCode = 3 } }
-            $script:BoundedForce = @{ 'call:1' = @{ Outcome = 'Failed'; Error = 'forced by the fixture' } }
+            $script:BoundedForce = @{ 'label:restore' = @{ Outcome = 'Failed'; Error = 'forced by the fixture' } }
             $script:Captured = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999
         }
 
@@ -123,7 +123,7 @@ Test-Case 'the tool outcome and the restore outcome combine to the higher-ranked
             Invoke-WithStubbedTool -StubToolPath -Body {
                 $script:StubResult = @{ '/sagerun:9999' = $script:CaseTool }
                 if ($script:CaseRestore) {
-                    $script:BoundedForce = @{ 'call:1' = @{ Outcome = $script:CaseRestore; Error = 'forced' } }
+                    $script:BoundedForce = @{ 'label:restore' = @{ Outcome = $script:CaseRestore; Error = 'forced' } }
                 }
                 $script:Captured = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999
             }

@@ -62,7 +62,7 @@ $script:RecordingInvoker = {
 # cmdlet inside it is the one that runs. A forced entry short-circuits it so the Incomplete and
 # Failed branches can be reached without waiting for a real timeout.
 $script:RecordingBounded = {
-    param($ScriptBlock, $TimeoutMs, $ArgumentList, $Component, $IgnoreRunBudget)
+    param($ScriptBlock, $TimeoutMs, $ArgumentList, $Component, $IgnoreRunBudget, $Label)
 
     $index = $script:BoundedCall.Count
     [void]$script:BoundedCall.Add([PSCustomObject]@{
@@ -70,9 +70,13 @@ $script:RecordingBounded = {
         TimeoutMs       = [int]$TimeoutMs
         Component       = [string]$Component
         IgnoreRunBudget = [bool]$IgnoreRunBudget
+        Label           = [string]$Label
     })
 
-    foreach ($key in @(('call:{0}' -f $index), [string]$Component)) {
+    # label: first, so a fixture can name the call it means. call: still works and still means the
+    # ordinal, but a step that gains a phase no longer renumbers every fixture that came before it.
+    foreach ($key in @(('label:{0}' -f [string]$Label), ('call:{0}' -f $index), [string]$Component)) {
+        if ([string]::IsNullOrEmpty($key) -or $key -ceq 'label:') { continue }
         if (-not $script:BoundedForce.ContainsKey($key)) { continue }
 
         $forced = $script:BoundedForce[$key]
@@ -205,6 +209,12 @@ function Invoke-WithStubbedTool {
     $script:StubResult = @{}
     $script:BoundedCall.Clear()
     $script:BoundedForce = @{}
+
+    # Each case is a RUN. The unproven-mutator latch is deliberately not self-clearing - nothing
+    # in-process can observe an abandoned mutator finishing - and Initialize-WacRun is what resets
+    # it in production. A suite never calls that, so without this every case after one that armed
+    # the latch would be refused for the previous case's reason.
+    Reset-WacAbandonedMutator
 
     $originalAdmin = Get-ModuleFunctionBody -Module $script:StepModule -Name 'Test-WacIsAdministrator'
     Set-ModuleFunctionBody -Module $script:StepModule -Name 'Test-WacIsAdministrator' -Body { return $true }

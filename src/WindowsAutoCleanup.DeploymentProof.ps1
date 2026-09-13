@@ -604,13 +604,30 @@ function Write-WacDeploymentJournal {
         return $false
     }
 
+    # WRITTEN BESIDE, THEN SWAPPED IN. Writing over the live record meant a crash mid-write left a
+    # TORN file - and a torn record is worse than none, because it destroyed the last complete one
+    # while looking like an answer. The temporary file absorbs a partial write; the swap is what the
+    # next process ever sees, and the displaced record is kept as the previous complete one.
+    $staging = $path + '.new'
+    $previous = $path + '.last'
+
     try {
-        [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $Record -Depth 4),
+        [System.IO.File]::WriteAllText($staging, (ConvertTo-Json -InputObject $Record -Depth 4),
             (New-Object System.Text.UTF8Encoding($false)))
+
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            # Replace keeps a copy of what it displaced, so a record that is later found unreadable
+            # still has a complete predecessor to reconcile against.
+            [System.IO.File]::Replace($staging, $path, $previous, $true)
+        }
+        else {
+            [System.IO.File]::Move($staging, $path)
+        }
         return $true
     }
     catch {
         Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The deployment transaction record could not be written.' -Data @{ path = $path; error = $_.Exception.Message }
+        try { if (Test-Path -LiteralPath $staging -PathType Leaf) { [System.IO.File]::Delete($staging) } } catch { $null = $_ }
         return $false
     }
 }
@@ -629,17 +646,38 @@ function Read-WacDeploymentJournal {
     #>
     param([string]$DeploymentRoot)
 
+    $result = [PSCustomObject]@{ State = 'Absent'; Record = $null; Reason = '' }
+
     if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
     $expectedRoot = Get-WacNormalizedPath -Path $DeploymentRoot
     $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot
-    if (-not $expectedRoot -or -not $path) { return $null }
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    if (Test-WacIsReparsePoint -Path $path) { return $null }
+
+    # THREE ANSWERS, NOT TWO. Absent, Valid and Unreadable are different facts and only one of them
+    # is permission to act: "there was no transaction" can license discarding a recovery copy, while
+    # "there is a record and it cannot be read" must never do so. Collapsing both to $null let a
+    # torn or foreign record be read as "nothing happened here".
+    if (-not $expectedRoot -or -not $path) {
+        $result.State = 'Unreadable'
+        $result.Reason = 'the transaction record path could not be resolved'
+        return $result
+    }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $result }
+    if (Test-WacIsReparsePoint -Path $path) {
+        $result.State = 'Unreadable'
+        $result.Reason = 'a reparse point stands where the transaction record should be'
+        return $result
+    }
 
     $record = $null
+    $failure = ''
     try { $record = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($path)) }
-    catch { $record = $null }
-    if (-not $record) { return $null }
+    catch { $record = $null; $failure = [string]$_.Exception.Message }
+
+    if (-not $record) {
+        $result.State = 'Unreadable'
+        $result.Reason = ('the transaction record could not be parsed: {0}' -f $failure).Trim()
+        return $result
+    }
 
     $schema = 0
     $projectId = ''
@@ -651,11 +689,19 @@ function Read-WacDeploymentJournal {
     if ($schema -ne $script:DeploymentJournalSchema -or
         -not [string]::Equals($projectId, $script:DeploymentProjectId, [System.StringComparison]::Ordinal) -or
         -not [string]::Equals($root, $expectedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A deployment transaction record was ignored because it does not describe this deployment.' -Data @{ path = $path }
-        return $null
+        # A record that is readable but describes something else is NOT absence either: something
+        # wrote it, and guessing which deployment it belongs to is exactly the guess to refuse.
+        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'A deployment transaction record does not describe this deployment.' -Data @{
+            path = $path; schema = $schema; root = $root
+        }
+        $result.State = 'Unreadable'
+        $result.Reason = 'the transaction record does not describe this deployment'
+        return $result
     }
 
-    return $record
+    $result.State = 'Valid'
+    $result.Record = $record
+    return $result
 }
 
 function Remove-WacDeploymentJournal {
@@ -713,6 +759,24 @@ function Test-WacRecoverySlotIsPromotable {
     }
     if (-not (Test-Path -LiteralPath (Join-Path -Path $ownership.Root -ChildPath 'Run.ps1') -PathType Leaf)) {
         $result.Reason = 'the recovery slot holds no Run.ps1, so it is not a deployment that could be put back'
+        return $result
+    }
+
+    # OURS IS NOT THE SAME AS INTACT. A managed slot whose files no longer hash to its own manifest
+    # is still recognisably ours - that is exactly what IsOurs means - and promoting it would put a
+    # tampered or half-copied tree at the path SYSTEM executes. Only an unmanaged slot, which has no
+    # manifest to disagree with, is exempt.
+    if ([string]$ownership.Kind -ceq 'Managed' -and -not [bool]$ownership.IsHealthy) {
+        $result.Reason = ('the recovery slot no longer matches its own manifest: {0}' -f [string]$ownership.Reason)
+        return $result
+    }
+
+    # And what it becomes is code run as SYSTEM, so the same trust walk the deployment root gets
+    # applies before it is promoted: a slot any non-administrative account can still write to is one
+    # a standard user could have prepared. No ACL is changed - this only reads.
+    $trust = Test-WacDeploymentTrusted -DeploymentRoot $ownership.Root
+    if (-not [bool]$trust.IsTrusted) {
+        $result.Reason = ('the recovery slot cannot be trusted to run as SYSTEM: {0}' -f [string]$trust.Reason)
         return $result
     }
 

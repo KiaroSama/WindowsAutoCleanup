@@ -20,6 +20,7 @@ $script:ProcessInvoker = $null
 # two different jobs with two different mechanisms. Both are dot-sourced here because this file is
 # where the policy that uses them lives.
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.OwnedProcess.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.OwnedRun.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.BoundedWork.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ProcessTree.ps1')
 
@@ -253,12 +254,52 @@ function Invoke-WacProcess {
     try { $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList }
     catch { $launch = $null }
 
+    # THE FALLBACK IS GATED ON WHETHER A PROCESS EXISTS, not on whether an object is truthy.
+    # Selecting the managed start whenever the launcher answered $null meant a failure AFTER the
+    # child had been resumed - a stream allocation, say - ran the same command a second time. For a
+    # destructive tool that is one logical invocation deleting twice, and closing the first job
+    # cannot undo the first one's work. Start-WacOwnedProcess now answers $null only for
+    # NeverCreated, and every other state is handled here without re-running anything.
     if ($launch) {
+        $launchState = 'Resumed'
+        try { $launchState = [string]$launch.State } catch { $launchState = 'Resumed' }
+
+        if ($launchState -ceq 'Created') {
+            # Created suspended and never resumed: it executed nothing, has no descendants, and the
+            # launcher has already terminated and released it. A failed start, reported as one -
+            # never retried, because a process really was created.
+            Write-WacLog -Level ERROR -Component $Component -Message 'The tool was created but could not be resumed; it was terminated without running.' -Data @{
+                tool = $FilePath; error = [string]$launch.Failure
+            }
+            return [PSCustomObject]@{
+                ExitCode = $null; TimedOut = $false
+                StandardOutput = ''; StandardError = [string]$launch.Failure
+                DurationMs = 0; Started = $false
+                TerminationProven = $true; OutputComplete = $true
+                Owned = $false; OwnedTreeState = 'Complete'
+            }
+        }
+
         Write-WacLog -Level DEBUG -Component $Component -Message 'Starting external tool in an owned job.' -Data @{
             tool = $FilePath; pid = [int]$launch.ProcessId; timeoutMs = $TimeoutMs; owned = [bool]$launch.Owned
         }
         try {
             return (Invoke-WacOwnedTool -Launch $launch -TimeoutMs $TimeoutMs -FilePath $FilePath -Component $Component)
+        }
+        catch {
+            # A post-start failure still has to answer the shared contract. Returning an exception
+            # here left the caller with no Started, no exit code and no termination fact for a tool
+            # that had already run.
+            Write-WacLog -Level CRITICAL -Component $Component -Message 'The owned tool ran, then failed before its result was known; its effects cannot be ruled out.' -Data @{
+                tool = $FilePath; pid = [int]$launch.ProcessId; error = $_.Exception.Message
+            }
+            return [PSCustomObject]@{
+                ExitCode = $null; TimedOut = $false
+                StandardOutput = ''; StandardError = [string]$_.Exception.Message
+                DurationMs = 0; Started = $true
+                TerminationProven = $false; OutputComplete = $false
+                Owned = [bool]$launch.Owned; OwnedTreeState = 'Unknown'
+            }
         }
         finally {
             # Closing the job handle is the kill-on-close backstop. It runs even when the block above

@@ -488,6 +488,15 @@ function Remove-WacTree {
         return (New-WacTreeResult -Category $Category -Path $normalizedRoot -Stats $stats -Attempted $false)
     }
 
+    # A sweep DELETES. It must not start while an earlier mutator this run could not prove stopped
+    # might still be writing into the same tree, so the same latch that stops the next driver
+    # candidate stops the next file pass.
+    if (-not (Test-WacMutationAllowed)) {
+        $stats.SkippedDeadline++
+        Write-WacLog -Level ERROR -Component 'FileSystem' -Message 'A cleanup target was skipped: an earlier operation could not be proven stopped.' -Data @{ category = $Category; path = $normalizedRoot }
+        return (New-WacTreeResult -Category $Category -Path $normalizedRoot -Stats $stats -Attempted $false)
+    }
+
     if (Test-WacDeadlineExpired) {
         $stats.SkippedDeadline++
         return (New-WacTreeResult -Category $Category -Path $normalizedRoot -Stats $stats -Attempted $false)

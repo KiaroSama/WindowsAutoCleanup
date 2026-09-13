@@ -109,8 +109,12 @@ function Invoke-WacComponentCleanup {
     # INFERENCE, not a documented DISM contract. 3017 is ERROR_FAIL_REBOOT_REQUIRED - a failure -
     # and must never be folded into success.
     if ($exitCode -eq 0 -or $exitCode -eq 3010) {
-        return (Write-WacStepResult -Component $component -Result (New-WacStepResult -Category $category -Outcome 'Succeeded' -Attempted $true `
-            -RebootRequired ($exitCode -eq 3010) -DurationMs ([int]$run.DurationMs) -Detail ('dism.exe exited with {0}.' -f $exitCode)))
+        # The exit code is what DISM believes about ITSELF. Servicing hands work to children, so a
+        # clean code with a live descendant or truncated output is not a finished step - one shared
+        # rule answers that for every tool rather than each step inventing its own.
+        $settled = Get-WacSettledOutcome -Outcome 'Succeeded' -Detail ('dism.exe exited with {0}.' -f $exitCode) -Run $run
+        return (Write-WacStepResult -Component $component -Result (New-WacStepResult -Category $category -Outcome $settled.Outcome -Attempted $true `
+            -RebootRequired ($exitCode -eq 3010) -DurationMs ([int]$run.DurationMs) -Detail $settled.Detail))
     }
 
     $detail = if ($null -eq $exitCode) { 'dism.exe did not start.' } else { 'dism.exe exited with {0}.' -f $exitCode }
@@ -251,7 +255,9 @@ function Clear-WacDeliveryOptimizationCache {
             -Detail ('The Delivery Optimization cache is on drive {0} ({1}); this run only touches drive {2}, so it was left alone.' -f $location.Drive, $location.Path, (Get-WacTargetDrive))))
     }
 
-    $purgeRun = Invoke-WacStepBounded -Component $component -TimeoutMs $script:DeliveryOptimizationPurgeTimeoutMs -ScriptBlock {
+    # -Mutating: this purge DELETES cached payloads. An abandoned one is not a terminated one, so it
+    # has to arm the quarantine latch that stops the run scheduling the next mutation on top of it.
+    $purgeRun = Invoke-WacStepBounded -Component $component -TimeoutMs $script:DeliveryOptimizationPurgeTimeoutMs -Mutating -ScriptBlock {
         $command = Get-Command -Name 'Delete-DeliveryOptimizationCache' -ErrorAction Stop
         if (-not $command) { throw 'Delete-DeliveryOptimizationCache could not be resolved.' }
 
@@ -274,6 +280,7 @@ Export-ModuleMember -Function @(
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath', 'Get-WacDiskCleanupCategory',
     'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded',
     'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable',
+    'Test-WacToolLifetimeSettled', 'Get-WacSettledOutcome',
     'Invoke-WacComponentCleanup',
     'Test-WacRecycleBinEntryName', 'Get-WacRecycleBinScan', 'Clear-WacRecycleBin',
     'Get-WacDeliveryOptimizationCacheLocation', 'Clear-WacDeliveryOptimizationCache',

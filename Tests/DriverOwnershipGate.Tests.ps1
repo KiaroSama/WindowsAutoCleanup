@@ -128,4 +128,63 @@ Test-Case 'the same delete with a proven stop still completes normally' {
     }
 }
 
+Test-Case 'an unresolved deletion stops the NEXT candidate instead of starting it on top' {
+    # The half that was missing. Preserving the first package's export was necessary and not
+    # sufficient: the loop simply moved on, so a pnputil that might still be writing to the driver
+    # store had the next deletion started on top of it. The latch that records an unproven stop is
+    # now checked at the top of the loop, so the remaining candidates are left untouched WITH their
+    # evidence - which is what a later run needs in order to reconcile them.
+    #
+    # Two independent candidates, so "the second was not touched" is an observation about a real
+    # second package rather than about a loop that ran once.
+    $sandbox = New-TestSandbox -Prefix 'dr-gate-next'
+    try {
+        $backupRoot = Join-Path -Path $sandbox -ChildPath 'DriverBackup'
+        $rows = @(
+            (New-PnpUtilRow -DriverName 'oem1.inf' -OriginalName 'acme.inf' -DriverVersion '03/04/2024 1.0.0.0' -DeviceStatus @()),
+            (New-PnpUtilRow -DriverName 'oem3.inf' -OriginalName 'beta.inf' -DriverVersion '03/04/2024 1.0.0.0' -DeviceStatus @()),
+            (New-PnpUtilRow -DriverName 'oem2.inf' -OriginalName 'acme.inf' -DriverVersion '12/07/2020 2.0.0.0' -DeviceStatus @('Started')),
+            (New-PnpUtilRow -DriverName 'oem4.inf' -OriginalName 'beta.inf' -DriverVersion '12/07/2020 2.0.0.0' -DeviceStatus @('Started'))
+        )
+        $xml = New-PnpUtilDriverXml -Row $rows
+
+        Invoke-WithStubbedTool -Body {
+            $script:StubResult['/enum-drivers'] = @{ ExitCode = 0; Out = $xml }
+            $script:StubResult['/delete-driver'] = @{ ExitCode = 0 }
+
+            # EVERY delete reports an unproven stop. The first one must therefore be the last one
+            # attempted at all.
+            Set-WacProcessInvoker -Invoker {
+                param($FilePath, $ArgumentList, $TimeoutMs)
+                $answer = & $script:RecordingInvoker $FilePath $ArgumentList $TimeoutMs
+                $argv = @($ArgumentList)
+                if (@($argv).Count -gt 0 -and $argv[0] -eq '/delete-driver') {
+                    Add-Member -InputObject $answer -NotePropertyName 'TerminationProven' -NotePropertyValue $false -Force
+                    Add-Member -InputObject $answer -NotePropertyName 'OutputComplete' -NotePropertyValue $false -Force
+                }
+                return $answer
+            }
+
+            $result = Invoke-WacDriverPackagePrune -Enabled -BackupRoot $backupRoot
+
+            $deletes = @($script:StubCall | Where-Object { @($_.Arguments).Count -gt 0 -and $_.Arguments[0] -eq '/delete-driver' })
+            Assert-Equal 1 $deletes.Count `
+                ('a second deletion was started while the first could not be proven stopped: ' + $result.Detail)
+
+            Assert-Equal 'Incomplete' $result.Outcome $result.Detail
+            Assert-True ($result.Detail -match 'deleted=0') ('something was counted as removed: ' + $result.Detail)
+
+            # The evidence a later run reconciles from has to survive for BOTH packages: the one that
+            # was attempted keeps its export and marker, and the untouched one keeps whatever it had.
+            $left = @(Get-GateBackupDirectory -Root $backupRoot)
+            Assert-True ($left.Count -ge 1) 'the attempted package lost the only copy of itself'
+            Assert-True (Test-Path -LiteralPath (Join-Path -Path $left[0].FullName -ChildPath $script:PendingName)) `
+                'the pending marker came off while the deletion was still unproven'
+        }
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun
