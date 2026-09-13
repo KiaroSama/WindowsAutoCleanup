@@ -38,6 +38,7 @@ $script:CoreModulePath      = $PSCommandPath
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TrustedStore.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Locations.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Budget.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Quarantine.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.RunState.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Process.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Environment.ps1')
@@ -63,8 +64,11 @@ Export-ModuleMember -Function @(
     'New-WacLogFile', 'Remove-WacOldLog',
     'Set-WacDeadline', 'Get-WacRemainingMs', 'Test-WacDeadlineExpired', 'Get-WacStepTimeoutMs',
     'Reset-WacShutdownReserve', 'Get-WacShutdownReserveMs', 'Request-WacShutdownReserveMs',
+    'Request-WacWaitMs',
     'Reset-WacAbandonedMutator', 'Get-WacAbandonedMutatorCount', 'Test-WacMutationAllowed',
-    'Add-WacAbandonedMutator',
+    'Add-WacAbandonedMutator', 'Resolve-WacQuarantine', 'Get-WacQuarantineMarkerPath',
+    'Read-WacQuarantineMarker', 'Remove-WacQuarantineMarker', 'Test-WacQuarantineProcessGone',
+    'Write-WacQuarantineMarker', 'Get-WacCurrentProcessCreated',
     'ConvertTo-WacCommandLineArgument', 'ConvertTo-WacCommandLine',
     'ConvertTo-WacPowerShellLiteral', 'Get-WacRelaunchCommand', 'Get-WacRelaunchArgument',
     'Stop-WacProcessTree', 'Set-WacProcessHandleOpener',

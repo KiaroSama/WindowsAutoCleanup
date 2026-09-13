@@ -405,7 +405,10 @@ function Invoke-WacElevatedRelaunch {
         # can see, so Proven=$false is not "probably fine": it means termination could not be
         # ESTABLISHED and part of the tree may still be deleting files. Discarding that answer is
         # what made a leaked cleanup process indistinguishable from a clean kill.
-        $stopped = Stop-WacProcessTree -ProcessId $process.Id
+        # Charged like every other shutdown wait: the child has already outrun the whole budget, so
+        # the time this kill takes comes from the one recovery reserve rather than a flat ten
+        # seconds nothing accounts for.
+        $stopped = Stop-WacProcessTree -ProcessId $process.Id -TimeoutMs (Request-WacWaitMs -RequestedMs 10000)
         if (-not $stopped.Proven) {
             Write-WacLog -Level CRITICAL -Component 'Elevation' -Message 'Termination of the elevated child could not be established; it may still be running.' -Data @{
                 pid = $process.Id
@@ -527,7 +530,13 @@ try {
     # Delivery Optimization first. The supported cmdlet is the documented way to purge that cache,
     # and the cache directory can be relocated off C: by policy, so when the cmdlet does the work the
     # hard-coded directory targets are redundant and only add noise to the log.
-    $deliveryOptimization = Clear-WacDeliveryOptimizationCache
+    # EVERY mutating step goes through Invoke-WacGuardedStep from here down. The quarantine latch
+    # was enforced at the places that mutate and nowhere in the sequence that decides whether a step
+    # runs, so a run holding an abandoned mutator still launched dism.exe and pnpclean.dll - two
+    # external mutators started unconditionally on the strength of a guard neither of them has
+    # (ledger WAC-05R). One gate, in front of each step, and a step that never starts is recorded
+    # Incomplete so the footer and the exit code both carry it.
+    $deliveryOptimization = Invoke-WacGuardedStep -Category 'Delivery Optimization cache' -Step { Clear-WacDeliveryOptimizationCache }
     [void]$stepResults.Add($deliveryOptimization)
     if ($deliveryOptimization.Succeeded) {
         [void]$effectiveSkip.Add('Delivery Optimization cache')
@@ -548,6 +557,17 @@ try {
     foreach ($target in @($targetSet.Target)) {
         if (Test-WacDeadlineExpired) {
             Write-WacLog -Level WARNING -Component 'Run' -Message 'The run budget expired; the remaining allow-list targets were not attempted.'
+            break
+        }
+
+        # Remove-WacTree carries this latch too, and keeps it. The loop head is where the SWEEP is
+        # decided, and it covers both modes: Remove-WacFilesByPattern deletes exactly as much and
+        # never had the check, which is the shape of defect this round exists to stop - one consumer
+        # of a contract updated and its sibling left behind.
+        if (-not (Test-WacMutationAllowed)) {
+            [void]$stepResults.Add((Write-WacStepResult -Component 'Run' -Result (New-WacStepResult `
+                -Category 'Cleanup allow-list sweep' -Outcome 'Incomplete' -Attempted $false `
+                -Detail 'No allow-list target was swept: an earlier mutation was abandoned and cannot be proven finished.')))
             break
         }
 
@@ -572,15 +592,17 @@ try {
     #
     # DISM runs before the optional legacy handler so Windows Update cleanup stays on the supported
     # path even when the caller opts in to cleanmgr.
-    $componentCleanup = Invoke-WacComponentCleanup -ResetBase:([bool]$ResetWindowsUpdateBase)
+    $componentCleanup = Invoke-WacGuardedStep -Category 'Windows component store cleanup (DISM)' `
+        -Step { Invoke-WacComponentCleanup -ResetBase:([bool]$ResetWindowsUpdateBase) }
     [void]$stepResults.Add($componentCleanup)
-    [void]$stepResults.Add((Invoke-WacPnpCleanHandler))
+    [void]$stepResults.Add((Invoke-WacGuardedStep -Category 'Device driver packages (pnpclean)' `
+        -Step { Invoke-WacPnpCleanHandler }))
     # NOT (Get-WacDataRoot)\DriverBackup any more. An export is the only copy of a package about to
     # be deleted, and %ProgramData% grants BUILTIN\Users the right to create names under every child
     # it has - a grant no healthy install can shed and this project may not rewrite. The backup root
     # moved somewhere that grant does not reach; Get-WacDriverBackupRoot carries the measurement.
-    [void]$stepResults.Add((Invoke-WacDriverPackagePrune -Enabled:([bool]$PruneSupersededDrivers) `
-        -BackupRoot (Get-WacDriverBackupRoot)))
+    [void]$stepResults.Add((Invoke-WacGuardedStep -Category 'Superseded driver packages (pnputil)' `
+        -Step { Invoke-WacDriverPackagePrune -Enabled:([bool]$PruneSupersededDrivers) -BackupRoot (Get-WacDriverBackupRoot) }))
 
     # cleanmgr's own "Update Cleanup" handler duplicates what DISM already did on the supported path.
     # Gate it on whether DISM actually SUCCEEDED, not on the parameter: a DISM that failed or was
@@ -589,10 +611,12 @@ try {
     if ($componentCleanup.Succeeded) {
         $legacyCategory = @($legacyCategory | Where-Object { $_ -ne 'Update Cleanup' })
     }
-    [void]$stepResults.Add((Invoke-WacLegacyDiskCleanup -Enabled:([bool]$EnableLegacyDiskCleanup) -Category $legacyCategory))
+    [void]$stepResults.Add((Invoke-WacGuardedStep -Category 'Disk Cleanup handlers (cleanmgr)' `
+        -Step { Invoke-WacLegacyDiskCleanup -Enabled:([bool]$EnableLegacyDiskCleanup) -Category $legacyCategory }))
 
     if (-not $SkipRecycleBin) {
-        [void]$stepResults.Add((Clear-WacRecycleBin))
+        [void]$stepResults.Add((Invoke-WacGuardedStep -Category ('Recycle Bin (drive {0} only)' -f (Get-WacTargetDrive)) `
+            -Step { Clear-WacRecycleBin }))
     }
 
     $freeAfter = Get-WacRunTelemetry -What 'free space on C:' -Probe { Get-WacFreeBytes -Drive 'C:' }

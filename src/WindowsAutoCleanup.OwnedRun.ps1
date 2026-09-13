@@ -144,7 +144,7 @@ function Invoke-WacOwnedTool {
             # Without a job the only honest stop is the handle-binding walk, and ITS verdict is what
             # gets reported: a degraded launch behaves exactly like the managed fallback, and Owned
             # says which one produced the answer.
-            $stopped = Stop-WacProcessTree -ProcessId $Launch.ProcessId
+            $stopped = Stop-WacProcessTree -ProcessId $Launch.ProcessId -TimeoutMs (Request-WacWaitMs -RequestedMs 10000)
             $walkProven = [bool]$stopped.Proven
             if (-not $walkProven) {
                 Write-WacLog -Level CRITICAL -Component $Component -Message 'An unowned tool could not be proven terminated; part of its tree may still be running.' -Data @{
@@ -154,13 +154,17 @@ function Invoke-WacOwnedTool {
             }
         }
 
-        [void][WacOwnedProcess]::WaitForExit($Launch.Process, 10000)
+        # Even the wait that confirms a termination is charged. It is the last thing a run does for
+        # a tool it has already given up on, so it draws from the recovery reserve like any other
+        # shutdown work rather than adding a flat ten seconds per tool to a budget already spent.
+        [void][WacOwnedProcess]::WaitForExit($Launch.Process, (Request-WacWaitMs -RequestedMs 10000))
     }
 
-    # Same accounting rule as the unowned path: the read waits are part of the run budget, not an
-    # extra ten seconds per tool on top of it.
-    $readBudgetMs = Get-WacStepTimeoutMs -RequestedMs 5000
-    if ($readBudgetMs -lt 250) { $readBudgetMs = 250 }
+    # Same accounting rule as the unowned path, and the same correction: clamping to the run budget
+    # left a 250 ms floor that nothing paid for, once per pipe per tool. Request-WacWaitMs charges
+    # the budget first and the single recovery reserve after it, and answers 0 when both are spent -
+    # which the verdict below reports as an incomplete read rather than hiding.
+    $readBudgetMs = Request-WacWaitMs -RequestedMs 5000
     [void]$outTask.Wait($readBudgetMs)
     [void]$errTask.Wait($readBudgetMs)
 

@@ -128,6 +128,21 @@ function Test-WacStatePathIsTrusted {
     }
 }
 
+# The second half of the same fact. Test-WacStatePathIsTrusted above answers the PATHNAME question;
+# this answers the one taken from the log directory's own handle. A redirected %ProgramData% under
+# TEMP is genuinely user-writable, so the real rule says "untrusted" there (measured) and every
+# scenario would exit 7 before reaching the case under test. Only the DESCRIPTOR answer is stood in:
+# the reparse test and the collision-failing create stay the kernel's answers.
+Set-WacDirectoryTrustJudge -ScriptBlock {
+    param($sddl)
+    $null = $sddl
+    return [PSCustomObject]@{
+        IsTrusted = [bool](Get-WacTestPlan).stateTrusted
+        Owner = $null
+        Reason = 'test shim: handle descriptor verdict'
+    }
+}
+
 function Initialize-WacRun {
     [CmdletBinding()]
     param(

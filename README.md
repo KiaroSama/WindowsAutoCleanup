@@ -209,12 +209,34 @@ the registered task instead is what the ownership proof and the exact action par
 | `3` | Another run already holds the machine-wide lock. |
 | `4` | Elevation was cancelled or failed. |
 | `5` | Unsupported environment: the online system drive is not `C:`. |
-| `6` | Incomplete: the run did not finish what it was asked to do, or cannot prove it did. The budget expired, a step hit its deadline, an elevated child had to be terminated, or the durable audit log could not be produced. |
+| `6` | Incomplete: the run did not finish what it was asked to do, or cannot prove it did. The budget expired, a step hit its deadline, an elevated child had to be terminated, the durable audit log could not be produced, or the run inherited an unfinished mutation and refused to change anything further (see below). |
 | `7` | Security refusal: a safety check refused to proceed on evidence. A cleanup path failed its identity or containment re-check, or the directory holding the run state and audit log is not machine-trusted. If no state directory passes verification, no run log is written and the refusal goes to the Windows event log or console; a directory created before a later trust refusal may remain. |
 
 A run reports its **worst** outcome: a refusal outranks a failure, which outranks incomplete work. A benign skip does not affect the code — a reparse point left alone, a protected path stepped around, or an opt-in step that is switched off all keep the run at `0`.
 
 The installer and uninstaller use the same `6` and `7`, and add an `8` of their own: the elevated child outran its budget and could **not** be proven terminated, so it may still be running and holding the machine-wide lock — do not re-run until it exits. Their full tables are in each script's `.NOTES` block.
+
+### A run that refuses to mutate anything
+
+Work this tool runs inside its own process is given a wall-clock bound. Almost all of it is
+reading; the few blocks that write say so. When a *writing* block misses its bound inside a
+blocking Windows call there is no way to stop it - the thread keeps going - so the run stops
+scheduling any further change and reports `6`. That much was already true within a single run.
+
+What is new is that the fact now survives the process. A marker named `abandoned-mutation.json`,
+written in the state root beside `Logs`, records the abandonment and the identity of the process
+that raised it. The next run - or an installer taking the same machine-wide lock - reads it before
+doing anything, and:
+
+- retires it and proceeds normally once that process is **proven** gone, which is what the recorded
+  creation time is for: a process id on its own is recycled;
+- starts quarantined if that process is still running, or if the marker cannot be read at all.
+
+A quarantined run still produces its log and its report. It simply starts none of the steps that
+change the machine - the allow-list sweep, DISM, `pnpclean`, `pnputil`, `cleanmgr`, the Recycle Bin
+and the Delivery Optimization purge - and records each of them as not attempted. If you see this
+and the machine is otherwise healthy, the marker is safe to delete by hand once you are satisfied
+nothing from the earlier run is still running.
 
 ## Concurrency
 
@@ -414,19 +436,23 @@ unlocked scratch files, so do not run it during work that depends on those files
 | Path | Purpose |
 | --- | --- |
 | `Run.ps1` | Entry point: parameters, elevation, single-instance lock, orchestration, exit codes. |
-| `src/WindowsAutoCleanup.Core.psm1` | Package entry point over `Native`, `Path`, `TrustedStore`, `Locations`, `Budget`, `RunState`, `Process`, `Environment` and `Trust`: the P/Invoke surface, path safety, pinned-handle directory creation, the fixed machine locations, the run deadline and recovery reserve, the audit log, bounded execution, machine facts, and the owner/DACL rules. |
-| `src/WindowsAutoCleanup.Budget.ps1` | The run's two time budgets: the deadline ordinary work is held to, and the single reserve that recovery work draws from after that deadline is gone, so a rollback still runs but twenty of them cannot add up to an unbounded shutdown. The remaining budget is the smaller of the civil deadline and a stopwatch armed with it, so an NTP or DST correction cannot hand the run time it never earned. |
+| `src/WindowsAutoCleanup.Core.psm1` | Package entry point over `Native`, `Path`, `TrustedStore`, `Locations`, `Budget`, `Quarantine`, `RunState`, `Process`, `Environment` and `Trust`: the P/Invoke surface, path safety, pinned-handle directory creation, the fixed machine locations, the run deadline and recovery reserve, the audit log, bounded execution, machine facts, and the owner/DACL rules. |
+| `src/WindowsAutoCleanup.Budget.ps1` | The run's two time budgets: the deadline ordinary work is held to, and the single reserve that recovery work draws from after that deadline is gone, so a rollback still runs but twenty of them cannot add up to an unbounded shutdown. Every shutdown-critical wait draws from the same two numbers - a termination wait, a pipe drain and a tree kill each used to take a fixed allowance charged to nothing, once per tool. The remaining budget is the smaller of the civil deadline and a stopwatch armed with it, so an NTP or DST correction cannot hand the run time it never earned. |
+| `src/WindowsAutoCleanup.Quarantine.ps1` | The abandoned-mutator quarantine. A block that misses its bound inside a blocking native call is abandoned, not stopped, so the run refuses every later mutation - and that refusal is now written to a durable marker under the state root, because the latch used to die with the process while the abandoned thread's uncertainty did not. The next run retires the marker only on proof that the process which raised it is gone, identified by process id **and** creation time; a marker that is unreadable, or names a process still running, starts the new run quarantined. |
 | `src/WindowsAutoCleanup.OwnedProcess.ps1` | Ownership at creation: every external tool is launched suspended, bound to a kill-on-close Job Object before its first instruction, then resumed. Termination is one call over the whole tree, and "did everything this run started finish?" is answered from the job rather than from a process snapshot. The launch also reports how far it got — nothing created, created but never resumed, or resumed — because only the first of those makes starting the same command again safe. |
 | `src/WindowsAutoCleanup.OwnedRun.ps1` | The policy that consumes that mechanism: waiting for the owned work rather than just its root, draining output inside the run budget, terminating only on a deadline or an error, and turning root exit, owned-tree state and output completeness into one result the steps can read. |
-| `src/WindowsAutoCleanup.BoundedWork.ps1` | In-process work under a real wall-clock bound, in its own runspace - including the rule that a block declaring itself a mutator, once abandoned, stops every later mutation in the run. |
+| `src/WindowsAutoCleanup.BoundedWork.ps1` | In-process work under a real wall-clock bound, in its own runspace - including the rule that a block declaring itself a mutator, once abandoned, stops every later mutation in the run and records that fact where the next process will find it. |
 | `src/WindowsAutoCleanup.FileSystem.psm1` | The single no-follow, reparse-safe, long-path-safe traversal, over the handle-bound delete in `BoundDelete`. |
 | `src/WindowsAutoCleanup.Targets.psm1` | The `C:`-only allow-list. |
 | `src/WindowsAutoCleanup.Steps.psm1` | Package entry point over `StepContract`, `RecycleBin` and `DiskCleanup`: the shared result vocabulary, DISM, Delivery Optimization, the Recycle Bin sweep and the opt-in cleanmgr step. |
 | `src/WindowsAutoCleanup.Drivers.psm1` | Package entry point over `DriverInventory` and `DriverBackup`: pnpclean, the structured pnputil inventory, and opt-in package pruning with content-addressed backups. |
-| `src/WindowsAutoCleanup.Deploy.psm1` | Package entry point over `DeploymentTree`, `DeploymentProof` and `ScheduledTask`: the shared operation lock, staging and rollback, ownership proof, and task action parsing. |
+| `src/WindowsAutoCleanup.Deploy.psm1` | Package entry point over `DeploymentTree`, `DeploymentProof`, `DeploymentJournal`, `ScheduledTask` and `TaskRemoval`: the shared operation lock, staging and rollback, ownership proof, and task action parsing. |
 | `Install-WindowsAutoCleanupTask.ps1` | Deploys the runtime and registers the daily task. |
 | `Uninstall-WindowsAutoCleanupTask.ps1` | Removes the task and the deployment. |
 | `src/WindowsAutoCleanup.EntryGate.ps1` | The pre-flight safety verdict, dot-sourced by **both** entry points so the two cannot drift: log health and state trust are decided before the first mutation, and an unknown answer refuses just as a false one does. |
+| `src/WindowsAutoCleanup.DeploymentJournal.ps1` | The two durable records a deployment operation leaves behind, and the corroboration a recovery slot must pass. The swap record says a tree replacement started and did not finish; the task-capture record says a scheduled task was unregistered and its exact definition is in here. They are separate files because the swap record is rewritten at every stage of one move pair while the capture has to outlive all of them. Both are read through a schema **window** rather than an exact match, so a record written by an older build still drives recovery instead of refusing the upgrade that would read it. |
+| `src/WindowsAutoCleanup.TaskRemoval.ps1` | Removing one scheduled task: prove it is ours, export its exact definition, hand that capture to the caller to make DURABLE, and only then unregister. A capture that could not be recorded leaves the task registered - that ordering is the transaction boundary, not a detail. |
+| `src/WindowsAutoCleanup.InstallerRecovery.ps1` | The installer's task-capture transaction: resolving the conflicting registration behind that durable record, reconciling a record an earlier interrupted run left, and ending the transaction when the replacement is proven registered or the removal is proven undone. |
 | `src/WindowsAutoCleanup.InstallerTask.ps1` | The installer's scheduled-task lifecycle: trigger, conflict resolution with definition capture, post-registration read-back, and the rollback that restores both the tree and the task. |
 | `src/WindowsAutoCleanup.RunReport.ps1` | Dot-sourced by `Run.ps1`: the header, the run-level verdicts and the footer. |
 | `Tests/` | Self-contained test harness, bounded parallel runner, and behavioural suites. |

@@ -1,8 +1,7 @@
 <#
 .SYNOPSIS
-    The installer's scheduled-task lifecycle: the trigger it builds, the conflicting registration it
-    clears, the read-back that proves what landed, and the rollback that puts both the tree and the
-    task back.
+    The installer's scheduled-task lifecycle: the trigger it builds, the read-back that proves what
+    landed, and the rollback that puts both the tree and the task back.
 
 .DESCRIPTION
     Dot-sourced by Install-WindowsAutoCleanupTask.ps1 into that script's own scope, and used by
@@ -11,6 +10,10 @@
     responsibility - the entry point keeps its console and log plumbing, its elevation wrapper and
     its orchestration, and this file keeps everything that decides what happens to the registered
     task.
+
+    Resolving the conflicting registration moved to WindowsAutoCleanup.InstallerRecovery.ps1, with
+    the reconciliation of a capture an earlier process never finished: those two are one transaction
+    and this file had reached the size at which nobody reads it.
 
     Write-InstallerMessage and the module functions these call live in the host script and in the
     modules it imports. PowerShell resolves a command when it is CALLED, not when it is defined, and
@@ -31,81 +34,6 @@ function Get-InstallerTaskTrigger {
     }
 
     return (New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.Add($parsed.TimeOfDay)))
-}
-
-function Resolve-ConflictingTask {
-    <#
-    .SYNOPSIS
-        Clears our own registration - current or pre-1.2 - before re-registering, refuses to touch
-        anyone else's, and hands back the exact definition of everything it removed.
-    .DESCRIPTION
-        Register-ScheduledTask -Force is documented only as "without prompting for confirmation";
-        nothing says it overwrites. So the installer explicitly Gets, proves ownership, then
-        Unregisters (ledger P0-4).
-
-        Ledger B2-3: a foreign task at EITHER path is a REFUSAL rather than a warning-and-carry-on,
-        because the pre-1.2 task ran a PATH-resolved host as SYSTEM and leaving an unrecognised one
-        registered while adding a second one beside it is how a machine ends up running two cleanup
-        tasks, one of them the vulnerable one. A lookup that FAILED is fatal too, and separately: a
-        scheduler that will not answer is not evidence that nothing is registered.
-
-        -RequireDefinitionCapture, and the captured definitions back on the result: this removal is
-        one step of an upgrade, so it has to be undoable. Undo-Installation puts them back.
-
-        Called BEFORE anything is switched into the live deployment root, and with the machine-wide
-        lock already held, so no cleanup run can start out of the tree between here and the swap.
-    .OUTPUTS
-        Ok, Refused, Reason, Captured.
-    #>
-    param([Parameter(Mandatory = $true)][string]$DeploymentRoot)
-
-    $captured = New-Object 'System.Collections.Generic.List[object]'
-    $result = [PSCustomObject]@{ Ok = $true; Refused = $false; Reason = $null; Captured = @() }
-
-    $discovery = Get-WacInstalledTask -IncludeLegacy
-    if ($discovery.State -eq 'Failed') {
-        $result.Ok = $false
-        $result.Reason = ('The Task Scheduler could not be queried, so whether a task is already registered is unknown: {0}' -f
-            ((@($discovery.Failure | ForEach-Object { '{0}: {1}' -f $_.TaskPath, $_.Reason })) -join '; '))
-        return $result
-    }
-
-    foreach ($existing in @($discovery.Task)) {
-        $label = '{0}{1}' -f [string]$existing.TaskPath, [string]$existing.TaskName
-
-        $removal = Remove-WacInstalledTask -Task $existing -DeploymentRoot $DeploymentRoot -AllowLegacyMigration -RequireDefinitionCapture
-        if ($removal.Captured) { [void]$captured.Add($removal) }
-        $result.Captured = @($captured.ToArray())
-
-        if ($removal.Verified) {
-            Write-InstallerMessage -Level INFO -Message 'Removed the previously registered WindowsAutoCleanup task and kept its definition for a rollback.' -Data @{
-                task = $label; reason = [string]$removal.Reason
-            }
-            continue
-        }
-
-        $result.Ok = $false
-
-        if ($removal.Removed) {
-            $result.Reason = ('The task at {0} was unregistered but its removal could not be verified: {1}' -f $label, [string]$removal.Reason)
-            return $result
-        }
-
-        if ($removal.Captured) {
-            # The capture only happens after the ownership proof, so this task IS ours and the
-            # unregister itself is what failed. Not a refusal: nothing was left in place by choice.
-            $result.Reason = ('Our task at {0} could not be unregistered: {1}' -f $label, [string]$removal.Reason)
-            return $result
-        }
-
-        # Nothing removed and nothing captured: the task is not ours, or its definition could not be
-        # captured and removing it would not have been undoable. Both left it exactly as found.
-        $result.Refused = $true
-        $result.Reason = ('The task at {0} was left untouched and nothing was registered beside it: {1}' -f $label, [string]$removal.Reason)
-        return $result
-    }
-
-    return $result
 }
 
 function Get-CapturedText {

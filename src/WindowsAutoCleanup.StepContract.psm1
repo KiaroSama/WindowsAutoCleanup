@@ -285,6 +285,40 @@ function Test-WacToolLifetimeSettled {
     return $result
 }
 
+function Invoke-WacGuardedStep {
+    <#
+    .SYNOPSIS
+        Runs one maintenance step, or refuses to start it while the run is quarantined.
+    .DESCRIPTION
+        The quarantine latch was enforced where mutations HAPPEN - the driver candidate loop,
+        cleanmgr's profile write, Remove-WacTree, every -Mutating bounded block - and nowhere in the
+        sequence that decides whether a step runs at all. So a run with an abandoned mutator still
+        LAUNCHED dism.exe and pnpclean.dll: both are external mutators, both were started
+        unconditionally, and both were relied on to refuse somewhere deeper down, which neither
+        does. Pushing the guard down into each tool would be the same mistake once per tool.
+
+        One gate, in front of the step. A step that never starts is Incomplete, not SafeSkip: the
+        work the run was asked to do was not done, the footer must say so, and the exit code must
+        carry it. SecurityRefusal would be wrong in the other direction - nothing here refused for a
+        trust reason, and exit 7 means something specific on this project.
+
+        The step is passed as a block rather than a name so the guard sits between the orchestrator
+        and the call, where the decision is, instead of inside each step where five copies of it
+        would drift.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Category,
+        [Parameter(Mandatory = $true)][scriptblock]$Step,
+        [string]$Component = 'Run'
+    )
+
+    if (Test-WacMutationAllowed) { return (& $Step) }
+
+    return (Write-WacStepResult -Component $Component -Result (New-WacStepResult -Category $Category `
+        -Outcome 'Incomplete' -Attempted $false `
+        -Detail 'The step was not started: an earlier mutation was abandoned and cannot be proven finished, so nothing further on this machine may be changed by this run.'))
+}
+
 function Get-WacSettledOutcome {
     <#
     .SYNOPSIS
@@ -316,6 +350,6 @@ function Get-WacSettledOutcome {
 Export-ModuleMember -Function @(
     'Test-WacToolLifetimeSettled', 'Get-WacSettledOutcome',
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath',
-    'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded',
+    'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded', 'Invoke-WacGuardedStep',
     'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable'
 )

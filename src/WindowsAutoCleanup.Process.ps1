@@ -358,7 +358,7 @@ function Invoke-WacProcess {
             # started and could not prove it stopped is a mutator that may still be writing while
             # the run reports its verdict, so it is recorded and written at CRITICAL - the one level
             # -LogLevel cannot gate out.
-            $stopped = Stop-WacProcessTree -ProcessId $process.Id
+            $stopped = Stop-WacProcessTree -ProcessId $process.Id -TimeoutMs (Request-WacWaitMs -RequestedMs 10000)
             $terminationProven = [bool]$stopped.Proven
             if (-not $terminationProven) {
                 Write-WacLog -Level CRITICAL -Component $Component -Message 'The external tool could not be proven terminated; part of its process tree may still be running.' -Data @{
@@ -368,16 +368,17 @@ function Invoke-WacProcess {
                 }
             }
 
-            [void]$process.WaitForExit(10000)
+            [void]$process.WaitForExit((Request-WacWaitMs -RequestedMs 10000))
         }
 
         # Two FIXED 5-second waits used to sit entirely outside the run budget, so every tool could
         # add up to ten seconds on top of its own timeout (ledger WAC-06R: output capture belongs in
-        # the accounting). The floor keeps the ordinary case working - a tool that has already
-        # exited hands its pipes over in milliseconds - while an exhausted budget no longer buys
-        # another ten seconds per tool.
-        $readBudgetMs = Get-WacStepTimeoutMs -RequestedMs 5000
-        if ($readBudgetMs -lt 250) { $readBudgetMs = 250 }
+        # the accounting). Clamping them to the run budget was only half of it: past the deadline
+        # the clamp returned 0 and a 250 ms FLOOR went back on top, unaccounted, once per pipe per
+        # tool. Request-WacWaitMs is the whole rule - the budget while it lasts, then the one
+        # recovery reserve, then nothing - so the floor is gone and a drain nobody can pay for is
+        # reported as an incomplete read instead of quietly taken.
+        $readBudgetMs = Request-WacWaitMs -RequestedMs 5000
 
         [void]$outTask.Wait($readBudgetMs)
         [void]$errTask.Wait($readBudgetMs)
