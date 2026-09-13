@@ -158,7 +158,16 @@ function Resolve-WacDeploymentRecoverySlot {
         return $result
     }
 
-    $journal = Read-WacDeploymentJournal -DeploymentRoot $Slots.Root
+    $journalState = Read-WacDeploymentJournal -DeploymentRoot $Slots.Root
+    $journal = $journalState.Record
+
+    # UNKNOWN IS NOT ABSENT. A torn, unparsable or foreign record means a transaction may have been
+    # in progress and its shape cannot be read; treating that as "no transaction" is what let a
+    # healthy-looking tree plus no record authorise deleting the only good previous copy. Nothing is
+    # touched, and both trees survive for a human or a later run to reconcile.
+    if ([string]$journalState.State -ceq 'Unreadable') {
+        throw ("A deployment transaction record is present but could not be read, so neither the deployment nor its recovery copy was touched: {0} ({1})" -f $Slots.Previous, [string]$journalState.Reason)
+    }
     $previous = Test-WacRecoverySlotIsPromotable -Path $Slots.Previous
     $live = Get-WacDeploymentOwnership -DeploymentRoot $Slots.Root
 
@@ -698,7 +707,7 @@ Export-ModuleMember -Function @(
     'Get-WacOperationLockName', 'Get-WacDeploymentVersion', 'Get-WacDeploymentProjectId',
     'Get-WacDeploymentManifestPath', 'New-WacDeploymentManifest', 'Read-WacDeploymentManifest',
     'Get-WacDeploymentFileHash', 'Get-WacDeploymentOwnership', 'Get-WacDeploymentFingerprint',
-    'Get-WacDeploymentJournalPath',
+    'Get-WacDeploymentJournalPath', 'Read-WacDeploymentJournal',
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
     'New-WacDeploymentStage', 'Switch-WacDeploymentStage',

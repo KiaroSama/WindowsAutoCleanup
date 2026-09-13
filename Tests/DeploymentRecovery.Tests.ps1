@@ -403,4 +403,75 @@ Test-Case 'A pre-manifest deployment is still adopted, replaced and committed' {
     }
 }
 
+Test-Case 'A TORN transaction record preserves both trees instead of authorising a discard' {
+    # The data-loss path. A record that is present but unparsable used to read exactly like absence -
+    # both became $null - so the resolver saw "a healthy root and no unfinished swap", concluded the
+    # slot was superseded debris, and DELETED the only other copy. A torn record means the opposite:
+    # something was mid-transaction and its shape cannot be read, which is the one state where
+    # guessing costs the operator both trees.
+    #
+    # The same fixture as the legitimate discard above, with one difference - the record is there and
+    # is garbage - so the two cases differ by exactly the fact under test.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-torn' -Body {
+        param($sandbox)
+
+        [void](Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1')
+        $slots = Get-WacDeploymentSlotPath
+        Copy-WacDeploymentTree -Source $slots.Root -Destination $slots.Previous
+        Assert-True (Test-Path -LiteralPath $slots.Previous -PathType Container)
+
+        # A write that stopped half way: valid JSON never starts and ends like this.
+        $journalPath = Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root
+        [System.IO.File]::WriteAllText($journalPath, '{"Schema":1,"ProjectId":"wind')
+
+        $read = Read-WacDeploymentJournal -DeploymentRoot $slots.Root
+        Assert-Equal 'Unreadable' ([string]$read.State) `
+            ('a torn record was not reported as unreadable: ' + [string]$read.Reason)
+
+        # Through the real staging entry point, which is where recovery is reconciled - the same
+        # route the legitimate-discard case above takes, so the two differ only in the record.
+        $refused = $false
+        $reason = ''
+        try { [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2') }
+        catch { $refused = $true; $reason = [string]$_.Exception.Message }
+
+        Assert-True $refused 'a torn transaction record was treated as proof that no transaction happened'
+        Assert-True ($reason -match 'could not be read') ('the refusal did not name the reason: ' + $reason)
+        Assert-True (Test-Path -LiteralPath $slots.Previous -PathType Container) `
+            'the only other copy was deleted on the strength of a record nobody could read'
+        Assert-True (Test-Path -LiteralPath (Join-Path -Path $slots.Root -ChildPath 'Run.ps1')) `
+            'the live deployment was disturbed as well'
+    }
+}
+
+Test-Case 'A recovery slot nobody can vouch for is never promoted onto the deployment root' {
+    # Being OURS is not being SAFE. A slot is promoted into the path SYSTEM executes, so it gets the
+    # same trust walk the deployment root gets - and this case is the one that leaves that walk REAL,
+    # against a TEMP sandbox that genuinely is writable by a non-administrative principal. Everything
+    # else about the fixture is the "empty root" shape that normally promotes.
+    #
+    # Nothing is touched on refusal: an operator who has lost the live tree still has the copy.
+    Reset-RecoveryFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-untrusted' -RealTrust -Body {
+        param($sandbox)
+
+        [void](Install-FixtureDeployment -Sandbox $sandbox -Name 'v1' -RunContent '# original v1')
+        $slots = Get-WacDeploymentSlotPath
+        Copy-WacDeploymentTree -Source $slots.Root -Destination $slots.Previous
+        [void](Remove-WacDeployment -Path $slots.Root)
+        [void][System.IO.Directory]::CreateDirectory($slots.Root)
+
+        $refused = $false
+        $reason = ''
+        try { [void](New-FixtureStage -Sandbox $sandbox -Name 'v2' -RunContent '# replacement v2') }
+        catch { $refused = $true; $reason = [string]$_.Exception.Message }
+
+        Assert-True $refused 'a recovery slot on a user-writable path was promoted onto the deployment root'
+        Assert-True ($reason -match 'cannot be trusted') ('the refusal did not name the trust walk: ' + $reason)
+        Assert-True (Test-Path -LiteralPath (Join-Path -Path $slots.Previous -ChildPath 'Run.ps1')) `
+            'the copy was destroyed by the very refusal that exists to protect it'
+    }
+}
+
 Complete-TestRun

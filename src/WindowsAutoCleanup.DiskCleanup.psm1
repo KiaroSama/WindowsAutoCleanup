@@ -538,7 +538,7 @@ function Invoke-WacLegacyDiskCleanup {
     try {
         # The key path travels as an ARGUMENT: in production the block runs in a fresh runspace
         # whose copy of this module knows nothing about a redirected key.
-        $snapshotRun = Invoke-WacStepBounded -Component $component -TimeoutMs $script:VolumeCacheRegistryTimeoutMs `
+        $snapshotRun = Invoke-WacStepBounded -Component $component -Label 'snapshot' -TimeoutMs $script:VolumeCacheRegistryTimeoutMs `
             -ArgumentList @($SageId, $keyPath) -ScriptBlock {
                 param($SageId, $KeyPath)
                 Get-WacDiskCleanupStateFlag -SageId $SageId -KeyPath $KeyPath
@@ -566,12 +566,33 @@ function Invoke-WacLegacyDiskCleanup {
                 $detail = 'The cleanmgr profile could not be snapshotted, so nothing was changed: {0}' -f $snapshotRun.Error
             }
         }
+        elseif (-not (Test-WacMutationAllowed)) {
+            # Writing the sage profile IS a mutation, and it is followed by a whole-machine
+            # /sagerun. Neither may start while an earlier mutator could still be running.
+            $outcome = 'Incomplete'
+            $detail = 'An earlier operation could not be proven stopped, so the cleanmgr profile was not written and cleanmgr was not started.'
+        }
         else {
             # The snapshot's handler names travel with the write. A handler that turned up after the
             # snapshot has no recorded original, and writing to a borrowed profile value this run
             # cannot put back is exactly what the rollback exists to prevent.
-            $enabledResult = Enable-WacDiskCleanupCategory -SageId $SageId -Category $Category -KeyPath $keyPath `
-                -KnownHandler @(@($snapshot) | ForEach-Object { [string]$_.Name })
+            # BOUNDED, and -Mutating. Writing the sage profile is a registry mutation and it was
+            # called directly: a wedged registry blocked it outside every deadline the run has, and
+            # an abandoned write is not a finished one.
+            $writeRun = Invoke-WacStepBounded -Component $component -Label 'write' -Mutating `
+                -TimeoutMs $script:VolumeCacheRegistryTimeoutMs `
+                -ArgumentList @($SageId, $Category, $keyPath, @(@($snapshot) | ForEach-Object { [string]$_.Name })) -ScriptBlock {
+                    param($SageId, $Category, $KeyPath, $KnownHandler)
+                    Enable-WacDiskCleanupCategory -SageId $SageId -Category $Category -KeyPath $KeyPath -KnownHandler $KnownHandler
+                }
+
+            if ($writeRun.Outcome -cne 'Succeeded') {
+                $enabledResult = [PSCustomObject]@{ Touched = 1; Enabled = @(); Failed = 1 }
+            }
+            else {
+                $enabledResult = @($writeRun.Output)[0]
+                if ($null -eq $enabledResult) { $enabledResult = [PSCustomObject]@{ Touched = 1; Enabled = @(); Failed = 1 } }
+            }
             # Touched counts values actually written, so this is "did this run change anything",
             # not "did it intend to". Switching somebody else's leftover selection off counts too.
             $mutated = ($enabledResult.Touched -gt 0)
@@ -579,7 +600,21 @@ function Invoke-WacLegacyDiskCleanup {
 
             $exact = $null
             if ($enabledResult.Failed -eq 0 -and $enabledHandler.Count -gt 0) {
-                $exact = Test-WacDiskCleanupProfileExact -SageId $SageId -Expected $enabledHandler -KeyPath $keyPath
+                # The read-back is bounded for the same reason the write is.
+                $exactRun = Invoke-WacStepBounded -Component $component -Label 'readback' `
+                    -TimeoutMs $script:VolumeCacheRegistryTimeoutMs `
+                    -ArgumentList @($SageId, $enabledHandler, $keyPath) -ScriptBlock {
+                        param($SageId, $Expected, $KeyPath)
+                        Test-WacDiskCleanupProfileExact -SageId $SageId -Expected $Expected -KeyPath $KeyPath
+                    }
+
+                if ($exactRun.Outcome -cne 'Succeeded') {
+                    $exact = [PSCustomObject]@{ Ok = $false; Reason = ('the profile read-back did not complete: {0}' -f $exactRun.Error); Enabled = @(); Missing = @() }
+                }
+                else {
+                    $exact = @($exactRun.Output)[0]
+                    if ($null -eq $exact) { $exact = [PSCustomObject]@{ Ok = $false; Reason = 'the profile read-back returned nothing'; Enabled = @(); Missing = @() } }
+                }
             }
 
             if ($enabledResult.Failed -gt 0) {
@@ -630,6 +665,12 @@ function Invoke-WacLegacyDiskCleanup {
                         $outcome = 'Failed'
                         $detail = 'cleanmgr exited with {0}.' -f $run.ExitCode
                     }
+
+                    # cleanmgr drives shell handlers, several of which outlive the process that
+                    # started them. Its exit code alone was deciding this step.
+                    $settled = Get-WacSettledOutcome -Outcome $outcome -Detail $detail -Run $run
+                    $outcome = $settled.Outcome
+                    $detail = $settled.Detail
                 }
             }
         }
@@ -640,7 +681,7 @@ function Invoke-WacLegacyDiskCleanup {
         if ($mutated -and @($snapshot).Count -gt 0) {
             # -IgnoreRunBudget with its own explicit bound: the rollback still has to run when the
             # budget that stopped the work has already expired.
-            $restoreRun = Invoke-WacStepBounded -Component $component -TimeoutMs $script:VolumeCacheRegistryTimeoutMs -IgnoreRunBudget -Mutating `
+            $restoreRun = Invoke-WacStepBounded -Component $component -Label 'restore' -TimeoutMs $script:VolumeCacheRegistryTimeoutMs -IgnoreRunBudget -Mutating `
                 -ArgumentList @(, $snapshot) -ScriptBlock {
                     param($Snapshot)
                     Restore-WacDiskCleanupStateFlag -Snapshot $Snapshot

@@ -55,6 +55,35 @@ function Set-WacOwnedProcessLauncher {
     $script:OwnedProcessLauncher = $Launcher
 }
 
+function Set-WacOwnedProcessFault {
+    <#
+    .SYNOPSIS
+        Arms or clears ONE native launch-phase failure. Injects failure only, never success.
+    .DESCRIPTION
+        The launch states that decide whether a retry is legal are produced inside the native Start,
+        between CreateProcessW and ResumeThread. A test that replaces the whole launcher cannot reach
+        them, so the seam lives where the phases do.
+
+        -Phase None clears every fault. Always clear in a finally: a fault left armed would make every
+        later launch in the process fail.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('None', 'JobAssign', 'BeforeResume', 'AfterResume')][string]$Phase,
+        [AllowEmptyString()][string]$Message = 'injected by a test'
+    )
+
+    if (-not (Initialize-WacOwnedProcessNative)) { return $false }
+
+    [WacOwnedProcess]::ClearFaults()
+    switch ($Phase) {
+        'JobAssign'    { [WacOwnedProcess]::FaultAtJobAssign = $Message }
+        'BeforeResume' { [WacOwnedProcess]::FaultBeforeResume = $Message }
+        'AfterResume'  { [WacOwnedProcess]::FaultAfterResume = $Message }
+        default        { $null = $Phase }
+    }
+    return $true
+}
+
 function Initialize-WacOwnedProcessNative {
     <#
     .SYNOPSIS
@@ -86,10 +115,42 @@ public sealed class WacOwnedLaunch
     public string Degraded = "";
     public Stream StandardOutput;
     public Stream StandardError;
+
+    // HOW FAR THE LAUNCH GOT, and the only thing that may decide whether retrying is legal.
+    //
+    //   NeverCreated - CreateProcessW never returned a process. Nothing exists, nothing ran, and a
+    //                  managed fallback start is the SAFE answer.
+    //   Created      - the process exists and is SUSPENDED. It has executed no instruction, so it
+    //                  has no effects and no descendants - but it WAS created, so this is reported
+    //                  as a failed start rather than retried. The launcher terminates it.
+    //   Resumed      - the first instruction ran. Effects are possible from this moment on, so this
+    //                  launch is NEVER retried under any failure, only reported.
+    //
+    // This field exists because collapsing a post-resume failure to null made the caller start the
+    // same command a second time: for pnputil /delete-driver or cleanmgr /sagerun that is one
+    // logical invocation executing twice, and closing the first job cannot undo what it already did.
+    public string State = "NeverCreated";
+    public string Failure = "";
 }
 
 public static class WacOwnedProcess
 {
+    // TEST SEAMS, and the reason they are native rather than a PowerShell shim: the states this
+    // contract exists to distinguish are produced INSIDE Start, between CreateProcessW and
+    // ResumeThread. Replacing the whole launcher with one that answers null cannot reach them - it
+    // tests the substitute, not the code. Each field makes exactly ONE phase fail; none can make a
+    // phase succeed or be skipped, so production behaviour with all three null is untouched.
+    public static string FaultAtJobAssign = null;
+    public static string FaultBeforeResume = null;
+    public static string FaultAfterResume = null;
+
+    public static void ClearFaults()
+    {
+        FaultAtJobAssign = null;
+        FaultBeforeResume = null;
+        FaultAfterResume = null;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct SECURITY_ATTRIBUTES
     {
@@ -167,6 +228,9 @@ public static class WacOwnedProcess
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CreatePipe(out IntPtr read, out IntPtr write, ref SECURITY_ATTRIBUTES sa, int size);
@@ -300,7 +364,10 @@ public static class WacOwnedProcess
         IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero;
         IntPtr errRead = IntPtr.Zero, errWrite = IntPtr.Zero;
         IntPtr nul = IntPtr.Zero;
-        bool handedOver = false;
+        // Each read end is owned by EXACTLY one thing. Once a SafeFileHandle has adopted it the
+        // finally block must not close it too - the previous version could close both, which is a
+        // double close on a handle the OS may already have recycled.
+        bool outAdopted = false, errAdopted = false;
 
         try
         {
@@ -325,6 +392,15 @@ public static class WacOwnedProcess
 
             launch.Job = CreateKillOnCloseJob();
 
+            // ADOPTED BEFORE THE CHILD RUNS. Constructing a FileStream can fail, and a failure after
+            // ResumeThread is unrecoverable in the only sense that matters: the tool has already
+            // started doing whatever it does. The pipes exist independently of the child, so every
+            // allocation that can throw moves ahead of the resume.
+            launch.StandardOutput = new FileStream(new SafeFileHandle(outRead, true), FileAccess.Read, 4096, false);
+            outAdopted = true;
+            launch.StandardError = new FileStream(new SafeFileHandle(errRead, true), FileAccess.Read, 4096, false);
+            errAdopted = true;
+
             PROCESS_INFORMATION pi;
             StringBuilder line = new StringBuilder(commandLine);
             uint flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
@@ -338,6 +414,7 @@ public static class WacOwnedProcess
             launch.Process = pi.hProcess;
             launch.Thread = pi.hThread;
             launch.ProcessId = pi.dwProcessId;
+            launch.State = "Created";
 
             // THE ORDERING THAT MATTERS. The process exists but has never run an instruction, so it
             // cannot yet have created a child. Assigning here, before ResumeThread, is what makes
@@ -346,22 +423,32 @@ public static class WacOwnedProcess
             {
                 launch.Degraded = "the job object could not be created with its kill-on-close backstop";
             }
-            else if (!AssignProcessToJobObject(launch.Job, launch.Process))
+            else if (FaultAtJobAssign != null || !AssignProcessToJobObject(launch.Job, launch.Process))
             {
-                int error = Marshal.GetLastWin32Error();
+                int error = FaultAtJobAssign != null ? -1 : Marshal.GetLastWin32Error();
                 CloseHandle(launch.Job);
                 launch.Job = IntPtr.Zero;
-                launch.Degraded = "the suspended process could not be assigned to the job object (error " + error + ")";
+                launch.Degraded = FaultAtJobAssign != null
+                    ? FaultAtJobAssign
+                    : "the suspended process could not be assigned to the job object (error " + error + ")";
             }
             else
             {
                 launch.Owned = true;
             }
 
+            if (FaultBeforeResume != null) { throw new InvalidOperationException(FaultBeforeResume); }
+
             if (ResumeThread(launch.Thread) == 0xFFFFFFFF)
             {
                 throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             }
+            launch.State = "Resumed";
+
+            // The window this whole contract exists for: the child is RUNNING and the launcher still
+            // has work left that can fail. Whatever happens from here, the command must never be
+            // started a second time.
+            if (FaultAfterResume != null) { throw new InvalidOperationException(FaultAfterResume); }
 
             // Our copies of the WRITE ends close here. While the parent holds one the pipe can never
             // reach EOF, so this is what lets an outstanding read mean "a child still holds it".
@@ -369,9 +456,28 @@ public static class WacOwnedProcess
             CloseHandle(errWrite); errWrite = IntPtr.Zero;
             if (nul != IntPtr.Zero) { CloseHandle(nul); nul = IntPtr.Zero; }
 
-            launch.StandardOutput = new FileStream(new SafeFileHandle(outRead, true), FileAccess.Read, 4096, false);
-            launch.StandardError = new FileStream(new SafeFileHandle(errRead, true), FileAccess.Read, 4096, false);
-            handedOver = true;
+            return launch;
+        }
+        catch (Exception error)
+        {
+            // NEVER rethrown. Throwing here is what erased the difference between "nothing was
+            // created" and "a tool is already running", and the caller answered both by starting the
+            // command a second time. The launch object carries the truth out instead.
+            launch.Failure = error.Message;
+
+            if (launch.State == "NeverCreated")
+            {
+                // Nothing exists. Release everything; the caller may safely use the managed path.
+                Close(launch);
+            }
+            else if (launch.State == "Created")
+            {
+                // Suspended and never resumed, so it has executed nothing and has no descendants.
+                // Terminating it here makes the cleanup complete rather than leaving a hung root.
+                try { TerminateProcess(launch.Process, 1); } catch { }
+                Close(launch);
+            }
+            // Resumed keeps its handles: the caller still has to wait on it, read it and stop it.
             return launch;
         }
         finally
@@ -379,12 +485,9 @@ public static class WacOwnedProcess
             if (outWrite != IntPtr.Zero) { CloseHandle(outWrite); }
             if (errWrite != IntPtr.Zero) { CloseHandle(errWrite); }
             if (nul != IntPtr.Zero) { CloseHandle(nul); }
-            if (!handedOver)
-            {
-                if (outRead != IntPtr.Zero) { CloseHandle(outRead); }
-                if (errRead != IntPtr.Zero) { CloseHandle(errRead); }
-                Close(launch);
-            }
+            // Only a read end NO SafeFileHandle took responsibility for.
+            if (!outAdopted && outRead != IntPtr.Zero) { CloseHandle(outRead); }
+            if (!errAdopted && errRead != IntPtr.Zero) { CloseHandle(errRead); }
         }
     }
 }
@@ -429,141 +532,30 @@ function Start-WacOwnedProcess {
     try { $directory = [System.IO.Path]::GetDirectoryName($FilePath) } catch { $directory = $null }
     if ([string]::IsNullOrWhiteSpace($directory)) { $directory = $null }
 
+    # The native Start no longer throws across the resume boundary: it returns a launch carrying
+    # State. Only a catastrophic marshalling failure reaches this catch, and only NeverCreated - here
+    # or in the returned object - may become $null, because $null is what licenses the caller to run
+    # the same command again.
     try {
-        return [WacOwnedProcess]::Start($FilePath, $commandLine, $directory)
+        $launch = [WacOwnedProcess]::Start($FilePath, $commandLine, $directory)
     }
     catch {
-        Write-WacLog -Level WARNING -Component 'Process' -Message 'The owned launch failed; falling back to an unowned start.' -Data @{
+        Write-WacLog -Level WARNING -Component 'Process' -Message 'The owned launcher failed before any process could be created; an unowned start is safe.' -Data @{
             tool = $FilePath; error = $_.Exception.Message
         }
         return $null
     }
-}
 
-function Get-WacOwnedTreeState {
-    <#
-    .SYNOPSIS
-        Whether every process in an owned job has finished.
-    .DESCRIPTION
-        Three answers, never two. 'Complete' is the only one that licenses reclaiming state a
-        mutator may still be touching; 'Alive' says something this run started is still running even
-        though the root is gone; 'Unknown' is an unreadable job and is not a synonym for either.
-    .OUTPUTS
-        Complete | Alive | Unknown, and the active count (-1 when unreadable).
-    #>
-    param([Parameter(Mandatory = $true)]$Launch)
+    if ($null -eq $launch) { return $null }
 
-    if ($null -eq $Launch -or -not $Launch.Owned) {
-        return [PSCustomObject]@{ State = 'Unknown'; ActiveProcesses = -1 }
-    }
-
-    $active = -1
-    try { $active = [int][WacOwnedProcess]::ActiveProcessesInJob($Launch.Job) } catch { $active = -1 }
-
-    $state = 'Unknown'
-    if ($active -eq 0) { $state = 'Complete' }
-    elseif ($active -gt 0) { $state = 'Alive' }
-
-    return [PSCustomObject]@{ State = $state; ActiveProcesses = $active }
-}
-
-function Invoke-WacOwnedTool {
-    <#
-    .SYNOPSIS
-        Runs an already-owned launch to completion and returns the shared Invoke-WacProcess contract.
-    .DESCRIPTION
-        Lives beside the mechanism rather than in Process.ps1 because it IS the mechanism's policy:
-        every verdict below is read off the job, and none of it means anything without one.
-
-        Three facts are kept apart, which is the whole point of the ledger item:
-
-          Root exit          - the root process handle is signalled. Says nothing about descendants.
-          Owned-tree state   - ActiveProcesses on the job. 'Complete' is the only answer that
-                               licenses reclaiming state a mutator may still be touching.
-          Output completion  - both pipes reached EOF within the budget. A pipe EOFs only when every
-                               write handle closes, so an outstanding read is a second, independent
-                               witness that a descendant is alive.
-
-        A timeout is one TerminateJobObject call: the entire tree, no enumeration, no pid, no race
-        with a recycled parent id, and nothing unrelated can be caught by it because membership is
-        decided by creation, not by a name or a number.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]$Launch,
-        [Parameter(Mandatory = $true)][int]$TimeoutMs,
-        [Parameter(Mandatory = $true)][string]$FilePath,
-        [string]$Component = 'Process'
-    )
-
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-    $outReader = New-Object System.IO.StreamReader($Launch.StandardOutput, [System.Text.Encoding]::UTF8)
-    $errReader = New-Object System.IO.StreamReader($Launch.StandardError, [System.Text.Encoding]::UTF8)
-    $outTask = $outReader.ReadToEndAsync()
-    $errTask = $errReader.ReadToEndAsync()
-
-    $exited = [WacOwnedProcess]::WaitForExit($Launch.Process, $TimeoutMs)
-    $timedOut = -not $exited
-    $killedJob = $false
-
-    if ($timedOut) {
-        Write-WacLog -Level WARNING -Component $Component -Message 'External tool exceeded its deadline; terminating the job it was created in.' -Data @{
-            tool = $FilePath; pid = $Launch.ProcessId; timeoutMs = $TimeoutMs; owned = [bool]$Launch.Owned
-        }
-        $killedJob = [bool][WacOwnedProcess]::TerminateJob($Launch.Job)
-        [void][WacOwnedProcess]::WaitForExit($Launch.Process, 10000)
-    }
-
-    # Same accounting rule as the unowned path: the read waits are part of the run budget, not an
-    # extra ten seconds per tool on top of it.
-    $readBudgetMs = Get-WacStepTimeoutMs -RequestedMs 5000
-    if ($readBudgetMs -lt 250) { $readBudgetMs = 250 }
-    [void]$outTask.Wait($readBudgetMs)
-    [void]$errTask.Wait($readBudgetMs)
-
-    $outputComplete = ($outTask.IsCompleted -and $errTask.IsCompleted)
-    $stdout = if ($outTask.IsCompleted) { [string]$outTask.Result } else { '' }
-    $stderr = if ($errTask.IsCompleted) { [string]$errTask.Result } else { '' }
-
-    $exitCode = $null
-    if (-not $timedOut) {
-        try { $exitCode = [WacOwnedProcess]::GetExitCode($Launch.Process) } catch { $exitCode = $null }
-    }
-
-    # Queried AFTER the reads on purpose: by then the root's own accounting has settled, so a job
-    # that still reports members is reporting real descendants rather than a not-yet-reaped root.
-    $tree = Get-WacOwnedTreeState -Launch $Launch
-    $terminationProven = ($tree.State -ceq 'Complete')
-
-    if (-not $terminationProven) {
-        Write-WacLog -Level CRITICAL -Component $Component -Message 'The owned job still holds live processes, so the tool cannot be reported as stopped.' -Data @{
-            tool = $FilePath; pid = $Launch.ProcessId; treeState = [string]$tree.State
-            activeProcesses = [int]$tree.ActiveProcesses; timedOut = $timedOut; jobTerminated = $killedJob
-        }
-    }
-    elseif (-not $outputComplete) {
-        # The job is empty and a read still has not finished. Nothing this run owns can be holding
-        # the pipe, so the handle went to something outside the job - a service or COM activation
-        # started on our behalf. The output is still not the whole output, and the verdict says so.
-        Write-WacLog -Level WARNING -Component $Component -Message 'The owned tree finished but an output pipe is still held, so a process outside the job inherited it.' -Data @{
-            tool = $FilePath; pid = $Launch.ProcessId; readBudgetMs = $readBudgetMs
+    if (-not [string]::IsNullOrEmpty([string]$launch.Failure)) {
+        Write-WacLog -Level WARNING -Component 'Process' -Message 'The owned launch did not complete.' -Data @{
+            tool = $FilePath; state = [string]$launch.State; error = [string]$launch.Failure
         }
     }
 
-    $stopwatch.Stop()
-    return [PSCustomObject]@{
-        ExitCode = $exitCode
-        TimedOut = $timedOut
-        StandardOutput = $stdout
-        StandardError = $stderr
-        DurationMs = [int]$stopwatch.Elapsed.TotalMilliseconds
-        Started = $true
-        TerminationProven = $terminationProven
-        OutputComplete = $outputComplete
-        # Ownership is reported, never assumed: a caller that needs to know whether the verdict above
-        # rests on a job or on a best-effort walk can ask.
-        Owned = [bool]$Launch.Owned
-        OwnedTreeState = [string]$tree.State
-    }
+    # Nothing was created, so nothing ran: the caller may safely fall back.
+    if ([string]$launch.State -ceq 'NeverCreated') { return $null }
+
+    return $launch
 }

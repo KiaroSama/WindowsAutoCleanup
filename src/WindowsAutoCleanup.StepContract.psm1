@@ -141,7 +141,7 @@ function Set-WacStepBoundedInvoker {
     .SYNOPSIS
         Replaces the bounded in-process runner. Pass $null to restore the real one.
     .DESCRIPTION
-        The invoker receives (ScriptBlock, TimeoutMs, ArgumentList, Component, IgnoreRunBudget) and
+        The invoker receives (ScriptBlock, TimeoutMs, ArgumentList, Component, IgnoreRunBudget, Label) and
         must return Invoke-WacBounded's shape: Outcome, Started, TimedOut, Output, HadErrors, Error,
         DurationMs.
 
@@ -169,11 +169,16 @@ function Invoke-WacStepBounded {
         [AllowEmptyCollection()][object[]]$ArgumentList = @(),
         [string]$Component = 'Steps',
         [switch]$IgnoreRunBudget,
-        [switch]$Mutating
+        [switch]$Mutating,
+        # A STABLE name for this particular bounded call. It never reaches a log line - Component
+        # still does that - and exists so a fixture can select one call by what it IS rather than by
+        # its position. Selecting by ordinal coupled five suites to the ORDER of bounded calls, which
+        # is why a phase could not be added to a step without renumbering unrelated tests.
+        [string]$Label = ''
     )
 
     if ($script:BoundedInvoker) {
-        return (& $script:BoundedInvoker $ScriptBlock $TimeoutMs $ArgumentList $Component ([bool]$IgnoreRunBudget))
+        return (& $script:BoundedInvoker $ScriptBlock $TimeoutMs $ArgumentList $Component ([bool]$IgnoreRunBudget) $Label)
     }
 
     return (Invoke-WacBounded -ScriptBlock $ScriptBlock -TimeoutMs $TimeoutMs -ArgumentList $ArgumentList `
@@ -234,7 +239,82 @@ function Get-WacOutcomeRankTable {
     return @{} + $script:OutcomeRank
 }
 
+function Test-WacToolLifetimeSettled {
+    <#
+    .SYNOPSIS
+        Whether an external tool's WHOLE tree finished and its whole output arrived.
+    .DESCRIPTION
+        A root's exit code is what the tool BELIEVES about itself. It says nothing about a child the
+        tool started, and nothing about output that never arrived - and every maintenance step used
+        to decide success from that code alone, so a run with a live descendant and a truncated
+        answer could still report Succeeded.
+        This is the one place that question is answered, so the steps cannot drift apart on it.
+
+        Read DEFENSIVELY. These properties are part of the runner's contract, but an injected test
+        invoker may omit them and under Set-StrictMode 2.0 a missing property throws rather than
+        reading as absent. A result that does not carry a fact cannot contradict one, so a missing
+        property is treated as settled - the veto only ever fires on evidence.
+    .OUTPUTS
+        Settled (bool) and Reason (empty when settled).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()]$Run)
+
+    $result = [PSCustomObject]@{ Settled = $true; Reason = '' }
+    if ($null -eq $Run) { return $result }
+
+    $names = @()
+    try { $names = @($Run.PSObject.Properties.Name) } catch { $names = @() }
+
+    $reasons = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($names -ccontains 'TerminationProven' -and -not [bool]$Run.TerminationProven) {
+        [void]$reasons.Add('the tool could not be proven stopped')
+    }
+    if ($names -ccontains 'OwnedTreeState' -and ([string]$Run.OwnedTreeState) -ceq 'Alive') {
+        [void]$reasons.Add('work this run started is still alive')
+    }
+    if ($names -ccontains 'OutputComplete' -and -not [bool]$Run.OutputComplete) {
+        [void]$reasons.Add('the tool output is incomplete')
+    }
+
+    if ($reasons.Count -gt 0) {
+        $result.Settled = $false
+        $result.Reason = (@($reasons.ToArray()) -join '; ')
+    }
+    return $result
+}
+
+function Get-WacSettledOutcome {
+    <#
+    .SYNOPSIS
+        Raises a step outcome to Incomplete when the tool's lifetime is not settled, and explains it.
+    .DESCRIPTION
+        Combined through Get-WacHigherOutcome, never assigned: an unsettled lifetime can only make a
+        verdict worse. A recorded Failed stays Failed.
+    .OUTPUTS
+        Outcome and Detail.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Outcome,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Detail,
+        [Parameter(Mandatory = $true)][AllowNull()]$Run
+    )
+
+    $settled = Test-WacToolLifetimeSettled -Run $Run
+    if ($settled.Settled) {
+        return [PSCustomObject]@{ Outcome = $Outcome; Detail = $Detail }
+    }
+
+    return [PSCustomObject]@{
+        Outcome = (Get-WacHigherOutcome -Current $Outcome -Candidate 'Incomplete')
+        Detail = ('{0} The step cannot be reported finished: {1}.' -f $Detail, $settled.Reason).Trim()
+    }
+}
+
 Export-ModuleMember -Function @(
+    'Test-WacToolLifetimeSettled', 'Get-WacSettledOutcome',
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath',
     'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded',
     'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable'

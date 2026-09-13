@@ -23,11 +23,36 @@ function Invoke-InDeploymentSandbox {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Prefix,
-        [Parameter(Mandatory = $true)][scriptblock]$Body
+        [Parameter(Mandatory = $true)][scriptblock]$Body,
+        # Leaves the REAL trust walk in place. A TEMP sandbox is genuinely user-writable, so this is
+        # how a case proves the gate refuses one rather than proving the forcing works.
+        [switch]$RealTrust
     )
 
     $sandbox = New-TestSandbox -Prefix $Prefix
     $savedProgramFiles = $env:ProgramFiles
+
+    # A TEMP sandbox is GENUINELY user-writable, so the trust walk that now gates promoting a
+    # recovery slot refuses it - correctly, and for a reason that has nothing to do with the
+    # behaviour these cases are about. Answering that one walk yes keeps each case about what it
+    # names. The walk itself, and the refusals it produces, are measured against real injected roots
+    # in DeploymentProof.Tests.ps1, and one case in DeploymentRecovery.Tests.ps1 deliberately leaves
+    # it REAL so the gate itself is still proved.
+    $deployModule = Get-Module -Name 'WindowsAutoCleanup.Deploy'
+    $realTrustBody = $null
+    if ($deployModule -and -not $RealTrust) {
+        $realTrustBody = & $deployModule { (Get-Command Test-WacDeploymentTrusted).ScriptBlock }
+        & $deployModule {
+            Set-Item -Path 'function:script:Test-WacDeploymentTrusted' -Value {
+                param([string]$DeploymentRoot)
+                return [PSCustomObject]@{
+                    Root = $DeploymentRoot; IsTrusted = $true; Reason = 'sandbox trust forced for this suite'
+                    CheckedCount = 0; Findings = @()
+                }
+            }
+        }
+    }
+
     try {
         $programFiles = Join-Path -Path $sandbox -ChildPath 'PF'
         [void][System.IO.Directory]::CreateDirectory($programFiles)
@@ -35,6 +60,9 @@ function Invoke-InDeploymentSandbox {
         & $Body $sandbox
     }
     finally {
+        if ($deployModule -and $realTrustBody) {
+            & $deployModule { param($b) Set-Item -Path 'function:script:Test-WacDeploymentTrusted' -Value $b } $realTrustBody
+        }
         $env:ProgramFiles = $savedProgramFiles
         Remove-TestSandbox -Path $sandbox
     }

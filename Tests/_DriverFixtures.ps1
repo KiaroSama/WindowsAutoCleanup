@@ -168,6 +168,12 @@ function Invoke-WithStubbedTool {
     $script:StubResult = @{}
     $script:StubDeleted.Clear()
 
+    # Each case is a RUN. The unproven-mutator latch is deliberately not self-clearing - nothing
+    # in-process can observe an abandoned mutator finishing - and Initialize-WacRun is what resets
+    # it in production. A suite never calls that, so a case that armed the latch would otherwise
+    # refuse every later case for the PREVIOUS case's reason.
+    Reset-WacAbandonedMutator
+
     $originalAdmin = Get-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacIsAdministrator'
     Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Test-WacIsAdministrator' -Body { return $true }
 

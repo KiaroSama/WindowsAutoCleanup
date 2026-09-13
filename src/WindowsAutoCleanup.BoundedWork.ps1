@@ -130,7 +130,50 @@ function Invoke-WacBounded {
         if ($modules.Count -gt 0) { $state.ImportPSModule([string[]]$modules.ToArray()) }
 
         $runspace = [runspacefactory]::CreateRunspace($state)
-        $runspace.Open()
+
+        # OpenAsync, not Open. Charging the setup to the budget afterwards measured the overshoot; it
+        # did not BOUND it. A module whose top-level code blocks forever made Open() block forever
+        # too, and the promised bound was never returned within - the call simply came back whenever
+        # initialization finished, which for a wedged initializer is never.
+        #
+        # Opening on its own thread lets the caller give up on it. An initializer that has not
+        # finished inside the bound is ABANDONED exactly the way a wedged work item is: not disposed,
+        # because disposing waits for the very thing that is stuck.
+        $runspace.OpenAsync()
+
+        # BOTH signals. RunspaceStateInfo reaches Opened while the InitialSessionState's own module
+        # import is still running on it, and handing that runspace a pipeline answers "a pipeline is
+        # already running". Availability is what says the runspace will actually accept work.
+        $openDeadline = [datetime]::UtcNow.AddMilliseconds([Math]::Max(1, $budgetMs))
+        $opened = $false
+        while ([datetime]::UtcNow -lt $openDeadline) {
+            $openState = $runspace.RunspaceStateInfo.State
+            if ($openState -eq [System.Management.Automation.Runspaces.RunspaceState]::Opened -and
+                $runspace.RunspaceAvailability -eq [System.Management.Automation.Runspaces.RunspaceAvailability]::Available) {
+                $opened = $true
+                break
+            }
+            if ($openState -eq [System.Management.Automation.Runspaces.RunspaceState]::Broken -or
+                $openState -eq [System.Management.Automation.Runspaces.RunspaceState]::Closed) { break }
+            Start-Sleep -Milliseconds 20
+        }
+
+        if (-not $opened) {
+            $abandoned = $true
+            $watch.Stop()
+            $openState = '{0}/{1}' -f [string]$runspace.RunspaceStateInfo.State, [string]$runspace.RunspaceAvailability
+            if ($Mutating) { [void](Add-WacAbandonedMutator) }
+
+            Write-WacLog -Level WARNING -Component $Component -Message 'The bounded work could not be initialised inside its bound; it was abandoned rather than waited on.' -Data @{
+                budgetMs = $budgetMs; runspaceState = $openState; mutating = [bool]$Mutating
+            }
+            return [PSCustomObject]@{
+                Outcome = 'Incomplete'; Started = $false; TimedOut = $true
+                Output = @(); HadErrors = $false
+                Error = ('Preparing the bounded work did not complete within {0} ms (runspace state {1}).' -f $budgetMs, $openState)
+                DurationMs = [int]$watch.Elapsed.TotalMilliseconds
+            }
+        }
 
         $shell = [powershell]::Create()
         $shell.Runspace = $runspace

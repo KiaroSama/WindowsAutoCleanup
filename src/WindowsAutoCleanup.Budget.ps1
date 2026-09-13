@@ -19,19 +19,45 @@
 # Deadline
 # ---------------------------------------------------------------------------------------------
 
+# Armed together with the deadline and never adjusted afterwards: the civil deadline says WHEN, this
+# says HOW MUCH REAL TIME is left regardless of what happens to the clock.
+$script:DeadlineWatch = $null
+$script:DeadlineBudgetMs = 0
+
 function Set-WacDeadline {
     param([Parameter(Mandatory = $true)][datetime]$DeadlineUtc)
+
     $script:DeadlineUtc = $DeadlineUtc
+    $script:DeadlineBudgetMs = ($DeadlineUtc - (Get-Date).ToUniversalTime()).TotalMilliseconds
+    $script:DeadlineWatch = [System.Diagnostics.Stopwatch]::StartNew()
 }
 
 function Get-WacRemainingMs {
     <#
     .SYNOPSIS
         Milliseconds left in the overall run budget, or [int]::MaxValue when no budget is armed.
+    .DESCRIPTION
+        Two clocks, and the SMALLER answer wins.
+
+        The civil clock (Get-Date) is what the deadline is expressed in, and it is not monotonic: an
+        NTP correction, a time-zone or DST adjustment, or a user setting the clock moves it. A
+        backward jump used to hand the run extra time it had not earned - hours of it, mid-sweep -
+        and a forward jump expired a run that had barely started.
+
+        The stopwatch armed alongside the deadline measures ELAPSED time and cannot be adjusted, so
+        it is what stops a backward jump granting more. Taking the minimum keeps the forward-jump
+        case conservative too: a clock that now says the deadline has passed still stops the run,
+        which for a tool that deletes files is the safe direction to be wrong in.
     #>
     if (-not $script:DeadlineUtc) { return [int]::MaxValue }
 
     $remaining = ($script:DeadlineUtc - (Get-Date).ToUniversalTime()).TotalMilliseconds
+
+    if ($script:DeadlineWatch) {
+        $monotonic = $script:DeadlineBudgetMs - $script:DeadlineWatch.Elapsed.TotalMilliseconds
+        if ($monotonic -lt $remaining) { $remaining = $monotonic }
+    }
+
     if ($remaining -le 0) { return 0 }
     if ($remaining -ge [int]::MaxValue) { return [int]::MaxValue }
     return [int]$remaining

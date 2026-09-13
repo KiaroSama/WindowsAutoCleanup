@@ -205,8 +205,12 @@ function Invoke-WacPnpCleanHandler {
     $outcome = 'Failed'
     if ($run.ExitCode -eq 0) { $outcome = 'Succeeded' }
 
+    # rundll32 returns as soon as it has handed the work over, so its code is the weakest of the
+    # three facts available. The shared rule keeps the other two from being dropped.
+    $settled = Get-WacSettledOutcome -Outcome $outcome -Detail $detail -Run $run
+
     return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
-        -Outcome $outcome -Attempted $true -DurationMs ([int]$run.DurationMs) -Detail $detail))
+        -Outcome $settled.Outcome -Attempted $true -DurationMs ([int]$run.DurationMs) -Detail $settled.Detail))
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -429,6 +433,17 @@ function Invoke-WacDriverPackagePrune {
             break
         }
 
+        # An earlier deletion that could not be proven stopped may still be writing to the driver
+        # store. Starting the next one on top of it is the race this latch exists to prevent, and it
+        # does not self-clear: nothing in this process can observe that pnputil finishing.
+        if (-not (Test-WacMutationAllowed)) {
+            $remaining = $candidates.Count - $index
+            $incomplete += $remaining
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
+            Write-WacLog -Level ERROR -Component $component -Message 'Pruning stopped: an earlier deletion could not be proven stopped, so no further package was touched.' -Data @{ remaining = $remaining }
+            break
+        }
+
         # Spoken for by the reconciliation above: its directory carries an attempt nobody has
         # settled, so this run neither exports it again nor asks pnputil to remove it again - and it
         # is not counted twice either, because the reconciliation already reported it.
@@ -497,7 +512,15 @@ function Invoke-WacDriverPackagePrune {
             # exit code from a root whose tree outlived it is not an answer about the store.
             $incomplete++
             $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
-            Write-WacLog -Level WARNING -Component $component -Message 'The deletion produced no trustworthy result, so whether the package was removed is unknown.' -Data @{
+
+            # ARMS THE QUARANTINE. Preserving this package's export was necessary but not sufficient:
+            # the run used to simply `continue` to the next candidate, so a pnputil that may still be
+            # writing to the driver store had the next deletion started on top of it. The latch is
+            # checked at the top of this loop, so the remaining candidates are left untouched with
+            # their evidence intact.
+            [void](Add-WacAbandonedMutator)
+
+            Write-WacLog -Level CRITICAL -Component $component -Message 'The deletion produced no trustworthy result; no further package will be touched this run.' -Data @{
                 driver = $candidate.DriverName; backup = $backup.Directory
                 timedOut = [bool]$delete.TimedOut; terminationProven = $terminationProven
             }

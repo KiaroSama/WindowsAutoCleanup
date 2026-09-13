@@ -199,11 +199,19 @@ Test-Case 'an enabled cleanmgr run passes only /sagerun and restores the profile
             Assert-True $result.Succeeded $result.Detail
             Assert-False $result.Failed $result.Detail
 
-            # Snapshot and restore both went through the bound, and the restore ignores the budget.
-            Assert-Equal 2 $script:BoundedCall.Count 'the snapshot and the restore must both be bounded'
-            Assert-False $script:BoundedCall[0].IgnoreRunBudget 'the snapshot must respect the run budget'
-            Assert-True $script:BoundedCall[1].IgnoreRunBudget 'the restore must run even after the budget expired'
-            Assert-True ($script:BoundedCall[1].TimeoutMs -gt 0) 'the restore was given no time at all'
+            # EVERY registry phase goes through the bound, asserted by NAME rather than by a count:
+            # the write and the read-back used to be direct calls that a wedged registry could block
+            # outside every deadline the run has, and a count assertion said nothing about which
+            # phase was missing.
+            $labels = @($script:BoundedCall | ForEach-Object { [string]$_.Label })
+            foreach ($phase in @('snapshot', 'write', 'readback', 'restore')) {
+                Assert-True ($labels -ccontains $phase) ('the {0} phase was not bounded: {1}' -f $phase, ($labels -join ','))
+            }
+            $snapshotCall = @($script:BoundedCall | Where-Object { $_.Label -ceq 'snapshot' })[0]
+            $restoreCall = @($script:BoundedCall | Where-Object { $_.Label -ceq 'restore' })[0]
+            Assert-False $snapshotCall.IgnoreRunBudget 'the snapshot must respect the run budget'
+            Assert-True $restoreCall.IgnoreRunBudget 'the restore must run even after the budget expired'
+            Assert-True ($restoreCall.TimeoutMs -gt 0) 'the restore was given no time at all'
         }
 
         foreach ($handler in @('Temporary Files', 'Thumbnail Cache', 'Offline Pages Files', 'Not A Real Handler')) {
@@ -342,8 +350,9 @@ Test-Case 'a restore that fails makes the whole step Incomplete' {
     Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $key
     try {
         Invoke-WithStubbedTool -StubToolPath -Body {
-            # call:0 is the snapshot, call:1 is the restore.
-            $script:BoundedForce['call:1'] = @{ Outcome = 'Failed'; Error = 'the restore could not run' }
+            # By NAME, not by position: this step has four bounded phases and adding one used to
+            # renumber every fixture that selected a later call.
+            $script:BoundedForce['label:restore'] = @{ Outcome = 'Failed'; Error = 'the restore could not run' }
             $result = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999
 
             Assert-Equal 'Incomplete' $result.Outcome $result.Detail
@@ -422,7 +431,8 @@ Test-Case 'a cleanmgr run whose handlers are all missing writes nothing and star
 
             # A step that wrote nothing must not "restore" anything either: rewriting every value it
             # snapshotted is a registry write nobody asked for.
-            Assert-Equal 1 $script:BoundedCall.Count 'a step that mutated nothing still ran a restore'
+            Assert-Equal 0 (@($script:BoundedCall | Where-Object { $_.Label -ceq 'restore' }).Count) `
+                'a step that mutated nothing still ran a restore'
         }
     }
     finally {
@@ -648,8 +658,11 @@ Test-Case 'a selection the read-back cannot PROVE never reaches cleanmgr' {
 
                     # The profile really was written first, so the restoration asserted below is the
                     # rollback of a real mutation and not an assertion over an untouched key.
-                    Assert-Equal 2 $script:BoundedCall.Count ('{0}: the step did not snapshot and restore' -f $entry['Name'])
-                    Assert-True $script:BoundedCall[1].IgnoreRunBudget ('{0}: the restore must run even after the budget expired' -f $entry['Name'])
+                    $labels = @($script:BoundedCall | ForEach-Object { [string]$_.Label })
+                    Assert-True ($labels -ccontains 'snapshot') ('{0}: the step did not snapshot' -f $entry['Name'])
+                    Assert-True ($labels -ccontains 'restore') ('{0}: the step did not restore' -f $entry['Name'])
+                    $restoreCall = @($script:BoundedCall | Where-Object { $_.Label -ceq 'restore' })[0]
+                    Assert-True $restoreCall.IgnoreRunBudget ('{0}: the restore must run even after the budget expired' -f $entry['Name'])
                 }
             }
             finally {
