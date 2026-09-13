@@ -56,6 +56,7 @@ function Register-ScheduledTask {
         Shadows the cmdlet for Restore-CapturedTask, which resolves it in THIS scope. Records the
         XML it is given, so a case can assert whether anything was written at all.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Shadowing the real cmdlet IS the mechanism: the production caller resolves the name in this scope, and the shadow lives and dies with this test script.')]
     param($TaskName, $TaskPath, $InputObject, $Xml, [switch]$Force, $ErrorAction)
 
     $null = $InputObject, $Force, $ErrorAction

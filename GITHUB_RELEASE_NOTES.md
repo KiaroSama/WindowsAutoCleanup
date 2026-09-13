@@ -77,6 +77,20 @@ refused. Losing that race produces a wrong **refusal**, never a wrong deletion.
   tool believes about itself. Where that verdict was previously only recorded in the report, it now
   also prevents the next change - and the installer and uninstaller refuse on it too, at the same
   shared gate, before they stage anything or unregister a task.
+- **The driver step now asks that question everywhere it acts, not only where it deletes.** The
+  enumeration that decides *which* packages are candidates, the confirmation that decides whether one
+  really went, and the export that is the only recoverable copy all used to read an exit code alone.
+  Truncated enumeration output still parses, and a package whose device rows never arrived looks
+  exactly like a package installed on nothing - which is the definition of a prune candidate. The
+  export was the sharper case: it hashed its directory while something might still be writing into
+  it, and then deleted that directory in a `finally` clause on any outcome short of success.
+- **An abandoned driver deletion is now recorded on disk and never settled by a machine.** A
+  `wac-driver-delete.pending` marker means the result is not known *yet*, and a later run settles it
+  against the driver store. When the `pnputil` that made the attempt could not be proven to have
+  stopped, asking again settles nothing - every answer would be read beside a writer that may still
+  be running - so a second `wac-driver-delete.abandoned` marker goes down beside it. That directory
+  is held, the run reports `Incomplete`, and clearing it is an operator's job after a restart. See
+  **Recovering a pruned driver package** in the README.
 - **A suspended process that could not be terminated is no longer reported as stopped**, and a tool
   that fails after starting without job ownership is now actually terminated rather than only
   reported. One operation also gets ONE deadline: a root that exited no longer hands its descendants
