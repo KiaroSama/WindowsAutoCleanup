@@ -77,7 +77,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-WacPowerShellLiteral', 'Get-WacRelaunchCommand', 'Get-WacRelaunchArgument',
     'Stop-WacProcessTree', 'Set-WacProcessHandleOpener',
     'Start-WacOwnedProcess', 'Get-WacOwnedTreeState', 'Set-WacOwnedProcessLauncher',
-    'Set-WacOwnedProcessFault',
+    'Set-WacOwnedProcessFault', 'Get-WacOwnedProcessRawCloseCount',
     'Wait-WacOwnedTreeQuiet', 'Set-WacOwnedRunFault',
     'Initialize-WacOwnedProcessNative',
     'Invoke-WacProcess', 'Set-WacProcessInvoker', 'Get-WacProcessInvoker', 'Invoke-WacBounded',
