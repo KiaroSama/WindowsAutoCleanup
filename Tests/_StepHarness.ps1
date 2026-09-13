@@ -19,6 +19,7 @@ $script:System32 = Join-Path -Path $env:SystemRoot -ChildPath 'System32'
 $script:StubCall = New-Object 'System.Collections.Generic.List[object]'
 $script:StubResult = @{}
 
+$script:StoreSandbox = $null
 $script:BoundedCall = New-Object 'System.Collections.Generic.List[object]'
 $script:BoundedForce = @{}
 
@@ -216,6 +217,18 @@ function Invoke-WithStubbedTool {
     # the latch would be refused for the previous case's reason.
     Reset-WacAbandonedMutator
 
+    # A disposable CONTROL STORE, for the same reason every registry case uses a scratch HKCU key:
+    # the real one is under %SystemRoot% and belongs to the machine. Steps that record a recovery
+    # copy before they mutate (ledger WAC-05R) decline when they cannot, so without this a suite
+    # would be testing the decline rather than the step.
+    $script:StoreSandbox = New-TestSandbox -Prefix 'step-control'
+    Set-WacControlRoot -Path (Join-Path -Path $script:StoreSandbox -ChildPath 'Control')
+    Set-WacDirectoryTrustJudge -ScriptBlock {
+        param($Sddl, $Strict)
+        $null = $Sddl; $null = $Strict
+        return [PSCustomObject]@{ IsTrusted = $true; Owner = $null; Reason = 'test shim: descriptor verdict'; Writers = @() }
+    }
+
     $originalAdmin = Get-ModuleFunctionBody -Module $script:StepModule -Name 'Test-WacIsAdministrator'
     Set-ModuleFunctionBody -Module $script:StepModule -Name 'Test-WacIsAdministrator' -Body { return $true }
 
@@ -244,6 +257,9 @@ function Invoke-WithStubbedTool {
         }
         $script:StubResult = @{}
         $script:BoundedForce = @{}
+        Set-WacDirectoryTrustJudge -ScriptBlock $null
+        Set-WacControlRoot -Path $null
+        if ($script:StoreSandbox) { Remove-TestSandbox -Path $script:StoreSandbox; $script:StoreSandbox = $null }
     }
 }
 

@@ -77,6 +77,59 @@ function Get-WacDriverBackupRoot {
     return (Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup\DriverBackup')
 }
 
+$script:ControlRootOverride = $null
+
+function Set-WacControlRoot {
+    <#
+    .SYNOPSIS
+        Test seam for the control-file root. Pass $null to restore the real one.
+    .DESCRIPTION
+        The real root is under %SystemRoot%, which an unelevated suite can neither create in nor
+        plant a link inside - and the planted-object refusals this store exists for are exactly what
+        has to be covered. The seam is read ONLY here; every caller still goes through the same
+        bound primitives and the same strict-trust demand, so a redirected root exercises the same
+        code rather than a substitute for it.
+    #>
+    param([AllowNull()][string]$Path)
+    $script:ControlRootOverride = $Path
+}
+
+function Get-WacControlRoot {
+    <#
+    .SYNOPSIS
+        Where this tool's small CONTROL files live - the records that decide what a LATER run is
+        allowed to do. Deliberately NOT the data root.
+    .DESCRIPTION
+        Same reasoning as Get-WacDriverBackupRoot, and the same measurement behind it. The state
+        root's own trust rule explicitly PERMITS a non-administrative principal to create new names
+        there: %ProgramData% carries an inherited BUILTIN\Users:(CI)(WD,AD,WEA,WA) that every child
+        inherits and no healthy install can shed. For a LOG that is acceptable - a planted name is
+        noise. For a file that decides whether the next run may change this machine at all it is
+        not: whoever can create the name can decide the answer, or can stand a link at it and have
+        the answer written somewhere of their own choosing.
+
+        %SystemRoot%\Logs does not carry that grant (measured: Writers=[] on stock Windows 11), and
+        this project may not rewrite an ACL, so the location is the whole lever - exactly as it was
+        for the driver backups.
+    #>
+    if ($script:ControlRootOverride) { return $script:ControlRootOverride }
+    return (Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup\Control')
+}
+
+function Get-WacLegacyControlRoot {
+    <#
+    .SYNOPSIS
+        Where a control file written by a build before the move would be. Reported, never believed.
+    .DESCRIPTION
+        Read for PRESENCE only. The reason this location stopped being the control root is that a
+        name under it can be created by somebody else, so its contents are exactly the evidence that
+        cannot be trusted - and deleting it silently would discard a real operator's real
+        uncertainty. The same answer this project already gives for a legacy driver backup.
+    #>
+    if (-not $env:ProgramData) { return $null }
+    return (Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup')
+}
+
 function Get-WacLegacyDriverBackupRoot {
     <#
     .SYNOPSIS

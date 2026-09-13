@@ -50,12 +50,43 @@ $script:Utf8 = New-Object System.Text.UTF8Encoding($false)
 function Set-TestDataRoot {
     <#
     .SYNOPSIS
-        Points Get-WacDataRoot at a sandbox for the duration of a case.
+        Points BOTH roots the quarantine reads at a sandbox, for the duration of a case.
+    .DESCRIPTION
+        Two roots since ledger WAC-14: the marker itself lives in the strict CONTROL store, and the
+        legacy location under %ProgramData% is still checked for presence so a record written by an
+        older build is never silently believed or deleted. A case that redirected only one of them
+        would be reading this machine's real state for the other.
+
+        The descriptor verdict is answered too, because an unelevated suite cannot own a TEMP
+        directory the way -RequireStrictTrust demands. The collision-failing create, the reparse
+        refusal and the hard-link refusal stay the kernel's answers - QuarantineStore.Tests.ps1 is
+        where those are proven.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
 
     [void][System.IO.Directory]::CreateDirectory($Path)
     $env:ProgramData = $Path
+
+    $store = Join-Path -Path $Path -ChildPath 'Control'
+    [void][System.IO.Directory]::CreateDirectory($store)
+    Set-WacControlRoot -Path $store
+    Set-WacDirectoryTrustJudge -ScriptBlock {
+        param($Sddl, $Strict)
+        $null = $Sddl; $null = $Strict
+        return [PSCustomObject]@{ IsTrusted = $true; Owner = $null; Reason = 'test shim: descriptor verdict'; Writers = @() }
+    }
+}
+
+function Reset-TestDataRoot {
+    <#
+    .SYNOPSIS
+        Undoes Set-TestDataRoot. Called from every case's finally, whichever way it ended.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$SavedProgramData)
+
+    Set-WacDirectoryTrustJudge -ScriptBlock $null
+    Set-WacControlRoot -Path $null
+    $env:ProgramData = $SavedProgramData
 }
 
 function Write-TestMarker {
@@ -74,9 +105,10 @@ function Write-TestMarker {
         [string]$Text
     )
 
-    $directory = Join-Path -Path $ProgramData -ChildPath 'WindowsAutoCleanup'
+    # Straight into the redirected control store, because that is where the shipped reader looks.
+    $directory = Join-Path -Path $ProgramData -ChildPath 'Control'
     [void][System.IO.Directory]::CreateDirectory($directory)
-    $path = Join-Path -Path $directory -ChildPath 'abandoned-mutation.json'
+    $path = Join-Path -Path $directory -ChildPath (Get-WacQuarantineMarkerName)
 
     # ContainsKey, not a null test: a [string] parameter left unbound is the EMPTY STRING, so
     # `$null -ne $Text` was true for every caller and every marker was written empty.
@@ -112,8 +144,8 @@ Test-Case 'an abandoned mutation is recorded where the next process can find it'
 
         [void](Add-WacAbandonedMutator -Reason 'a test abandoned a mutating block')
 
-        $path = Get-WacQuarantineMarkerPath
-        Assert-True ([System.IO.File]::Exists($path)) ('no durable marker was written: ' + $path)
+        Assert-Equal 'Valid' ([string](Read-WacControlFile -Name (Get-WacQuarantineMarkerName)).State) `
+            'no durable marker was written into the control store'
         Assert-False (Test-WacMutationAllowed) 'the in-memory latch did not arm'
 
         $marker = Read-WacQuarantineMarker
@@ -124,7 +156,7 @@ Test-Case 'an abandoned mutation is recorded where the next process can find it'
     }
     finally {
         Reset-WacAbandonedMutator
-        $env:ProgramData = $saved
+        Reset-TestDataRoot -SavedProgramData $saved
         Remove-TestSandbox -Path $sandbox
     }
 }
@@ -143,7 +175,7 @@ Test-Case 'clearing the in-memory latch cannot erase the machine uncertainty' {
 
         Reset-WacAbandonedMutator
         Assert-True (Test-WacMutationAllowed) 'the in-memory reset did not clear the latch it owns'
-        Assert-True ([System.IO.File]::Exists((Get-WacQuarantineMarkerPath))) `
+        Assert-Equal 'Valid' ([string](Read-WacControlFile -Name (Get-WacQuarantineMarkerName)).State) `
             'the in-memory reset deleted the durable marker, which is the erasure this fix exists to stop'
 
         # What a NEW run does. The process that raised it is this one, and it is still running.
@@ -153,7 +185,7 @@ Test-Case 'clearing the in-memory latch cannot erase the machine uncertainty' {
     }
     finally {
         Reset-WacAbandonedMutator
-        $env:ProgramData = $saved
+        Reset-TestDataRoot -SavedProgramData $saved
         Remove-TestSandbox -Path $sandbox
     }
 }
@@ -174,11 +206,11 @@ Test-Case 'a marker is retired only when the process that raised it is proven go
         $resolved = Resolve-WacQuarantine
         Assert-Equal 'Retired' ([string]$resolved.State) ('a finished abandonment was not retired: ' + [string]$resolved.Reason)
         Assert-True (Test-WacMutationAllowed) 'a retired quarantine still refused every mutation'
-        Assert-False ([System.IO.File]::Exists((Get-WacQuarantineMarkerPath))) 'a retired marker was left on disk'
+        Assert-Equal 'Absent' ([string](Read-WacControlFile -Name (Get-WacQuarantineMarkerName)).State) 'a retired marker was left in the store'
     }
     finally {
         Reset-WacAbandonedMutator
-        $env:ProgramData = $saved
+        Reset-TestDataRoot -SavedProgramData $saved
         Remove-TestSandbox -Path $sandbox
     }
 }
@@ -198,11 +230,11 @@ Test-Case 'a marker that cannot be read is not absence' {
         $resolved = Resolve-WacQuarantine
         Assert-Equal 'Quarantined' ([string]$resolved.State) ('a torn marker did not fail closed: ' + [string]$resolved.Reason)
         Assert-False (Test-WacMutationAllowed) 'a run mutated the machine over a marker it could not read'
-        Assert-True ([System.IO.File]::Exists((Get-WacQuarantineMarkerPath))) 'a marker that could not be read was deleted anyway'
+        Assert-Equal 'Valid' ([string](Read-WacControlFile -Name (Get-WacQuarantineMarkerName)).State) 'a marker that could not be parsed was deleted anyway'
     }
     finally {
         Reset-WacAbandonedMutator
-        $env:ProgramData = $saved
+        Reset-TestDataRoot -SavedProgramData $saved
         Remove-TestSandbox -Path $sandbox
     }
 }
@@ -223,7 +255,7 @@ Test-Case 'a marker naming no usable process can never be retired' {
     }
     finally {
         Reset-WacAbandonedMutator
-        $env:ProgramData = $saved
+        Reset-TestDataRoot -SavedProgramData $saved
         Remove-TestSandbox -Path $sandbox
     }
 }
@@ -263,22 +295,19 @@ Test-Case 'both deletion primitives refuse while a mutation is unproven' {
     }
     finally {
         Reset-WacAbandonedMutator
-        $env:ProgramData = $saved
+        Reset-TestDataRoot -SavedProgramData $saved
         Remove-TestSandbox -Path $sandbox
     }
 }
 
-Test-Case 'a run that inherits an unretired quarantine starts no mutating step' {
-    # Items 3 and 5 together, through the SHIPPED Run.ps1 in a child process. The marker is planted
-    # by THIS process and read by that one, which is the process boundary the ledger item is about.
-    #
-    # ProcessId 0 so the verdict needs no process binding: the marker is refused on its own terms,
-    # and what is under test here is the step sequence, not the identity proof (covered above).
+Test-Case 'a quarantined run starts no mutating step' {
+    # The ORCHESTRATION half, through the SHIPPED Run.ps1 in a child process. The latch is armed in
+    # the rig's Initialize-WacRun shim, immediately after the real one has resolved the durable
+    # record - so what this proves is the step SEQUENCE reading the latch, which is the ledger item.
+    # Where the record itself comes from, and that it survives a process, is QuarantineStore's job.
     $rig = New-RunRig -Prefix 'quarantine-rig-armed'
     try {
-        [void](Write-TestMarker -ProgramData $rig.ProgramData -ProcessId 0 -ProcessCreated '0')
-
-        $plan = @{ targets = @((New-PlanTarget -Category 'Temp' -FilesDeleted 3)) }
+        $plan = @{ quarantined = $true; targets = @((New-PlanTarget -Category 'Temp' -FilesDeleted 3)) }
         $result = Invoke-RunRig -Rig $rig -Plan $plan
 
         Assert-RigExit -Rig $rig -Result $result -ExitCode 6 -Status 'Incomplete'
@@ -290,33 +319,24 @@ Test-Case 'a run that inherits an unretired quarantine starts no mutating step' 
         ('a quarantined run started a mutating step anyway: ' + $text)
         Assert-True ($text.Contains('an earlier mutation was abandoned and cannot be proven finished')) `
         ('the run did not record why the steps were refused: ' + $text)
-        Assert-True ($text.Contains('this run will not mutate anything')) `
-        ('the run did not report inheriting a quarantine: ' + $text)
     }
     finally {
         Remove-RunRig -Rig $rig
     }
 }
 
-Test-Case 'a run whose quarantine is proven over cleans normally and clears the marker' {
-    # The control, and the one that keeps the guard from becoming a permanent stop. The marker names
-    # THIS process with the wrong creation time, so the child binds its own parent - same user, same
-    # integrity, which Windows grants unconditionally - reads a different creation time, and
-    # concludes the recorded process is gone.
-    $rig = New-RunRig -Prefix 'quarantine-rig-over'
+Test-Case 'a run with nothing unresolved cleans normally' {
+    # The control, and the one that keeps the guard from becoming a permanent stop. Without it
+    # "always refuse" satisfies the case above and this tool would never clean anything again.
+    $rig = New-RunRig -Prefix 'quarantine-rig-clean'
     try {
-        $live = [long](Get-LiveCreated)
-        Assert-True ($live -gt 0) 'this process creation time could not be read, so the case cannot be set up'
-        [void](Write-TestMarker -ProgramData $rig.ProgramData -ProcessId $PID -ProcessCreated ([string]($live + 1)))
-
         $plan = @{ targets = @((New-PlanTarget -Category 'Temp' -FilesDeleted 3)) }
         Assert-RigExit -Rig $rig -Result (Invoke-RunRig -Rig $rig -Plan $plan) -ExitCode 0 -Status 'Succeeded'
 
         $text = Get-RigLogText -Rig $rig
-        Assert-True ($text.Contains('[TestStep]')) ('a run with no live abandonment skipped its steps: ' + $text)
-        Assert-False ([System.IO.File]::Exists(
-                (Join-Path -Path $rig.ProgramData -ChildPath 'WindowsAutoCleanup\abandoned-mutation.json'))) `
-        ('a quarantine proven over left its marker behind: ' + $text)
+        Assert-True ($text.Contains('[TestStep]')) ('a run with no abandonment skipped its steps: ' + $text)
+        Assert-False ($text.Contains('an earlier mutation was abandoned')) `
+        ('a clean run reported a quarantine it did not have: ' + $text)
     }
     finally {
         Remove-RunRig -Rig $rig

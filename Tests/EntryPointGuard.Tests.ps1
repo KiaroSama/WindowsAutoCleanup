@@ -421,4 +421,24 @@ Test-Case 'Neither wrapper reports an unproven termination as proof, and neither
     }
 }
 
+Test-Case 'An unresolved mutation refuses BOTH entry points before anything is staged or removed' {
+    # WAC-05R. Only Run.ps1's step sequence was asking about the quarantine. The installer and the
+    # uninstaller unregister tasks and replace files - mutations every bit as real as a sweep - and
+    # both went ahead over an operation an earlier run could not prove finished. The admission moved
+    # into the shared gate, so neither script can forget it.
+    $sandbox = New-TestSandbox -Prefix 'gate-quarantine'
+    try {
+        New-StubDeployment -Sandbox $sandbox
+        foreach ($name in @('Install-WindowsAutoCleanupTask.ps1', 'Uninstall-WindowsAutoCleanupTask.ps1')) {
+            $run = Invoke-StubbedEntryPoint -Sandbox $sandbox -ScriptName $name -StateMode 'trusted' -Quarantined $true
+
+            Assert-Equal 6 $run.ExitCode ('{0}: a run carrying an unresolved mutation was not refused: {1}' -f $name, $run.Console)
+            Assert-True ($run.ConsoleText -match 'could not be proven finished') `
+            ('{0}: the refusal did not say why: {1}' -f $name, $run.Console)
+            Assert-NothingMutated -Run $run -Label ('{0} over an unresolved mutation' -f $name) -ScriptName $name -Refused
+        }
+    }
+    finally { Remove-TestSandbox -Path $sandbox }
+}
+
 Complete-TestRun

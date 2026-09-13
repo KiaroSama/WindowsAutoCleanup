@@ -385,12 +385,29 @@ function Invoke-Main {
         return 1
     }
 
-    # A task-capture record left by an earlier run means this machine may be MISSING a registration
-    # that run removed and never replaced (ledger WAC-02R). Reconciled here, before phase 1: staging
-    # deletes slots and the swap replaces the tree that task would have run, and neither may happen
-    # over a registration nobody has accounted for. It reuses the lookup above rather than asking
-    # the scheduler a second question it has already answered.
-    $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $slots.Root -Lookup $discovery
+    # ONE decision for what an earlier run left behind, read off BOTH durable records and the disk
+    # (ledger WAC-02R). The two halves of a deployment - the tree and the registration - used to be
+    # reconciled by two pieces of code that each reached its own conclusion from its own half of the
+    # evidence, and an upgrade interrupted before it committed ended with the ORIGINAL tree under the
+    # REPLACEMENT task and the original task's definition deleted as "accounted for". The plan is
+    # made here, the task half acts on it below, and the file half inside New-WacDeploymentStage acts
+    # on the same one.
+    $plan = Get-WacDeploymentRecoveryPlan -DeploymentRoot $slots.Root
+    if ([string]$plan.Verdict -eq 'Refuse') {
+        Write-InstallerMessage -Level ERROR -Message ('Refusing to install: {0} Nothing was staged, swapped or registered.' -f [string]$plan.Reason)
+        return 1
+    }
+    if ([string]$plan.Verdict -ne 'None') {
+        Write-InstallerMessage -Level WARNING -Message 'An earlier run left a deployment transaction outstanding; it is being reconciled before anything is staged.' -Data @{
+            verdict = [string]$plan.Verdict; reason = [string]$plan.Reason; linked = [bool]$plan.Linked
+        }
+    }
+
+    # The TASK half, before phase 1 and before the file half: staging deletes slots and the swap
+    # replaces the tree that task would have run, and a restored registration has to point into a
+    # tree that is still the one it was taken away from. It reuses the lookup above rather than
+    # asking the scheduler a second question it has already answered.
+    $reconciled = Resolve-InterruptedTaskCapture -DeploymentRoot $slots.Root -Lookup $discovery -Plan $plan
     if (-not $reconciled.Ok) {
         Write-InstallerMessage -Level ERROR -Message ('Refusing to install: {0} Nothing was staged, swapped or registered.' -f [string]$reconciled.Reason)
         return 1
@@ -524,12 +541,20 @@ function Invoke-Main {
         return 1
     }
 
-    [void](Remove-WacDeploymentPrevious)
+    # The commit point, and its two record deletions are RESULTS, not gestures (ledger WAC-02R).
+    # While either record is on disk a later run reads this committed installation as an unfinished
+    # transaction - the swap record makes it a candidate for rollback, the capture record sends it
+    # looking for a registration that is no longer missing. The install itself has succeeded, so
+    # this is not a rollback; it is an install whose audit state is not what it says, and it is
+    # reported as INCOMPLETE below rather than as success.
+    $committed = [bool](Remove-WacDeploymentPrevious)
 
-    # The commit point for the task-capture transaction as well: a registration this run has read
-    # back and proven now stands where the one it removed used to. Left behind, the record would
-    # send the next run looking for a task that is no longer missing.
-    [void](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
+    $captureEnded = [bool](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
+    if (-not $captureEnded) {
+        Write-InstallerMessage -Level CRITICAL -Message 'This install is committed but the task-capture record beside the deployment could not be deleted; a later run will try to reconcile a registration that is not missing. Delete it by hand.' -Data @{
+            record = [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root -Kind 'TaskCapture')
+        }
+    }
 
     Write-InstallerMessage -Level INFO -Message 'Scheduled task registered and verified.' -Data @{
         task = ('{0}{1}' -f $registered.TaskPath, $registered.TaskName)
@@ -546,6 +571,18 @@ function Invoke-Main {
     }
     catch {
         Write-InstallerMessage -Level WARNING -Message ('The next run time could not be read: {0}' -f $_.Exception.Message)
+    }
+
+    # The same rule as the audit log below, applied to the transaction records: the task and the
+    # tree are in place and proven, and the machine is nonetheless not in the state this run would
+    # be claiming if it reported success, because a later run will read a settled deployment as an
+    # unfinished one. INCOMPLETE (6), never success.
+    if (-not $committed -or -not $captureEnded) {
+        Write-InstallerMessage -Level ERROR -Message 'Final status: incomplete. The task and the deployment are in place and verified, but a transaction record beside the deployment outlived the install that committed it; a later run will try to reconcile a state that is already settled.' -Data @{
+            swapRecordEnded = $committed; captureRecordEnded = $captureEnded
+            record = [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root)
+        }
+        return 6
     }
 
     # The install itself succeeded, but a run whose audit trail was lost did not fully do what it

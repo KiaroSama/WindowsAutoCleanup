@@ -24,7 +24,10 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path -Path $PSScriptRoot -ChildPath '_Harness.ps1')
 
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
-. (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.InstallerTask.ps1')
+Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Core.psm1') `
+    -Force -DisableNameChecking -ErrorAction Stop
+Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Deploy.psm1') `
+    -Force -DisableNameChecking -ErrorAction Stop
 
 $script:TaskHost = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 $script:TaskRoot = 'C:\Program Files\WindowsAutoCleanup'
@@ -126,7 +129,7 @@ function Assert-NotRestored {
 # ---------------------------------------------------------------------------------------------
 
 Test-Case 'A task restored exactly as captured matches, action, principal, settings and trigger' {
-    $verdict = Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task (New-RestoredTask)
+    $verdict = Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task (New-RestoredTask)
     Assert-True $verdict.Match ([string]$verdict.Reason)
 }
 
@@ -138,7 +141,7 @@ Test-Case 'A capture that declares only its action is still matched on its actio
     $task.Principal.UserId = 'MACHINE\someone'
     $task.Settings.Enabled = $false
 
-    $verdict = Test-CapturedTaskDefinition -Xml $xml -Task $task
+    $verdict = Test-WacCapturedTaskDefinition -Xml $xml -Task $task
     Assert-True $verdict.Match ([string]$verdict.Reason)
 }
 
@@ -150,19 +153,19 @@ Test-Case 'A task restored under a different user is not the task that was captu
     $task = New-RestoredTask
     $task.Principal.UserId = 'MACHINE\mobin'
 
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
         -Pattern 'user' -Message 'a SYSTEM task that came back as a user task was reported as restored'
 }
 
 Test-Case 'A task restored at a lower run level or a different logon type is not restored' {
     $lowered = New-RestoredTask
     $lowered.Principal.RunLevel = 'Limited'
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $lowered) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $lowered) `
         -Pattern 'run level' -Message 'a task that came back without its elevation was reported as restored'
 
     $logon = New-RestoredTask
     $logon.Principal.LogonType = 'Password'
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $logon) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $logon) `
         -Pattern 'logon type' -Message 'a task that came back with a different logon type was reported as restored'
 }
 
@@ -177,14 +180,14 @@ Test-Case 'The spellings the two sides use for the SAME identity are not differe
         $task.Principal.RunLevel = 1
         $task.Principal.LogonType = 5
 
-        $verdict = Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $task
+        $verdict = Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $task
         Assert-True $verdict.Match ('[{0}] {1}' -f $spelling, [string]$verdict.Reason)
     }
 
     # And the fold is not a general case-insensitive compare: a different account stays different.
     $other = New-RestoredTask
     $other.Principal.UserId = 'S-1-5-19'
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $other) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $other) `
         -Pattern 'user' -Message 'LOCAL SERVICE was folded into SYSTEM'
 }
 
@@ -196,7 +199,7 @@ Test-Case 'A task restored DISABLED is not restored' {
     $task = New-RestoredTask
     $task.Settings.Enabled = $false
 
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
         -Pattern 'enabled state' -Message 'a task that came back disabled was reported as restored'
 }
 
@@ -213,7 +216,7 @@ Test-Case 'Execution, restart and battery settings are compared, and equal durat
 
         $task = New-RestoredTask
         $task.Settings.($change.Field) = $change.Value
-        Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
+        Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
             -Pattern $change.Pattern -Message ('a task whose {0} came back changed was reported as restored' -f $change.Field)
     }
 
@@ -222,7 +225,7 @@ Test-Case 'Execution, restart and battery settings are compared, and equal durat
     $normalised = New-RestoredTask
     $normalised.Settings.ExecutionTimeLimit = 'PT240M'
     $normalised.Settings.MultipleInstances = 2
-    $verdict = Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $normalised
+    $verdict = Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $normalised
     Assert-True $verdict.Match ([string]$verdict.Reason)
 }
 
@@ -232,7 +235,7 @@ Test-Case 'A setting the restored task cannot be read back for is unproven, not 
     $task = New-RestoredTask
     $task.Settings.PSObject.Properties.Remove('Enabled')
 
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $task) `
         -Pattern 'unproven' -Message 'a field the restored task does not expose was treated as matching'
 }
 
@@ -243,35 +246,134 @@ Test-Case 'A setting the restored task cannot be read back for is unproven, not 
 Test-Case 'A task restored on a different schedule is not restored' {
     $hour = New-RestoredTask
     $hour.Triggers[0].StartBoundary = '2026-01-01T20:00:00'
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $hour) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $hour) `
         -Pattern 'starts at' -Message 'a daily task that came back firing at another hour was reported as restored'
 
     $interval = New-RestoredTask
     $interval.Triggers[0].DaysInterval = 2
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $interval) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $interval) `
         -Pattern 'day interval' -Message 'a daily task that came back running every other day was reported as restored'
 
     $disabled = New-RestoredTask
     $disabled.Triggers[0].Enabled = $false
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $disabled) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $disabled) `
         -Pattern 'enabled state' -Message 'a task whose only trigger came back disabled was reported as restored'
 }
 
 Test-Case 'A trigger that came back as a different KIND, or an extra one, is caught' {
     $kind = New-RestoredTask
     $kind.Triggers[0].CimClass.CimClassName = 'MSFT_TaskBootTrigger'
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $kind) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $kind) `
         -Pattern 'Daily trigger' -Message 'a daily trigger that came back as a boot trigger was reported as restored'
 
+    # By the COUNT, and the message has to say so. Get-TaskCollection used to hand the whole
+    # collection back as one object, so this read as "1 trigger against 1 declared" and only the
+    # field comparison - over member enumeration across the array - caught it by accident. A
+    # two-trigger task where BOTH triggers match the captured one would then have passed outright.
     $extra = New-RestoredTask
     $extra.Triggers = @($extra.Triggers[0], $extra.Triggers[0])
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $extra) `
-        -Pattern 'trigger' -Message 'a task that came back with a second trigger was reported as restored'
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $extra) `
+        -Pattern 'has 2 trigger\(s\) where the captured definition declares 1' `
+        -Message 'a task that came back with a second identical trigger was reported as restored'
+
+    # Same primitive, the other collection: a second action is a second program run as SYSTEM.
+    $actions = New-RestoredTask
+    $actions.Actions = @($actions.Actions[0], $actions.Actions[0])
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $actions) `
+        -Pattern 'has 2 action\(s\) where the captured definition declares 1' `
+        -Message 'a task that came back running a second program was reported as restored'
 
     $none = New-RestoredTask
     $none.Triggers = @()
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $none) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $none) `
         -Pattern 'trigger' -Message 'a scheduled task that came back with no schedule at all was reported as restored'
+}
+
+Test-Case 'A capture that declares NO trigger is not matched by a task that has one' {
+    # Ledger WAC-02R. An EMPTY Triggers element says the task fires on nothing, and the comparison
+    # returned "nothing to report" for it - so the one difference between a registration that runs
+    # and one that does not was the one difference it could not see. ABSENT stays different from
+    # EMPTY: a capture carrying no Triggers element at all never declared that part, and the case
+    # above proves it is still matched on what it does declare.
+    $xml = New-CapturedXml -Triggers '<Triggers></Triggers>'
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml $xml -Task (New-RestoredTask)) `
+        -Pattern 'trigger' -Message 'a task that fires daily was reported as the captured task that fires on nothing'
+
+    # And the pair of it: a task that really does have no trigger matches that capture.
+    $none = New-RestoredTask
+    $none.Triggers = @()
+    $verdict = Test-WacCapturedTaskDefinition -Xml $xml -Task $none
+    Assert-True $verdict.Match ([string]$verdict.Reason)
+}
+
+Test-Case 'A trigger that came back REPEATING is not the trigger that was captured' {
+    # A daily trigger that comes back repeating every ten minutes for a day runs the cleanup 144
+    # times instead of once, and every field the comparison used to read agrees perfectly.
+    $xml = New-CapturedXml -Triggers ('<Triggers><CalendarTrigger><StartBoundary>2026-01-01T03:00:00</StartBoundary><Enabled>true</Enabled>' +
+        '<Repetition><Interval>PT1H</Interval><Duration>PT12H</Duration><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>' +
+        '<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>')
+
+    $matching = New-RestoredTask
+    Add-Member -InputObject $matching.Triggers[0] -MemberType NoteProperty -Name 'Repetition' `
+        -Value ([PSCustomObject]@{ Interval = 'PT60M'; Duration = 'PT12H'; StopAtDurationEnd = $false })
+    $verdict = Test-WacCapturedTaskDefinition -Xml $xml -Task $matching
+    Assert-True $verdict.Match ('equal repetitions written differently were reported as a change: ' + [string]$verdict.Reason)
+
+    $faster = New-RestoredTask
+    Add-Member -InputObject $faster.Triggers[0] -MemberType NoteProperty -Name 'Repetition' `
+        -Value ([PSCustomObject]@{ Interval = 'PT10M'; Duration = 'PT12H'; StopAtDurationEnd = $false })
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml $xml -Task $faster) `
+        -Pattern 'repetition interval' -Message 'a trigger that came back repeating six times as often was reported as restored'
+}
+
+Test-Case 'The DAYS a weekly trigger fires on are compared, element names against the day mask' {
+    # The two sides say this completely differently - one empty child element per day against a
+    # single bit mask - so nothing the general normaliser does can compare them. Monday is 2.
+    $monday = '<Triggers><CalendarTrigger><StartBoundary>2026-01-01T03:00:00</StartBoundary><Enabled>true</Enabled>' +
+        '<ScheduleByWeek><WeeksInterval>1</WeeksInterval><DaysOfWeek><Monday /></DaysOfWeek></ScheduleByWeek></CalendarTrigger></Triggers>'
+
+    $task = New-RestoredTask
+    $task.Triggers[0].CimClass.CimClassName = 'MSFT_TaskWeeklyTrigger'
+    $task.Triggers[0].PSObject.Properties.Remove('DaysInterval')
+    Add-Member -InputObject $task.Triggers[0] -MemberType NoteProperty -Name 'WeeksInterval' -Value 1
+    Add-Member -InputObject $task.Triggers[0] -MemberType NoteProperty -Name 'DaysOfWeek' -Value 2
+
+    $verdict = Test-WacCapturedTaskDefinition -Xml (New-CapturedXml -Triggers $monday) -Task $task
+    Assert-True $verdict.Match ('a weekly trigger on the captured day was reported as a change: ' + [string]$verdict.Reason)
+
+    # Sunday instead of Monday: same interval, same hour, a task that never runs when it should.
+    $task.Triggers[0].DaysOfWeek = 1
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml -Triggers $monday) -Task $task) `
+        -Pattern 'day mask' -Message 'a weekly task that came back on another day was reported as restored'
+}
+
+Test-Case 'The conditions that decide whether the task runs at all are compared' {
+    # A task that comes back wanting the network, or no longer waking the machine, is a task that
+    # runs at times the operator never chose - and is exactly what an upgrade can change.
+    $declared = '<Settings><Enabled>true</Enabled><Hidden>true</Hidden><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>' +
+        '<RunOnlyIfIdle>false</RunOnlyIfIdle><WakeToRun>true</WakeToRun><AllowStartOnDemand>true</AllowStartOnDemand>' +
+        '<Priority>7</Priority></Settings>'
+
+    $task = New-RestoredTask
+    foreach ($pair in @(@{ Name = 'RunOnlyIfNetworkAvailable'; Value = $false }, @{ Name = 'RunOnlyIfIdle'; Value = $false },
+        @{ Name = 'WakeToRun'; Value = $true }, @{ Name = 'AllowDemandStart'; Value = $true }, @{ Name = 'Priority'; Value = 7 })) {
+        Add-Member -InputObject $task.Settings -MemberType NoteProperty -Name $pair.Name -Value $pair.Value
+    }
+
+    $verdict = Test-WacCapturedTaskDefinition -Xml (New-CapturedXml -Settings $declared) -Task $task
+    Assert-True $verdict.Match ([string]$verdict.Reason)
+
+    foreach ($change in @(@{ Name = 'RunOnlyIfNetworkAvailable'; Value = $true; Pattern = 'RunOnlyIfNetworkAvailable' },
+        @{ Name = 'WakeToRun'; Value = $false; Pattern = 'WakeToRun' },
+        @{ Name = 'AllowDemandStart'; Value = $false; Pattern = 'AllowStartOnDemand' },
+        @{ Name = 'Priority'; Value = 4; Pattern = 'priority' })) {
+
+        $was = $task.Settings.($change.Name)
+        $task.Settings.($change.Name) = $change.Value
+        Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml -Settings $declared) -Task $task) `
+            -Pattern $change.Pattern -Message ('a task whose {0} changed was reported as restored' -f $change.Name)
+        $task.Settings.($change.Name) = $was
+    }
 }
 
 Test-Case 'A boundary written with an offset is the local time the task will fire' {
@@ -281,7 +383,7 @@ Test-Case 'A boundary written with an offset is the local time the task will fir
     $xml = New-CapturedXml -Triggers ('<Triggers><CalendarTrigger><StartBoundary>{0}</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>' -f
         [System.Xml.XmlConvert]::ToString($local, [System.Xml.XmlDateTimeSerializationMode]::Local))
 
-    $verdict = Test-CapturedTaskDefinition -Xml $xml -Task (New-RestoredTask)
+    $verdict = Test-WacCapturedTaskDefinition -Xml $xml -Task (New-RestoredTask)
     Assert-True $verdict.Match ([string]$verdict.Reason)
 }
 
@@ -296,25 +398,25 @@ Test-Case 'The program is compared as a path and the arguments are compared byte
     $path = New-RestoredTask
     $path.Actions[0].Execute = 'c:\WINDOWS\system32\windowspowershell\v1.0\POWERSHELL.EXE'
     $path.Actions[0].WorkingDirectory = ($script:TaskRoot + '\')
-    $verdict = Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $path
+    $verdict = Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $path
     Assert-True $verdict.Match ([string]$verdict.Reason)
 
     $arguments = New-RestoredTask
     $arguments.Actions[0].Arguments = $script:TaskArguments.Replace('-Scheduled', '-scheduled')
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $arguments) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $arguments) `
         -Pattern "action 1's Arguments" -Message 'a command line that came back differing in case was reported as restored'
 
     $program = New-RestoredTask
     $program.Actions[0].Execute = 'C:\Windows\System32\cmd.exe'
-    Assert-NotRestored -Verdict (Test-CapturedTaskDefinition -Xml (New-CapturedXml) -Task $program) `
+    Assert-NotRestored -Verdict (Test-WacCapturedTaskDefinition -Xml (New-CapturedXml) -Task $program) `
         -Pattern "action 1's Command" -Message 'a task that came back running a different program was reported as restored'
 }
 
 Test-Case 'A capture with no readable action proves nothing and is refused' {
-    $verdict = Test-CapturedTaskDefinition -Xml '<Task><Settings><Hidden>true</Hidden></Settings></Task>' -Task (New-RestoredTask)
+    $verdict = Test-WacCapturedTaskDefinition -Xml '<Task><Settings><Hidden>true</Hidden></Settings></Task>' -Task (New-RestoredTask)
     Assert-NotRestored -Verdict $verdict -Pattern 'declares no program to run' -Message 'a definition with no action was accepted'
 
-    $broken = Test-CapturedTaskDefinition -Xml 'not xml at all' -Task (New-RestoredTask)
+    $broken = Test-WacCapturedTaskDefinition -Xml 'not xml at all' -Task (New-RestoredTask)
     Assert-NotRestored -Verdict $broken -Pattern 'not readable XML' -Message 'unreadable XML was accepted'
 }
 

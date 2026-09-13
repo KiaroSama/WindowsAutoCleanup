@@ -15,6 +15,26 @@
     already run cannot be un-run by reporting an exception instead of a result.
 #>
 
+$script:OwnedRunFault = $null
+
+function Set-WacOwnedRunFault {
+    <#
+    .SYNOPSIS
+        Arms or clears ONE post-start failure inside the runner. Injects failure only, never success.
+    .DESCRIPTION
+        The same contract as Set-WacOwnedProcessFault and for the same reason: the window this seam
+        reaches - a tool that is ALREADY RUNNING when the runner throws - cannot be produced on
+        demand, and a test that replaces the runner would be asserting about the replacement.
+
+        It is null in production and each phase can only make one step FAIL. -Phase None clears it;
+        always clear in a finally, or every later launch in the process throws.
+    #>
+    param([Parameter(Mandatory = $true)][ValidateSet('None', 'ReadAcquire', 'Wait')][string]$Phase)
+
+    $script:OwnedRunFault = if ($Phase -ceq 'None') { $null } else { $Phase }
+    return $true
+}
+
 function Wait-WacOwnedTreeQuiet {
     <#
     .SYNOPSIS
@@ -48,8 +68,12 @@ function Wait-WacOwnedTreeQuiet {
         }
     }
 
-    $deadline = [datetime]::UtcNow.AddMilliseconds($BudgetMs)
-    while ([datetime]::UtcNow -lt $deadline) {
+    # The STOPWATCH, not UtcNow (ledger WAC-06R). This loop is the last thing standing between a
+    # live descendant and the run moving on, and a civil clock moved backwards by an NTP or DST
+    # correction extends it by however far it jumped - inside the one wait whose whole purpose is to
+    # be bounded. Get-WacRemainingMs made exactly this correction for the run budget; the same clock
+    # had been left in here.
+    while ($watch.Elapsed.TotalMilliseconds -lt $BudgetMs) {
         Start-Sleep -Milliseconds 100
         $state = Get-WacOwnedTreeState -Launch $Launch
         if ($state.State -cne 'Alive') { break }
@@ -118,14 +142,32 @@ function Invoke-WacOwnedTool {
         [string]$Component = 'Process'
     )
 
+    # ONE DEADLINE FOR THE WHOLE OPERATION, and it is this stopwatch (ledger WAC-06R). -TimeoutMs is
+    # what the operation gets in total - root, tree, output capture and the cleanup after them - not
+    # what each of those phases gets in turn. Before this, a root that exited normally just inside
+    # its bound handed the tree another full TimeoutMs, and each pipe drain took its own grant on
+    # top, so one "30 second" tool could legitimately occupy a minute and a half.
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $operationBudgetMs = [int]$TimeoutMs
+
+    # Closes over the stopwatch, so every later phase asks the same monotonic clock what is left.
+    $remaining = { [int][Math]::Max(0, $operationBudgetMs - $stopwatch.Elapsed.TotalMilliseconds) }
 
     $outReader = New-Object System.IO.StreamReader($Launch.StandardOutput, [System.Text.Encoding]::UTF8)
     $errReader = New-Object System.IO.StreamReader($Launch.StandardError, [System.Text.Encoding]::UTF8)
     $outTask = $outReader.ReadToEndAsync()
     $errTask = $errReader.ReadToEndAsync()
 
-    $exited = [WacOwnedProcess]::WaitForExit($Launch.Process, $TimeoutMs)
+    if ($script:OwnedRunFault -ceq 'ReadAcquire') {
+        throw ('injected runner failure while acquiring the output reads of {0}' -f $FilePath)
+    }
+
+    # Reclamped immediately before the wait: acquiring the readers above is cheap but not free, and
+    # a phase that starts from the ORIGINAL number has already overrun by whatever preceded it.
+    $exited = [WacOwnedProcess]::WaitForExit($Launch.Process, (& $remaining))
+    if ($script:OwnedRunFault -ceq 'Wait') {
+        throw ('injected runner failure while waiting for {0}' -f $FilePath)
+    }
     $timedOut = -not $exited
     $killedJob = $false
     $walkProven = $false
@@ -160,34 +202,31 @@ function Invoke-WacOwnedTool {
         [void][WacOwnedProcess]::WaitForExit($Launch.Process, (Request-WacWaitMs -RequestedMs 10000))
     }
 
-    # Same accounting rule as the unowned path, and the same correction: clamping to the run budget
-    # left a 250 ms floor that nothing paid for, once per pipe per tool. Request-WacWaitMs charges
-    # the budget first and the single recovery reserve after it, and answers 0 when both are spent -
-    # which the verdict below reports as an incomplete read rather than hiding.
-    $readBudgetMs = Request-WacWaitMs -RequestedMs 5000
-    [void]$outTask.Wait($readBudgetMs)
-    [void]$errTask.Wait($readBudgetMs)
-
-    $outputComplete = ($outTask.IsCompleted -and $errTask.IsCompleted)
-    $stdout = if ($outTask.IsCompleted) { [string]$outTask.Result } else { '' }
-    $stderr = if ($errTask.IsCompleted) { [string]$errTask.Result } else { '' }
-
     $exitCode = $null
     if (-not $timedOut) {
         try { $exitCode = [WacOwnedProcess]::GetExitCode($Launch.Process) } catch { $exitCode = $null }
     }
 
-    # Queried AFTER the reads on purpose: by then the root's own accounting has settled, so a job
-    # that still reports members is reporting real descendants rather than a not-yet-reaped root.
+    # THE LIFECYCLE IS SETTLED BEFORE THE OUTPUT IS FINALISED (ledger WAC-05R). The reads have been
+    # running since before the root was waited on, so nothing here starts a drain - but the ANSWER
+    # used to be taken before the tree was given its time to finish. A child that held a pipe a
+    # little longer than the drain allowance and then exited well inside the tree allowance was
+    # recorded as incomplete output and an EMPTY STRING, which a caller parsing stdout reads as a
+    # real, empty answer. Settle what is alive first; read what arrived once, afterwards.
     #
-    # And when it IS still populated after a clean root exit, the work gets the rest of the run's
-    # budget to finish rather than being killed by the job handle closing. Only a timeout, an error
-    # or a cancellation may terminate; a root that returned while its child still works is not one.
+    # The job is also more truthful here than it was earlier: by now the root's own accounting has
+    # settled, so a job that still reports members is reporting real descendants rather than a
+    # not-yet-reaped root. A populated job after a CLEAN root exit gets the rest of the operation to
+    # empty rather than being killed by the job handle closing - only a timeout, an error or a
+    # cancellation may terminate.
     if ($timedOut) {
         $tree = Get-WacOwnedTreeState -Launch $Launch
     }
     else {
-        $tree = Wait-WacOwnedTreeQuiet -Launch $Launch -BudgetMs (Get-WacStepTimeoutMs -RequestedMs $TimeoutMs)
+        # What is LEFT of this operation, not another TimeoutMs. A descendant still alive when that
+        # runs out is reported Alive and the verdict below refuses to call the tool settled - which
+        # is the honest answer for an operation that has reached its deadline.
+        $tree = Wait-WacOwnedTreeQuiet -Launch $Launch -BudgetMs (Get-WacStepTimeoutMs -RequestedMs (& $remaining))
         if ([int]$tree.WaitedMs -gt 0) {
             Write-WacLog -Level DEBUG -Component $Component -Message 'The root exited while owned work continued; waited for the job inside the remaining budget.' -Data @{
                 tool = $FilePath; waitedMs = [int]$tree.WaitedMs; state = [string]$tree.State
@@ -195,6 +234,32 @@ function Invoke-WacOwnedTool {
             }
         }
     }
+    # ONE allowance, ONE deadline, BOTH pipes, and only now. Request-WacWaitMs CLAIMS what it grants
+    # - that is the whole point of a reserve that cannot refill - so passing the same grant to two
+    # waits spent the reservation once and consumed it twice, up to double what the run had set
+    # aside. The grant becomes a deadline and each wait takes only what is still left of it.
+    $drainGrantMs = Request-WacWaitMs -RequestedMs ([Math]::Min(5000, [Math]::Max(0, (& $remaining))))
+    $drainWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    [void]$outTask.Wait([int][Math]::Max(0, $drainGrantMs - $drainWatch.Elapsed.TotalMilliseconds))
+    [void]$errTask.Wait([int][Math]::Max(0, $drainGrantMs - $drainWatch.Elapsed.TotalMilliseconds))
+    $drainWatch.Stop()
+    $readBudgetMs = $drainGrantMs
+
+    # RanToCompletion, not IsCompleted. IsCompleted is true for a task that FAULTED or was cancelled
+    # as well as one that succeeded, so a read that threw was being reported as complete output and
+    # then had its .Result accessed - which rethrows. "It finished" and "it worked" are two facts.
+    $outOk = ($outTask.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion)
+    $errOk = ($errTask.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion)
+    $outputComplete = ($outOk -and $errOk)
+    $stdout = if ($outOk) { [string]$outTask.Result } else { '' }
+    $stderr = if ($errOk) { [string]$errTask.Result } else { '' }
+
+    if (-not $outputComplete -and ($outTask.IsFaulted -or $errTask.IsFaulted)) {
+        Write-WacLog -Level WARNING -Component $Component -Message 'An output read failed rather than finishing, so the tool output is not the whole output.' -Data @{
+            tool = $FilePath; stdoutStatus = [string]$outTask.Status; stderrStatus = [string]$errTask.Status
+        }
+    }
+
     if ($Launch.Owned) {
         $terminationProven = ($tree.State -ceq 'Complete')
     }

@@ -130,6 +130,10 @@ function New-RollbackSandbox {
         'function Get-WacRelaunchArgument { param($ScriptPath, $BooleanSwitch, $PresentSwitch, $NamedValue, $HostSwitch) return @($ScriptPath) }',
         'function Get-WacLogHealth { return ([PSCustomObject]@{ Path = (Get-WacLogPath); IsDurable = $true; Degraded = $false; FallbackKind = ''None''; FailedWrites = 0; Reason = ''stub'' }) }',
         'function Get-WacStateTrust { return ([PSCustomObject]@{ Path = $env:WAC_RB_ROOT; IsTrusted = $true; Reason = ''stub''; Checked = @(); Failures = @(); Writers = @() }) }',
+        # The quarantine admission the shared gate makes before either entry point changes anything.
+        # Clear here: every scenario in this suite is about what happens AFTER the gate lets the run
+        # through, and EntryPointGuard.Tests.ps1 owns the refusal.
+        'function Test-WacMutationAllowed { return $true }',
         'Export-ModuleMember -Function *-*'
     )
 
@@ -170,6 +174,30 @@ function New-RollbackSandbox {
         '    $items = @(ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($path)))',
         '    Add-Journal (''Read-WacTaskCaptureRecord|'' + @($items).Count)',
         '    return ([PSCustomObject]@{ State = ''Valid''; Schema = 2; Capture = @($items); Reason = ''stub'' })',
+        '}',
+        # The ONE commit decision the generation gets (ledger WAC-02R). The installer asks for it
+        # before anything is staged and hands it to the task half; the file half derives the same
+        # one inside New-WacDeploymentStage, which this sandbox stubs out. WAC_RB_PLAN is the
+        # verdict a scenario wants; the capture it carries is the real record on disk.
+        'function Get-WacDeploymentRecoveryPlan {',
+        '    param([string]$DeploymentRoot)',
+        '    $verdict = $env:WAC_RB_PLAN',
+        '    if (-not $verdict) { $verdict = ''None'' }',
+        '    Add-Journal (''Get-WacDeploymentRecoveryPlan|'' + $verdict)',
+        '    return ([PSCustomObject]@{',
+        '        Verdict = $verdict; Reason = ''stub''; Slots = (Get-WacDeploymentSlotPath)',
+        '        Swap = $null; Capture = (Read-WacTaskCaptureRecord); Linked = ($env:WAC_RB_LINKED -eq ''yes'')',
+        '        SlotState = ''Absent''; Promotable = $null; Corroboration = $null; Live = $null',
+        '    })',
+        '}',
+        # Whether a task standing at a captured name IS that capture. 'differ' is a task that wears
+        # the name and is not the task - the shape the name-only comparison could not see.
+        'function Test-WacCapturedTaskDefinition {',
+        '    param([string]$Xml, $Task)',
+        '    $null = $Xml, $Task',
+        '    $match = ($env:WAC_RB_SEMANTICS -ne ''differ'')',
+        '    Add-Journal (''Test-WacCapturedTaskDefinition|'' + $match)',
+        '    return ([PSCustomObject]@{ Match = $match; Reason = ''stub'' })',
         '}',
         'function Remove-WacTaskCaptureRecord {',
         '    param([string]$DeploymentRoot)',
@@ -261,6 +289,12 @@ function Invoke-RollbackScenario {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Sandbox,
+        # The scheduler's answers, in the order they are asked for. Restore-CapturedTask asks one
+        # more question than it used to (ledger WAC-02R): before it registers a captured definition
+        # it checks what, if anything, already stands at that name, because Register-ScheduledTask
+        # -Force would otherwise overwrite a task somebody else created there. A scenario that put
+        # a task back therefore answers ABSENT at that position - which is the truth, since the
+        # phase before it unregistered the one that was there - and Found at the read-back after.
         [string]$Lookup = 'Absent',
         [string]$Remove = 'Verified',
         [ValidateSet('yes', 'no')][string]$Capture = 'yes',
@@ -268,6 +302,12 @@ function Invoke-RollbackScenario {
         # Whether the durable capture record can be written at all. 'fail' is the transaction
         # boundary: the task stays registered and the upgrade stops before it changes anything.
         [ValidateSet('ok', 'fail')][string]$Record = 'ok',
+        # The recovery plan's verdict, and whether a task standing at a captured name IS that
+        # capture. Both are what the real module derives from disk; here they are what the scenario
+        # says, so a case can put the pair in a state and see what the installer does with it.
+        [ValidateSet('None', 'RestoreOriginal', 'CommitReplacement', 'Refuse')][string]$Plan = 'None',
+        [ValidateSet('same', 'differ')][string]$Semantics = 'same',
+        [ValidateSet('yes', 'no')][string]$Linked = 'no',
         # Zero-based index of the first budget check that finds the deadline gone; -1 never expires.
         [ValidateRange(-1, 32)][int]$Budget = -1,
         [ValidateRange(10, 300)][int]$TimeoutSeconds = 90
@@ -312,6 +352,9 @@ function Invoke-RollbackScenario {
     $psi.EnvironmentVariables['WAC_RB_CAPTURE'] = $Capture
     $psi.EnvironmentVariables['WAC_RB_REGISTER'] = $Register
     $psi.EnvironmentVariables['WAC_RB_RECORD'] = $Record
+    $psi.EnvironmentVariables['WAC_RB_PLAN'] = $Plan
+    $psi.EnvironmentVariables['WAC_RB_SEMANTICS'] = $Semantics
+    $psi.EnvironmentVariables['WAC_RB_LINKED'] = $Linked
     $psi.EnvironmentVariables['WAC_RB_BUDGET'] = ([string]$Budget)
     $psi.EnvironmentVariables['WAC_RB_XML'] = (Get-CapturedTaskXml -Sandbox $Sandbox)
 
@@ -369,7 +412,7 @@ Test-Case 'A registration that fails after the old task was removed restores BOT
     $sandbox = New-TestSandbox -Prefix 'rb-register'
     try {
         New-RollbackSandbox -Sandbox $sandbox
-        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Absent,Found' -Remove 'Verified' -Register 'throw'
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Absent,Absent,Found' -Remove 'Verified' -Register 'throw'
 
         Assert-False $run.TimedOut 'the installer never finished inside its bound'
         Assert-Equal 1 $run.ExitCode $run.Console
@@ -513,7 +556,7 @@ Test-Case 'A conflict phase that removed a task before it refused puts that task
     $sandbox = New-TestSandbox -Prefix 'rb-conflict'
     try {
         New-RollbackSandbox -Sandbox $sandbox
-        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Found' -Remove 'Unverified'
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Absent,Found' -Remove 'Unverified'
 
         Assert-False $run.TimedOut 'the installer never finished inside its bound'
         Assert-Equal 1 $run.ExitCode $run.Console
@@ -565,7 +608,7 @@ Test-Case 'A budget that runs out after the swap rolls the tree and the task bac
     $sandbox = New-TestSandbox -Prefix 'rb-budget-late'
     try {
         New-RollbackSandbox -Sandbox $sandbox
-        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Absent,Found' -Budget 5
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Absent,Absent,Found' -Budget 5
 
         Assert-False $run.TimedOut 'the installer never finished inside its bound'
         Assert-Equal 1 $run.ExitCode $run.Console
@@ -662,7 +705,7 @@ Test-Case 'A run that finds a capture record re-registers the lost task before i
         }) -Depth 5))
 
         # Absent at the first lookup - the registration the dead run removed - and found from then on.
-        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Absent,Found,Found,Found' -Remove 'Verified'
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Absent,Absent,Found,Found,Found' -Remove 'Verified'
 
         Assert-False $run.TimedOut 'the installer never finished inside its bound'
         Assert-Equal 0 $run.ExitCode $run.Console

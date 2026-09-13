@@ -251,8 +251,15 @@ function Invoke-WacProcess {
     # finish?" without enumerating anything. Everything below it is the fallback for the case where
     # that is unavailable, and it says Owned=$false rather than pretending otherwise.
     $launch = $null
+    # The launch is PART of the operation, not something that happens before it starts. Creating the
+    # pipes, compiling the helper on first use, CreateProcessW and the job assignment all take real
+    # time, and handing the root the original -TimeoutMs afterwards means the operation as a whole
+    # always overruns by however long that took (ledger WAC-06R).
+    $setupWatch = [System.Diagnostics.Stopwatch]::StartNew()
     try { $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList }
     catch { $launch = $null }
+    $setupWatch.Stop()
+    $ownedBudgetMs = [int][Math]::Max(0, $TimeoutMs - $setupWatch.Elapsed.TotalMilliseconds)
 
     # THE FALLBACK IS GATED ON WHETHER A PROCESS EXISTS, not on whether an object is truthy.
     # Selecting the managed start whenever the launcher answered $null meant a failure AFTER the
@@ -268,36 +275,75 @@ function Invoke-WacProcess {
             # Created suspended and never resumed: it executed nothing, has no descendants, and the
             # launcher has already terminated and released it. A failed start, reported as one -
             # never retried, because a process really was created.
-            Write-WacLog -Level ERROR -Component $Component -Message 'The tool was created but could not be resumed; it was terminated without running.' -Data @{
-                tool = $FilePath; error = [string]$launch.Failure
+            # Stopped is the launcher's CONFIRMED answer, not the fact that it asked. A suspended
+            # process that could not be terminated, or that had not exited when its handle was
+            # released, is a root this run can no longer see and must not claim to have stopped.
+            $createdStopped = $false
+            try { $createdStopped = [bool]$launch.Stopped } catch { $createdStopped = $false }
+
+            if ($createdStopped) {
+                Write-WacLog -Level ERROR -Component $Component -Message 'The tool was created but could not be resumed; it was terminated without running, and its exit was confirmed.' -Data @{
+                    tool = $FilePath; error = [string]$launch.Failure
+                }
             }
+            else {
+                Write-WacLog -Level CRITICAL -Component $Component -Message 'The tool was created but could not be resumed, and its termination could not be confirmed; a suspended process may remain.' -Data @{
+                    tool = $FilePath; pid = [int]$launch.ProcessId
+                    error = [string]$launch.Failure; degraded = [string]$launch.Degraded
+                }
+            }
+
             return [PSCustomObject]@{
                 ExitCode = $null; TimedOut = $false
                 StandardOutput = ''; StandardError = [string]$launch.Failure
                 DurationMs = 0; Started = $false
-                TerminationProven = $true; OutputComplete = $true
-                Owned = $false; OwnedTreeState = 'Complete'
+                TerminationProven = $createdStopped; OutputComplete = $true
+                Owned = $false; OwnedTreeState = $(if ($createdStopped) { 'Complete' } else { 'Unknown' })
             }
         }
 
         Write-WacLog -Level DEBUG -Component $Component -Message 'Starting external tool in an owned job.' -Data @{
-            tool = $FilePath; pid = [int]$launch.ProcessId; timeoutMs = $TimeoutMs; owned = [bool]$launch.Owned
+            tool = $FilePath; pid = [int]$launch.ProcessId; timeoutMs = $ownedBudgetMs
+            setupMs = [int]$setupWatch.Elapsed.TotalMilliseconds; owned = [bool]$launch.Owned
         }
         try {
-            return (Invoke-WacOwnedTool -Launch $launch -TimeoutMs $TimeoutMs -FilePath $FilePath -Component $Component)
+            return (Invoke-WacOwnedTool -Launch $launch -TimeoutMs $ownedBudgetMs -FilePath $FilePath -Component $Component)
         }
         catch {
             # A post-start failure still has to answer the shared contract. Returning an exception
             # here left the caller with no Started, no exit code and no termination fact for a tool
             # that had already run.
+            $failure = $_.Exception.Message
+
+            # AND THE TOOL HAS TO BE STOPPED. For an OWNED launch the finally below does it: closing
+            # the job handle fires kill-on-close over the whole tree. For a launch that is resumed
+            # and NOT owned - a job that could not be created or could not be assigned - Job is zero,
+            # closing handles terminates nothing at all, and the previous code left a running tool
+            # behind while reporting an exception. The ordinary jobless-timeout path never covered
+            # this: it is reached from the timeout branch, not from a thrown one.
+            $walkProven = $false
+            if (-not $launch.Owned) {
+                $stopped = Stop-WacProcessTree -ProcessId $launch.ProcessId -TimeoutMs (Request-WacWaitMs -RequestedMs 10000)
+                $walkProven = [bool]$stopped.Proven
+                if (-not $walkProven) {
+                    Write-WacLog -Level CRITICAL -Component $Component -Message 'An unowned tool failed after it had started and could not be proven terminated; part of its tree may still be running.' -Data @{
+                        tool = $FilePath; pid = [int]$launch.ProcessId
+                        survivors = (@($stopped.Survivor) -join ','); reason = [string]$stopped.Reason
+                    }
+                }
+            }
+
             Write-WacLog -Level CRITICAL -Component $Component -Message 'The owned tool ran, then failed before its result was known; its effects cannot be ruled out.' -Data @{
-                tool = $FilePath; pid = [int]$launch.ProcessId; error = $_.Exception.Message
+                tool = $FilePath; pid = [int]$launch.ProcessId; error = $failure
+                owned = [bool]$launch.Owned; terminationProven = $walkProven
             }
             return [PSCustomObject]@{
                 ExitCode = $null; TimedOut = $false
-                StandardOutput = ''; StandardError = [string]$_.Exception.Message
+                StandardOutput = ''; StandardError = [string]$failure
                 DurationMs = 0; Started = $true
-                TerminationProven = $false; OutputComplete = $false
+                # An owned launch is stopped by the kill-on-close backstop in the finally, but that
+                # has not run yet and this result must not claim a stop it has not seen.
+                TerminationProven = $walkProven; OutputComplete = $false
                 Owned = [bool]$launch.Owned; OwnedTreeState = 'Unknown'
             }
         }
