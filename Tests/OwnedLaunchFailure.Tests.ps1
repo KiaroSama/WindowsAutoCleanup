@@ -367,4 +367,80 @@ Test-Case 'a termination that was never confirmed is reported unproven by the ca
     }
 }
 
+Test-Case 'a termination that was GRANTED but not confirmed in its budget is not a stop' {
+    # WAC-13 defect 1, and the half the two cases above could not reach. They discriminate whether
+    # the REQUEST succeeded; neither can discriminate the WAIT that follows it, because a suspended
+    # process dies the instant it is asked and the wait therefore never changes an answer. The state
+    # that matters in production - the request granted, the process still there when the budget ran
+    # out - is exactly the state a fixture cannot produce on demand, so the launcher carries a seam
+    # for it beside the one that refuses the request.
+    #
+    # Driven through the launcher, like its sibling: the caller's view of this is already covered by
+    # 'a termination that was never confirmed is reported unproven by the caller too'.
+    $sandbox = New-TestSandbox -Prefix 'owned-confirm'
+    $launch = $null
+    try {
+        $counter = Join-Path -Path $sandbox -ChildPath 'ran.txt'
+        [void](Set-WacOwnedProcessFault -Phase BeforeResume -Message 'injected pre-resume failure')
+        [WacOwnedProcess]::FaultConfirmNotSignalled = $true
+
+        $argv = New-CountingArgument -CounterPath $counter
+        $commandLine = (ConvertTo-WacCommandLineArgument -Value $script:HostExe) + ' ' + (ConvertTo-WacCommandLine -ArgumentList $argv)
+        $workingDirectory = [System.IO.Path]::GetDirectoryName($script:HostExe)
+        $launch = [WacOwnedProcess]::Start($script:HostExe, $commandLine, $workingDirectory, 2000)
+
+        Assert-Equal 'Created' ([string]$launch.State) 'the fixture did not reach the suspended state this case is about'
+        Assert-False ([bool]$launch.Stopped) `
+            'a termination whose confirmation never came back was reported as a confirmed stop, so asking was treated as stopping'
+
+        # WHICH refusal it was. The sibling case produces a false Stopped from a REFUSED request; if
+        # both cases accepted either message, either one could pass for the other.
+        Assert-True ([string]$launch.Degraded).Contains('had not exited') `
+            ('the degraded reason describes a refused request rather than an unconfirmed exit: {0}' -f [string]$launch.Degraded)
+        Assert-Equal 0 (Get-InvocationCount -Path $counter) 'a process that was never resumed executed the command'
+    }
+    finally {
+        [WacOwnedProcess]::FaultConfirmNotSignalled = $false
+        [void](Set-WacOwnedProcessFault -Phase None)
+        # The request really was granted here - only its confirmation was withheld - but this case
+        # must not depend on that to leave the machine clean.
+        if ($launch -and $launch.ProcessId -gt 0) {
+            Stop-Process -Id ([int]$launch.ProcessId) -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'a stream failure stands down from the handle its SafeFileHandle already owns' {
+    # WAC-13 defect 3, asserted DIRECTLY. The case above it asserts the consequence - that the next
+    # launch still works - and that assertion cannot fail for this reason: closing a handle twice on
+    # Windows normally produces nothing observable in-process, so the ordering that prevents it could
+    # be reverted with the whole suite still green. That is the shape of a guard nothing measures.
+    #
+    # The launcher therefore counts the read ends it closed RAW, meaning ones no SafeFileHandle had
+    # adopted. With the fault armed the count is the whole assertion: stderr's read end was never
+    # adopted and is legitimately closed here, stdout's was adopted one line before the throw and
+    # must be left to its owner. One, not two.
+    $launch = $null
+    try {
+        [void](Set-WacOwnedProcessFault -Phase OutStream -Message 'injected stream construction failure')
+        Assert-Equal 0 (Get-WacOwnedProcessRawCloseCount) 'arming a fault did not reset the count this case reads'
+
+        $commandLine = ConvertTo-WacCommandLineArgument -Value $script:HostExe
+        $workingDirectory = [System.IO.Path]::GetDirectoryName($script:HostExe)
+        $launch = [WacOwnedProcess]::Start($script:HostExe, $commandLine, $workingDirectory, 2000)
+
+        Assert-Equal 'NeverCreated' ([string]$launch.State) `
+            ('the fault fired somewhere other than before CreateProcessW: {0}' -f [string]$launch.Failure)
+        Assert-Equal 1 (Get-WacOwnedProcessRawCloseCount) `
+            'the raw cleanup closed a read end a SafeFileHandle had already adopted, which is a double close on a handle number the OS may have reissued'
+    }
+    finally {
+        [void](Set-WacOwnedProcessFault -Phase None)
+        if ($launch -and $launch.ProcessId -gt 0) {
+            Stop-Process -Id ([int]$launch.ProcessId) -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Complete-TestRun
