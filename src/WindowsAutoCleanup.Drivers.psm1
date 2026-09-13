@@ -372,6 +372,21 @@ function Invoke-WacDriverPackagePrune {
 
     $enum = Invoke-WacProcess -FilePath $pnputil -ArgumentList $script:PnpUtilEnumArgument -TimeoutMs $enumTimeoutMs -Component $component
 
+    # THE CANDIDATE LIST IS ONLY AS GOOD AS THE RUN THAT PRODUCED IT (ledger WAC-05R). The
+    # per-candidate loop below has asked this question about its own pnputil since the last round;
+    # the enumeration that decides WHICH packages that loop touches never did, and it is the more
+    # dangerous of the two. Truncated output still parses into valid XML, and a package whose device
+    # rows never arrived reads as installed on nothing - which is precisely what makes a package a
+    # deletion candidate. So a store that was half read could nominate a live package for removal.
+    # Resolve-WacSettledOutcome raises the outcome and arms the latch in one move, so the step stops
+    # here rather than acting on a list it cannot stand behind.
+    $enumSettled = Resolve-WacSettledOutcome -Outcome 'SafeSkip' -Detail 'The driver store was not enumerated.' -Run $enum
+    if ([string]$enumSettled.Outcome -cne 'SafeSkip') {
+        return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
+            -Outcome (Get-WacHigherOutcome -Current ([string]$enumSettled.Outcome) -Candidate $floor) -Attempted $true `
+            -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) -Detail ([string]$enumSettled.Detail + $legacyDetail)))
+    }
+
     if ($enum.TimedOut) {
         return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
             -Outcome (Get-WacHigherOutcome -Current 'Incomplete' -Candidate $floor) -Attempted $true -DurationMs ([int]$stopwatch.Elapsed.TotalMilliseconds) `
@@ -518,10 +533,13 @@ function Invoke-WacDriverPackagePrune {
             # writing to the driver store had the next deletion started on top of it. The latch is
             # checked at the top of this loop, so the remaining candidates are left untouched with
             # their evidence intact.
-            [void](Add-WacAbandonedMutator)
+            # Arms that latch AND records the same fact in the directory, so the next run does not
+            # settle this attempt against a store reading taken beside a writer nobody stopped.
+            $marked = Set-WacDriverBackupAbandoned -Path $backup.Directory `
+                -Reason ('a driver deletion could not be proven finished: {0}' -f [string]$candidate.DriverName)
 
             Write-WacLog -Level CRITICAL -Component $component -Message 'The deletion produced no trustworthy result; no further package will be touched this run.' -Data @{
-                driver = $candidate.DriverName; backup = $backup.Directory
+                driver = $candidate.DriverName; backup = $backup.Directory; recorded = $marked
                 timedOut = [bool]$delete.TimedOut; terminationProven = $terminationProven
             }
             continue

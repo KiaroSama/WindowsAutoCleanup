@@ -188,6 +188,7 @@ function Register-ScheduledTask {
         scheduler. The XML it is given is recorded, so a case can assert that what went back is
         byte for byte what was captured.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidOverwritingBuiltInCmdlets', '', Justification = 'Shadowing the real cmdlet IS the mechanism: the production caller resolves the name in this scope, and the shadow lives and dies with this test script.')]
     param($TaskName, $TaskPath, $InputObject, $Xml, [switch]$Force, $ErrorAction)
 
     $null = $InputObject, $Force, $ErrorAction
