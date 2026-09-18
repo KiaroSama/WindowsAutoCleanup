@@ -41,6 +41,7 @@ $script:RecordingInvoker = {
 
     $key = ''
     if ($argv.Count -gt 0) { $key = [string]$argv[0] }
+    $canned = @{}
     if ($script:StubResult.ContainsKey($key)) {
         $canned = $script:StubResult[$key]
         if ($canned.ContainsKey('ExitCode')) { $exitCode = $canned['ExitCode'] }
@@ -48,13 +49,38 @@ $script:RecordingInvoker = {
         if ($canned.ContainsKey('Out')) { $standardOutput = [string]$canned['Out'] }
     }
 
+    # THE LIFETIME FACTS ARE STATED, NOT OMITTED (ledger WAC-05R). The production contract is
+    # positive now: a result that does not say whether the tool stopped, whether its output all
+    # arrived and what its tree is doing has an UNKNOWN lifetime, not a harmless one. A double that
+    # leaves them off therefore models a runner that answers nothing - which is the very shape the
+    # contract exists to refuse - so it states them, and a case that wants an unsettled tool says so.
+    # A TIMEOUT IS NOT AN UNPROVEN STOP - the same rule the driver fixture states. The real runner
+    # terminates the owned tree when the deadline expires and the job then answers for it, so a
+    # timed-out run is normally proven stopped with an empty tree; it simply did not finish its work.
+    # The harder shape, a deadline whose tree could NOT be proven gone, is what a case asks for.
+    $terminationProven = $true
+    $outputComplete = $true
+    $treeState = 'Complete'
+    if ($canned.ContainsKey('TerminationProven')) { $terminationProven = [bool]$canned['TerminationProven'] }
+    if ($canned.ContainsKey('OutputComplete')) { $outputComplete = [bool]$canned['OutputComplete'] }
+    if ($canned.ContainsKey('OwnedTreeState')) { $treeState = [string]$canned['OwnedTreeState'] }
+    elseif (-not $terminationProven) { $treeState = 'Unknown' }
+
     return [PSCustomObject]@{
-        ExitCode       = $exitCode
-        TimedOut       = $timedOut
-        StandardOutput = $standardOutput
-        StandardError  = ''
-        DurationMs     = 5
-        Started        = (-not $timedOut)
+        ExitCode          = $exitCode
+        TimedOut          = $timedOut
+        StandardOutput    = $standardOutput
+        StandardError     = ''
+        DurationMs        = 5
+        # A TOOL KILLED ON ITS DEADLINE DID START. The real runner reports Started=$true for it -
+        # it ran, it was terminated, and that is a different fact from never having been created.
+        # Reporting otherwise made a timeout indistinguishable from a launch that never happened,
+        # which is the one shape the completion contract settles without a tree.
+        Started           = $true
+        TerminationProven = $terminationProven
+        OutputComplete    = $outputComplete
+        Owned             = $true
+        OwnedTreeState    = $treeState
     }
 }
 

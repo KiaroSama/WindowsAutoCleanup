@@ -35,6 +35,7 @@ Import-Module -Name (Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAut
     -Force -DisableNameChecking -ErrorAction Stop
 
 $script:CoreModule = Get-Module -Name 'WindowsAutoCleanup.Core'
+$script:HostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 
 function Get-ModuleFunctionBody {
     param([Parameter(Mandatory = $true)]$Module, [Parameter(Mandatory = $true)][string]$Name)
@@ -172,6 +173,159 @@ Test-Case 'The launch itself is debited from the operation budget the next phase
     finally {
         Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Invoke-WacOwnedTool' -Body $realOwnedTool
         Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Start-WacOwnedProcess' -Body $realStart
+    }
+}
+
+Test-Case 'R06-1 a launcher that declines AFTER spending the budget starts no fallback process' {
+    # The fallback used to begin with the ORIGINAL -TimeoutMs and a brand-new stopwatch, so every
+    # millisecond the native launcher spent before declining was free: a launcher that took the whole
+    # budget to answer "I cannot own this" was followed by a tool that then got the whole budget
+    # again. Worse than the overrun is that it STARTS something at all - a spent budget is a reason
+    # not to run a tool, and this was the one path that did not ask.
+    $sandbox = New-TestSandbox -Prefix 'r06-late'
+    $marker = Join-Path -Path $sandbox -ChildPath 'ran.txt'
+    $realStart = Get-ModuleFunctionBody -Module $script:CoreModule -Name 'Start-WacOwnedProcess'
+    try {
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Start-WacOwnedProcess' -Body {
+            param([string]$FilePath, $ArgumentList)
+            $null = $FilePath, $ArgumentList
+            # Spends the caller's whole budget and then declines ownership, which is the shape a
+            # first-use compile of the native helper produces on a slow machine.
+            Start-Sleep -Milliseconds 700
+            return $null
+        }
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $run = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 400 -Component 'Test' `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command',
+                ('[System.IO.File]::WriteAllText("{0}", "ran")' -f $marker))
+        $watch.Stop()
+
+        Assert-False (Test-Path -LiteralPath $marker -PathType Leaf) `
+            'the fallback started a tool after the budget for the whole operation was already spent'
+        Assert-False ([bool]$run.Started) 'a run that started nothing reported that it had started'
+
+        # And it did not spend a second budget discovering that. The launcher's own 700 ms is the
+        # floor here; anything approaching 700 + 400 means the fallback re-armed the original bound.
+        Assert-True ([int]$watch.Elapsed.TotalMilliseconds -lt 1000) `
+            ('the operation took {0} ms after a 400 ms budget, so the fallback started its own' -f [int]$watch.Elapsed.TotalMilliseconds)
+    }
+    finally {
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Start-WacOwnedProcess' -Body $realStart
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'R06-2 two pipes held open in the managed path share ONE drain grant' {
+    # Handing the same duration to two waits spends it twice. The owned path was corrected for this;
+    # the fallback kept the old shape, so a tool whose stdout AND stderr were both held could take
+    # two full grants beyond its deadline - and the accounting believed it had given out one.
+    #
+    # The child keeps both pipes open by starting a grandchild that inherits them and outlives it, so
+    # the root can exit while EOF never arrives. Nothing here waits on a guess: the measurement is a
+    # ceiling, and the assertion is that one grant was spent rather than two.
+    $sandbox = New-TestSandbox -Prefix 'r06-drain'
+    $marker = Join-Path -Path $sandbox -ChildPath 'holder.pid'
+    $realStart = Get-ModuleFunctionBody -Module $script:CoreModule -Name 'Start-WacOwnedProcess'
+    try {
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Start-WacOwnedProcess' -Body { return $null }
+
+        $holder = @(
+            ('[System.IO.File]::WriteAllText("{0}", [string]$PID)' -f $marker)
+            'Start-Sleep -Seconds 25'
+        ) -join '; '
+        # -NoNewWindow is what makes the grandchild INHERIT this process's standard handles:
+        # without it Start-Process shell-executes and the grandchild gets its own, so both pipes
+        # reach EOF the moment the root exits and no drain is ever under pressure.
+        $root = @(
+            ('$c = Start-Process -FilePath "{0}" -NoNewWindow -ArgumentList ' -f $script:HostExe) +
+                ("'-NoProfile','-NonInteractive','-EncodedCommand','{0}' -PassThru" -f
+                    [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($holder)))
+            ('$d = [System.Diagnostics.Stopwatch]::StartNew()')
+            ('while (-not (Test-Path -LiteralPath "{0}") -and $d.Elapsed.TotalSeconds -lt 20) {{ Start-Sleep -Milliseconds 50 }}' -f $marker)
+            'exit 0'
+        ) -join '; '
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $run = Invoke-WacProcess -FilePath $script:HostExe -TimeoutMs 20000 -Component 'Test' `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand',
+                [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($root)))
+        $watch.Stop()
+
+        Assert-True (Test-Path -LiteralPath $marker -PathType Leaf) 'the grandchild never took the pipes, so this case never reached its own scenario'
+        Assert-False ([bool]$run.OutputComplete) 'both pipes reached EOF, so no drain grant was ever under pressure'
+
+        # ONE grant is 5 s. Two would be ten, and the root itself returns as soon as the marker is
+        # there - so the ceiling below separates the two shapes with room to spare for a slow runner.
+        Assert-True ([int]$watch.Elapsed.TotalMilliseconds -lt 9000) `
+            ('the call took {0} ms, which is two drain grants rather than one shared between the pipes' -f [int]$watch.Elapsed.TotalMilliseconds)
+    }
+    finally {
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Start-WacOwnedProcess' -Body $realStart
+        if (Test-Path -LiteralPath $marker -PathType Leaf) {
+            $held = 0
+            try { $held = [int]([System.IO.File]::ReadAllText($marker)).Trim() } catch { $held = 0 }
+            if ($held -gt 0) { Stop-Process -Id $held -Force -ErrorAction SilentlyContinue }
+        }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'R06-3 the termination floor is granted once for a call, not once per pass' {
+    # Stop-WacProcessTree makes up to three passes, and the floor that keeps a very short bound from
+    # turning "asked" into "gave up" was recomputed inside the loop. The cap made each wait small and
+    # nothing made their SUM small, so a caller's 200 ms bound could still be followed by three
+    # near-second waits - unaccounted, and once per tree.
+    #
+    # The tree here is real and deliberately outlives its bound: the root starts a child that sleeps,
+    # so pass one cannot clear it and the loop runs its full three.
+    $sandbox = New-TestSandbox -Prefix 'r06-floor'
+    $marker = Join-Path -Path $sandbox -ChildPath 'child.pid'
+    $root = $null
+    try {
+        $child = @(
+            ('[System.IO.File]::WriteAllText("{0}", [string]$PID)' -f $marker)
+            'Start-Sleep -Seconds 30'
+        ) -join '; '
+        $rootSource = @(
+            ('$c = Start-Process -FilePath "{0}" -WindowStyle Hidden -ArgumentList ' -f $script:HostExe) +
+                ("'-NoProfile','-NonInteractive','-EncodedCommand','{0}' -PassThru" -f
+                    [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child)))
+            'Start-Sleep -Seconds 30'
+        ) -join '; '
+
+        $root = Start-Process -FilePath $script:HostExe -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-EncodedCommand',
+            [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($rootSource)))
+
+        $appeared = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $marker -PathType Leaf) -and $appeared.Elapsed.TotalSeconds -lt 20) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (Test-Path -LiteralPath $marker -PathType Leaf) 'the fixture tree never formed, so this case measures nothing'
+
+        $stopped = Stop-WacProcessTree -ProcessId $root.Id -TimeoutMs 1000
+
+        # THE GRANT, not the wall time, and that distinction is the whole case. A terminated process
+        # normally exits at once, so these waits are ceilings that go unspent - an overrun built out
+        # of ceilings is invisible to a stopwatch. One floor for a 1000 ms bound is 1000; the floor
+        # handed out again on each of three passes is three times that, and nothing in the elapsed
+        # time would ever show it.
+        Assert-True ([int]$stopped.GrantedWaitMs -le 1000) `
+            ('terminating a three-pass tree under a 1000 ms bound granted itself {0} ms of waiting, so the floor was handed out again on every pass' -f [int]$stopped.GrantedWaitMs)
+
+        # And the control: it really did grant something, so the assertion above is not satisfied by
+        # a call that never reached its wait at all.
+        Assert-True ([int]$stopped.GrantedWaitMs -gt 0) 'the termination never granted itself any wait, so this case measures nothing'
+    }
+    finally {
+        if (Test-Path -LiteralPath $marker -PathType Leaf) {
+            $held = 0
+            try { $held = [int]([System.IO.File]::ReadAllText($marker)).Trim() } catch { $held = 0 }
+            if ($held -gt 0) { Stop-Process -Id $held -Force -ErrorAction SilentlyContinue }
+        }
+        if ($root) { Stop-Process -Id $root.Id -Force -ErrorAction SilentlyContinue }
+        Remove-TestSandbox -Path $sandbox
     }
 }
 

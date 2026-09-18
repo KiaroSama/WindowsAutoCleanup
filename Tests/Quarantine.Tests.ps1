@@ -102,7 +102,10 @@ function Write-TestMarker {
         [Parameter(Mandatory = $true)][string]$ProgramData,
         [int]$ProcessId = $PID,
         [string]$ProcessCreated,
-        [string]$Text
+        [string]$Text,
+        # Omitted on purpose by default: that is a record from a build before the field existed, and
+        # what the resolver does with one of those is part of what these cases pin down.
+        [ValidateSet('InProcess', 'External')][string]$Kind
     )
 
     # Straight into the redirected control store, because that is where the shipped reader looks.
@@ -124,6 +127,9 @@ function Write-TestMarker {
         RaisedUtc = ((Get-Date).ToUniversalTime().ToString('o'))
         Count = 1
         Reason = 'planted by Quarantine.Tests.ps1'
+    }
+    if ($PSBoundParameters.ContainsKey('Kind')) {
+        Add-Member -InputObject $record -MemberType NoteProperty -Name 'OperationKind' -Value $Kind
     }
     [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $record -Depth 3), $script:Utf8)
     return $path
@@ -190,10 +196,16 @@ Test-Case 'clearing the in-memory latch cannot erase the machine uncertainty' {
     }
 }
 
-Test-Case 'a marker is retired only when the process that raised it is proven gone' {
-    # The other direction, and it has to be evidence rather than a clock: the id is the same, the
-    # creation time is not, so whatever owns that id now is a different process and the thread that
-    # was writing cannot exist. Without this the quarantine would be permanent after one bad run.
+Test-Case 'only IN-PROCESS work is retired by proving the host that reported it is gone' {
+    # The host's death proves one thing: no thread of that process survived it. That is the whole
+    # argument for retiring a record, and it holds for an in-process block and for nothing else
+    # (ledger WAC-05R). An external tool, a service-dispatched operation or an unowned descendant
+    # outlives the process that launched it, so retiring THEIR record on the launcher's death is
+    # proving the wrong thing - and it was the one path that could clear the machine while the work
+    # it was worried about carried on.
+    #
+    # The evidence is an identity, never a clock: the id is the same, the creation time is not, so
+    # whatever owns that id now is a different process.
     $sandbox = New-TestSandbox -Prefix 'quarantine-retire'
     $saved = [string]$env:ProgramData
     try {
@@ -201,12 +213,28 @@ Test-Case 'a marker is retired only when the process that raised it is proven go
         Reset-WacAbandonedMutator
 
         $live = [long](Get-LiveCreated)
-        [void](Write-TestMarker -ProgramData $sandbox -ProcessId $PID -ProcessCreated ([string]($live + 1)))
+        [void](Write-TestMarker -ProgramData $sandbox -ProcessId $PID -ProcessCreated ([string]($live + 1)) -Kind 'InProcess')
 
         $resolved = Resolve-WacQuarantine
-        Assert-Equal 'Retired' ([string]$resolved.State) ('a finished abandonment was not retired: ' + [string]$resolved.Reason)
+        Assert-Equal 'Retired' ([string]$resolved.State) ('a finished in-process abandonment was not retired: ' + [string]$resolved.Reason)
         Assert-True (Test-WacMutationAllowed) 'a retired quarantine still refused every mutation'
         Assert-Equal 'Absent' ([string](Read-WacControlFile -Name (Get-WacQuarantineMarkerName)).State) 'a retired marker was left in the store'
+
+        # THE HALF THAT WAS MISSING. The same proof against EXTERNAL work settles nothing, and a
+        # record from a build before the field existed reads as external because that is the answer
+        # that keeps it.
+        foreach ($planted in @(@{ Kind = 'External' }, @{})) {
+            Reset-WacAbandonedMutator
+            [void](Write-TestMarker -ProgramData $sandbox -ProcessId $PID -ProcessCreated ([string]($live + 1)) @planted)
+
+            $external = Resolve-WacQuarantine
+            $label = if ($planted.ContainsKey('Kind')) { 'an external' } else { 'a legacy' }
+            Assert-Equal 'Quarantined' ([string]$external.State) `
+                ('{0} abandonment was retired because the process that REPORTED it had died: {1}' -f $label, [string]$external.Reason)
+            Assert-False (Test-WacMutationAllowed) ('{0} abandonment left the run free to mutate' -f $label)
+            Assert-True (([string](Read-WacControlFile -Name (Get-WacQuarantineMarkerName)).State) -cne 'Absent') `
+                ('{0} record was deleted, so the next run will not learn about it' -f $label)
+        }
     }
     finally {
         Reset-WacAbandonedMutator
