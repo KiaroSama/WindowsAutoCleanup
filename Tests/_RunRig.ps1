@@ -144,6 +144,20 @@ Set-WacDirectoryTrustJudge -ScriptBlock {
     }
 }
 
+# THE CONTROL STORE, inside this run's own sandbox (ledger WAC-05R). Its shipped root is under
+# %SystemRoot%, which no redirected environment variable moves - and on an ELEVATED runner that
+# directory is writable, so the quarantined scenarios below armed a REAL durable marker on the
+# machine. An external abandonment is never retired by a later run, so that single marker refused
+# every rig run for the rest of the job, and the failures landed in whatever suite happened to come
+# next. None of it showed on an unelevated developer shell, where the same write simply failed.
+#
+# A parent suite's Set-WacControlRoot is in-process and cannot reach a child, so the child sets its
+# own. The descriptor judge above is what makes a store under a user-writable %ProgramData%
+# answerable at all.
+$script:RigControlRoot = Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\Control'
+[void][System.IO.Directory]::CreateDirectory($script:RigControlRoot)
+Set-WacControlRoot -Path $script:RigControlRoot
+
 function Initialize-WacRun {
     [CmdletBinding()]
     param(
@@ -164,10 +178,10 @@ function Initialize-WacRun {
     # Test-WacDeadlineExpired stay the shipped functions reading the shipped variables.
     if ($plan.logDegraded) { Set-WacLogDegraded -Reason 'test shim: a log write failed' }
 
-    # AFTER the real Initialize-WacRun, which is what resolves the durable record. Arming the latch
-    # here is how an orchestration case gets a quarantined run without needing a control store the
-    # child could never create: what those cases are about is whether the STEP SEQUENCE reads the
-    # latch, and QuarantineStore.Tests.ps1 is where the record itself is proven.
+    # AFTER the real Initialize-WacRun, which is what resolves the durable record. What these cases
+    # are about is whether the STEP SEQUENCE reads the latch; QuarantineStore.Tests.ps1 is where the
+    # record itself is proven. The marker this writes lands in the sandbox store above, so arming it
+    # costs the machine nothing and the next scenario starts from an empty store.
     if ($plan.quarantined) { [void](Add-WacAbandonedMutator -Reason 'test shim: an abandoned mutator') }
     if ($plan.deadlineExpired) { $script:DeadlineUtc = (Get-Date).ToUniversalTime().AddMinutes(-1) }
     if (-not $plan.stateEvaluated) { $script:StateTrust = $null }
