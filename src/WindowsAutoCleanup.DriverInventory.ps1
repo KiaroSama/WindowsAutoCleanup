@@ -328,13 +328,8 @@ function Test-WacDriverPackageRemoved {
     #
     # Unknown is the truthful answer. Arming the latch is the second half: a pnputil that cannot be
     # proven finished may still be writing to the store the caller is about to delete from next.
-    # OUTPUT, not the tree. This function's entire job is to read an answer out of these bytes, so
-    # the question it must ask is whether all of them arrived - and that is what distinguishes a
-    # package genuinely gone from the store from a package missing off the end of a truncated read.
-    # Asking for a proven TREE instead would refuse every confirmation on a machine without job
-    # ownership, which is a different tool's problem being charged to this one.
     $settled = Test-WacToolLifetimeSettled -Run $enum
-    if (-not $settled.OutputTrustworthy) {
+    if (-not $settled.Settled) {
         [void](Add-WacAbandonedMutator -Reason ('a confirming driver enumeration could not be proven finished: {0}' -f $settled.Reason))
         $result.Reason = 'the confirming enumeration could not be proven finished: {0}' -f $settled.Reason
         return $result

@@ -38,10 +38,6 @@ function Get-WacDeploymentRecoveryPathState {
         dangling link and for a probe the filesystem refused, and the recovery path used to read
         every one of those as "there is no recovery slot" - and then delete the swap record that was
         the only evidence a transaction had been in flight.
-
-        Absent therefore needs positive evidence of a missing object: the shared inspection listed
-        the parent and this name was not in it, or the parent is proven not to exist. A parent that
-        could not be read is not one of them.
     .OUTPUTS
         State and Reason.
     #>
@@ -65,24 +61,12 @@ function Get-WacDeploymentRecoveryPathState {
             return $result
         }
 
-        # Neither a directory nor a file BY ITS OWN TYPE PROBE, which is not the same as no slot
-        # being there. Get-WacPathPresence is the only thing here allowed to turn that into
-        # absence: it classifies by the exception a single enumeration of the parent THROWS, so a
-        # container that could not be listed answers for none of the names in it, and it READS
-        # that enumeration's result, so a name the filesystem does list under a shape neither
-        # probe above reports is something standing there rather than nothing.
-        #
-        # The result used to be discarded with [void] and the fall-through said Absent regardless.
-        # An absence here is what lets the recovery copy of an earlier deployment be reclaimed.
-        $presence = [string](Get-WacPathPresence -Path $Path)
-        if ($presence -ceq 'Present') {
-            $result.Reason = 'something this build cannot identify stands where the recovery slot should be'
-            return $result
-        }
-        if ($presence -cne 'Absent') {
+        $parent = [System.IO.Path]::GetDirectoryName($Path)
+        if ([string]::IsNullOrWhiteSpace($parent) -or -not [System.IO.Directory]::Exists($parent)) {
             $result.Reason = 'the directory the recovery slot would live in could not be read'
             return $result
         }
+        [void][System.IO.Directory]::GetFileSystemEntries($parent, [System.IO.Path]::GetFileName($Path))
     }
     catch {
         $result.Reason = ('the recovery slot path could not be inspected: {0}' -f $_.Exception.Message)

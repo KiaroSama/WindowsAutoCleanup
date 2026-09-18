@@ -132,33 +132,14 @@ $script:RecordingInvoker = {
         Started        = (-not $timedOut)
     }
 
-    # THE LIFETIME FACTS ARE ALWAYS STATED (ledger WAC-05R). They used to be attached only when a
-    # case asked, because the production reader treated a missing property as settled. That reading
-    # is gone: a result that states nothing now has an UNKNOWN lifetime, which is the honest answer
-    # and makes a silent double indistinguishable from a runner that failed to report. So the double
-    # answers by default - a stopped tool, all of its output, an empty job - and a case that wants
-    # any other shape overrides exactly that fact.
-    # A TIMEOUT IS NOT AN UNPROVEN STOP. The real runner terminates the owned tree when its deadline
-    # expires and the job then answers for it, so a timed-out run is normally proven stopped with an
-    # empty tree - it simply did not finish its work. A case that wants the harder shape, a deadline
-    # whose tree could NOT be proven gone, asks for it.
-    $fact = @{
-        TerminationProven = $true
-        OutputComplete    = $true
-        Owned             = $true
-        OwnedTreeState    = 'Complete'
-    }
-    foreach ($name in @($fact.Keys)) {
-        $value = $fact[$name]
-        if ($canned.ContainsKey($name)) { $value = $canned[$name] }
-        Add-Member -InputObject $result -MemberType NoteProperty -Name $name -Value $value
-    }
-
-    # A tool nobody could prove stopped has, by construction, a tree nobody could read either -
-    # unless the case said otherwise. Without this a fixture could ask for one without the other and
-    # accidentally describe a state the real runner never produces.
-    if (-not [bool]$result.TerminationProven -and -not $canned.ContainsKey('OwnedTreeState')) {
-        $result.OwnedTreeState = 'Unknown'
+    # The LIFETIME facts - whether the tool was proven stopped, whether anything it started is still
+    # alive, whether its output all arrived - are attached only when a case asks for one. A result
+    # that does not carry a fact cannot contradict one, and the production reader treats a missing
+    # property as settled, so every suite written before these existed keeps its meaning.
+    foreach ($fact in @('TerminationProven', 'OwnedTreeState', 'OutputComplete')) {
+        if ($canned.ContainsKey($fact)) {
+            Add-Member -InputObject $result -MemberType NoteProperty -Name $fact -Value $canned[$fact]
+        }
     }
 
     return $result

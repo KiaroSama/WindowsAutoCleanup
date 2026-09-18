@@ -95,16 +95,9 @@ function Invoke-WacPnpCleanHandler {
     if ($run.TimedOut) {
         # Killed on its deadline. It may have removed packages and it may not have, and nothing here
         # can tell which - that is precisely what Incomplete means.
-        #
-        # It goes through the finalizer for the same reason its DISM twin does (ledger WAC-05R):
-        # reporting Incomplete is not the same act as refusing to start the next mutator, and this
-        # path used to do only the first. pnpclean hands its work to the PnP subsystem, so a timeout
-        # here is the case where something of ours is most likely still touching the driver store.
-        $timedOut = Resolve-WacSettledOutcome -Outcome 'Incomplete' -Run $run `
-            -Detail ('pnpclean exceeded its {0} ms deadline and its process tree was terminated.' -f $timeoutMs)
         return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
-            -Outcome ([string]$timedOut.Outcome) -Attempted $true -DurationMs ([int]$run.DurationMs) `
-            -Detail ([string]$timedOut.Detail)))
+            -Outcome 'Incomplete' -Attempted $true -DurationMs ([int]$run.DurationMs) `
+            -Detail ('pnpclean exceeded its {0} ms deadline and its process tree was terminated.' -f $timeoutMs)))
     }
 
     $detail = 'rundll32.exe exited with {0}.' -f $run.ExitCode

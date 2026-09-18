@@ -149,10 +149,8 @@ function Get-WacJournalPathState {
         because it believed no transaction was open.
 
         Proven absence is narrow on purpose: the name must not exist as a file OR as a directory,
-        and the shared inspection must then agree that the parent does not list it - either because
-        it listed the parent and the name was not in it, or because the parent itself is proven not
-        to exist, which is the one error that IS an answer. A parent that merely could not be read
-        has proven nothing about what is in it.
+        and the parent directory must be readable, because a probe that cannot see the parent has
+        not proven anything about what is in it.
     .OUTPUTS
         State (File, Absent or Unreadable) and Reason.
     #>
@@ -176,25 +174,14 @@ function Get-WacJournalPathState {
             return $result
         }
 
-        # Neither a file nor a directory BY ITS OWN TYPE PROBE, which is not the same as nothing
-        # being there. Get-WacPathPresence is what may turn it into absence, and it is the only
-        # thing here allowed to: it classifies by the exception a single enumeration of the parent
-        # THROWS, so a container that could not be listed answers for none of the names in it, and
-        # it READS that enumeration's result, so a name the filesystem does list under a shape
-        # neither probe above reports is something standing there rather than nothing.
-        #
-        # The result used to be discarded with [void] and the fall-through said Absent regardless,
-        # which made the enumeration a gesture: the one piece of positive evidence it collects was
-        # thrown away, and the answer it was collected for was given anyway.
-        $presence = [string](Get-WacPathPresence -Path $Path)
-        if ($presence -ceq 'Present') {
-            $result.Reason = 'something this build cannot identify stands where the transaction record should be'
-            return $result
-        }
-        if ($presence -cne 'Absent') {
+        # Neither a file nor a directory. That is absence only if the place it would be in can
+        # actually be read; an unreadable parent makes every name in it answer "not there".
+        $parent = [System.IO.Path]::GetDirectoryName($Path)
+        if ([string]::IsNullOrWhiteSpace($parent) -or -not [System.IO.Directory]::Exists($parent)) {
             $result.Reason = 'the directory the transaction record would live in could not be read'
             return $result
         }
+        [void][System.IO.Directory]::GetFileSystemEntries($parent, [System.IO.Path]::GetFileName($Path))
     }
     catch {
         $result.Reason = ('the transaction record path could not be inspected: {0}' -f $_.Exception.Message)

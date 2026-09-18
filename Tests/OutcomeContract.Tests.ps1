@@ -211,36 +211,16 @@ Test-Case 'a result that says nothing is not a settled one' {
         Assert-False ((Test-WacToolLifetimeSettled -Run $unknown).Settled) `
             'an owned launch whose tree could not be read was treated as a finished tool'
 
-        # THE EXEMPTION THAT USED TO LIVE HERE IS GONE, and this case now asserts why (ledger
-        # WAC-05R). An UNOWNED launch has no job to ask, so it called its pipe reaching EOF an
-        # independent witness for a finished tree. It is not one: a pipe reaches EOF when every
-        # WRITE HANDLE closes, and a descendant that closes or redirects its own standard handles
-        # keeps running with the pipe already at EOF. EOF is a fact about handles.
+        # The documented exception, and the reason it is one: an UNOWNED launch has no job to ask,
+        # so Unknown is the only tree answer it can ever give, and its pipe reaching EOF is the
+        # independent witness that stands in for one. Refusing that would refuse every unowned tool.
         $unowned = [PSCustomObject]@{
             ExitCode = 0; TimedOut = $false; Started = $true
             TerminationProven = $true; OutputComplete = $true
             Owned = $false; OwnedTreeState = 'Unknown'
         }
-        $verdict = Test-WacToolLifetimeSettled -Run $unowned
-        Assert-False $verdict.Settled `
-            'pipe EOF was accepted as proof of a finished tree, so a descendant that closed its handles reads as gone'
-
-        # What it DOES establish, which is what keeps the repair from becoming fail-shut: the bytes
-        # all arrived. A reader may believe its answer on that; nothing may delete on it.
-        Assert-True $verdict.OutputTrustworthy `
-            'a complete read was thrown away with the tree claim, which would refuse every managed fallback'
-
-        # And the consequence, which is the half that matters: the same result quarantines a MUTATOR
-        # and lets a READER report. Asserting the flag alone would not notice if nothing consulted it.
-        Reset-WacAbandonedMutator
-        [void](Resolve-WacSettledOutcome -Outcome 'Succeeded' -Detail 'read' -Run $unowned -Kind 'ReadOnly')
-        Assert-True (Test-WacMutationAllowed) 'a tool that changed nothing stopped the run'
-
-        Reset-WacAbandonedMutator
-        $mutating = Resolve-WacSettledOutcome -Outcome 'Succeeded' -Detail 'wrote' -Run $unowned -Kind 'Mutating'
-        Assert-Equal 'Incomplete' ([string]$mutating.Outcome) 'an unprovable mutator still reported success'
-        Assert-False (Test-WacMutationAllowed) `
-            'an unprovable mutator left the run free to start the next one on top of it'
+        Assert-True ((Test-WacToolLifetimeSettled -Run $unowned).Settled) `
+            'an unowned tool whose output completed was refused, which would refuse every managed fallback'
     }
     finally { Reset-WacAbandonedMutator }
 }
