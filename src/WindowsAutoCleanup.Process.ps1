@@ -354,29 +354,7 @@ function Invoke-WacProcess {
         }
     }
 
-    # THE FALLBACK IS PART OF THE SAME OPERATION (ledger WAC-06R). It used to start a fresh
-    # stopwatch and hand the root the ORIGINAL -TimeoutMs, so every millisecond the native launcher
-    # spent before declining was free: the operation as a whole overran by exactly the time it took
-    # to discover that it could not own the tool.
-    #
-    # And the budget is rechecked HERE, not merely subtracted. A setup that consumed everything must
-    # not be followed by creating a process anyway - a spent budget is a reason not to start a tool,
-    # which is the same rule the owned path applies before it resumes one.
-    $fallbackBudgetMs = [int]$ownedBudgetMs
-    if ($fallbackBudgetMs -le 0) {
-        Write-WacLog -Level WARNING -Component $Component -Message 'The run budget was spent before the fallback could start the tool, so nothing was started.' -Data @{
-            tool = $FilePath; timeoutMs = $TimeoutMs
-        }
-        return [PSCustomObject]@{
-            ExitCode = $null; TimedOut = $true; StandardOutput = ''; StandardError = ''
-            DurationMs = 0; Started = $false; TerminationProven = $true; OutputComplete = $true
-            Owned = $false; OwnedTreeState = 'Complete'
-        }
-    }
-
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    # Every later phase asks this one monotonic clock what is left, exactly as the owned path does.
-    $remaining = { [int][Math]::Max(0, $fallbackBudgetMs - $stopwatch.Elapsed.TotalMilliseconds) }
     $process = $null
     # Set once, immediately after a successful Start, and never cleared. The catch below reads it to
     # tell "never ran" apart from "ran, and we lost track of it"; those need opposite answers and the
@@ -396,8 +374,7 @@ function Invoke-WacProcess {
         $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 
         Write-WacLog -Level DEBUG -Component $Component -Message 'Starting external tool.' -Data @{
-            tool = $FilePath; args = $psi.Arguments; timeoutMs = $fallbackBudgetMs
-            setupMs = ([int]$TimeoutMs - $fallbackBudgetMs)
+            tool = $FilePath; args = $psi.Arguments; timeoutMs = $TimeoutMs
         }
 
         $process = [System.Diagnostics.Process]::Start($psi)
@@ -413,16 +390,13 @@ function Invoke-WacProcess {
         $outTask = $process.StandardOutput.ReadToEndAsync()
         $errTask = $process.StandardError.ReadToEndAsync()
 
-        # Reclamped immediately before the wait: building the start info and acquiring the two async
-        # reads above is cheap but not free, and a phase that starts from the ORIGINAL number has
-        # already overrun by whatever preceded it.
-        $exited = $process.WaitForExit((& $remaining))
+        $exited = $process.WaitForExit($TimeoutMs)
         $timedOut = -not $exited
 
         $terminationProven = $true
         if ($timedOut) {
             Write-WacLog -Level WARNING -Component $Component -Message 'External tool exceeded its deadline; terminating the process tree.' -Data @{
-                tool = $FilePath; pid = $process.Id; timeoutMs = $fallbackBudgetMs
+                tool = $FilePath; pid = $process.Id; timeoutMs = $TimeoutMs
             }
 
             # The stop result used to be discarded, which made "we asked taskkill to kill it" and
@@ -430,15 +404,7 @@ function Invoke-WacProcess {
             # started and could not prove it stopped is a mutator that may still be writing while
             # the run reports its verdict, so it is recorded and written at CRITICAL - the one level
             # -LogLevel cannot gate out.
-            # ONE allowance for the whole teardown, turned into a deadline (ledger WAC-06R). The
-            # kill and the wait that confirms it used to take a separate 10 s grant each, so a single
-            # teardown could claim twice what the accounting thought it had - and Request-WacWaitMs
-            # CLAIMS what it grants, so the second call was spending a reserve the first had already
-            # been given.
-            $teardownGrantMs = Request-WacWaitMs -RequestedMs 10000
-            $teardownWatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-            $stopped = Stop-WacProcessTree -ProcessId $process.Id -TimeoutMs $teardownGrantMs
+            $stopped = Stop-WacProcessTree -ProcessId $process.Id -TimeoutMs (Request-WacWaitMs -RequestedMs 10000)
             $terminationProven = [bool]$stopped.Proven
             if (-not $terminationProven) {
                 Write-WacLog -Level CRITICAL -Component $Component -Message 'The external tool could not be proven terminated; part of its process tree may still be running.' -Data @{
@@ -448,7 +414,7 @@ function Invoke-WacProcess {
                 }
             }
 
-            [void]$process.WaitForExit([int][Math]::Max(0, $teardownGrantMs - $teardownWatch.Elapsed.TotalMilliseconds))
+            [void]$process.WaitForExit((Request-WacWaitMs -RequestedMs 10000))
         }
 
         # Two FIXED 5-second waits used to sit entirely outside the run budget, so every tool could
@@ -458,14 +424,10 @@ function Invoke-WacProcess {
         # tool. Request-WacWaitMs is the whole rule - the budget while it lasts, then the one
         # recovery reserve, then nothing - so the floor is gone and a drain nobody can pay for is
         # reported as an incomplete read instead of quietly taken.
-        # ONE grant for BOTH pipes, turned into a deadline. Handing the same duration to two waits
-        # spends it twice: two held pipes could take 2 x the allowance the accounting believed it had
-        # given out. The owned path was corrected for exactly this; the fallback kept the old shape.
-        $readBudgetMs = Request-WacWaitMs -RequestedMs ([Math]::Min(5000, [Math]::Max(0, (& $remaining))))
-        $readWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $readBudgetMs = Request-WacWaitMs -RequestedMs 5000
 
-        [void]$outTask.Wait([int][Math]::Max(0, $readBudgetMs - $readWatch.Elapsed.TotalMilliseconds))
-        [void]$errTask.Wait([int][Math]::Max(0, $readBudgetMs - $readWatch.Elapsed.TotalMilliseconds))
+        [void]$outTask.Wait($readBudgetMs)
+        [void]$errTask.Wait($readBudgetMs)
 
         # A pipe reaches EOF only once EVERY write handle on it is closed. So a read that is still
         # outstanding after the root has exited is not a slow reader - it is positive evidence that
@@ -539,10 +501,7 @@ function Invoke-WacProcess {
         $terminationProven = $false
         $survivors = ''
         try {
-            # WITH AN ALLOWANCE, like every other teardown (ledger WAC-06R). This one asked for the
-            # function's own default and so spent time nothing had granted - the single call in the
-            # whole dispatcher that stood outside the accounting it belongs to.
-            $stopped = Stop-WacProcessTree -ProcessId $processId -TimeoutMs (Request-WacWaitMs -RequestedMs 10000)
+            $stopped = Stop-WacProcessTree -ProcessId $processId
             $terminationProven = [bool]$stopped.Proven
             $survivors = (@($stopped.Survivor) -join ',')
         }

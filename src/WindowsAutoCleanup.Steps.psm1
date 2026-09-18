@@ -98,16 +98,8 @@ function Invoke-WacComponentCleanup {
     $run = Invoke-WacProcess -FilePath $dism -ArgumentList $arguments -TimeoutMs $timeoutMs -Component $component
 
     if ($run.TimedOut) {
-        # THROUGH THE FINALIZER, not around it (ledger WAC-05R). This was the one exit that skipped
-        # the completion check, and it is the state most likely to need it: a tool killed on its
-        # deadline is exactly the tool whose descendants outlive it. The step reported Incomplete,
-        # which told the FOOTER something was unfinished - while the latch stayed down and the next
-        # guarded mutator started on top of a DISM that may still have been servicing the image.
-        $timedOut = Resolve-WacSettledOutcome -Outcome 'Incomplete' -Run $run `
-            -Detail ('DISM exceeded its {0} ms deadline and its process tree was terminated.' -f $timeoutMs)
-        return (Write-WacStepResult -Component $component -Result (New-WacStepResult -Category $category `
-            -Outcome ([string]$timedOut.Outcome) -Attempted $true -DurationMs ([int]$run.DurationMs) `
-            -Detail ([string]$timedOut.Detail)))
+        return (Write-WacStepResult -Component $component -Result (New-WacStepResult -Category $category -Outcome 'Incomplete' -Attempted $true -DurationMs ([int]$run.DurationMs) `
+            -Detail ('DISM exceeded its {0} ms deadline and its process tree was terminated.' -f $timeoutMs)))
     }
 
     $exitCode = $run.ExitCode
