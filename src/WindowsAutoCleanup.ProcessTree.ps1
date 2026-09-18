@@ -241,23 +241,16 @@ function New-WacTerminationResult {
         [Parameter(Mandatory = $true)][string]$Reason,
         [AllowEmptyCollection()][int[]]$Bound = @(),
         [AllowEmptyCollection()][int[]]$Survivor = @(),
-        $TaskkillExit = $null,
-        # How much waiting this call granted ITSELF across all of its passes, which is a different
-        # number from how long it actually took: a terminated process usually exits at once, so the
-        # grant is a ceiling that normally goes unspent. That is exactly why it needs reporting -
-        # an overrun built out of ceilings nobody spends is invisible in a wall-clock measurement,
-        # and the floor being handed out again on every pass was precisely that (ledger WAC-06R).
-        [int]$GrantedWaitMs = 0
+        $TaskkillExit = $null
     )
 
     return [PSCustomObject]@{
-        Root           = $Root
-        Proven         = $Proven
-        Bound          = [int[]]$Bound
-        Survivor       = [int[]]$Survivor
-        TaskkillExit   = $TaskkillExit
-        GrantedWaitMs  = [int]$GrantedWaitMs
-        Reason         = $Reason
+        Root         = $Root
+        Proven       = $Proven
+        Bound        = [int[]]$Bound
+        Survivor     = [int[]]$Survivor
+        TaskkillExit = $TaskkillExit
+        Reason       = $Reason
     }
 }
 
@@ -381,23 +374,13 @@ function Stop-WacProcessTree {
 
         # Never hand the root to taskkill /T: its independent PID walk bypasses our identity proof.
         # TaskkillExit stays null in the compatibility result; termination uses only bound handles.
-        # A STOPWATCH, not the civil clock (ledger WAC-06R). This is the bound that decides how long
-        # a termination may take, and a wall clock moved backwards by an NTP or DST correction
-        # stretches it by however far it jumped - inside the one wait whose whole purpose is to end.
-        $watch = [System.Diagnostics.Stopwatch]::StartNew()
-        $remaining = { [int][Math]::Max(0, $TimeoutMs - $watch.Elapsed.TotalMilliseconds) }
-
-        # The floor below is granted ONCE for the whole call. It used to be recomputed every pass, so
-        # a caller's bound of 200 ms could still be followed by three separate near-second waits: the
-        # cap made each one small, and nothing made their SUM small.
+        $waitDeadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
 
         # Terminate validated identities at once rather than waiting out the caller's bound first.
         #
         # Three passes: every pass after the first exists only for a process that appeared DURING
         # the kill, and a tree still spawning after three is not settling - the caller needs an
         # answer more than it needs another round.
-        $floorGranted = $false
-        $grantedWaitMs = 0
         for ($pass = 1; $pass -le 3; $pass++) {
             $null = $pass
             $pending = @($bound | Where-Object { [WacNative]::WaitForProcessExit($_.Handle, 0) -ne 0 })
@@ -414,23 +397,11 @@ function Stop-WacProcessTree {
             # The floor is itself capped by $TimeoutMs, which the caller claimed from the run budget
             # or the recovery reserve. Without that cap a bound of 200 ms still waited a full second
             # here - a small overrun, but an unaccounted one, and per tree (ledger WAC-06R).
-            $left = (& $remaining)
-            $grantMs = [int][Math]::Min(5000, $left)
-            if (-not $floorGranted) {
-                # The floor keeps a caller's very short bound from turning "asked" into "gave up",
-                # and it is itself capped by $TimeoutMs, which the caller claimed from the run budget
-                # or the recovery reserve. Once, because a per-pass floor is a per-pass overrun.
-                $grantMs = [int][Math]::Min(5000, [Math]::Max([Math]::Min(1000, $TimeoutMs), $left))
-                $floorGranted = $true
-            }
-
-            $grantedWaitMs += $grantMs
-
-            # ONE grant for the whole pass, turned into a deadline: handing the same duration to each
-            # pending identity in turn would spend it once per process.
-            $killWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            $floor = [int][Math]::Min(1000, $TimeoutMs)
+            $left = [int][Math]::Max(0, ($waitDeadline - [datetime]::UtcNow).TotalMilliseconds)
+            $killDeadline = [datetime]::UtcNow.AddMilliseconds([Math]::Min(5000, [Math]::Max($floor, $left)))
             foreach ($entry in $pending) {
-                $wait = [int][Math]::Max(0, $grantMs - $killWatch.Elapsed.TotalMilliseconds)
+                $wait = [int][Math]::Max(0, ($killDeadline - [datetime]::UtcNow).TotalMilliseconds)
                 [void][WacNative]::WaitForProcessExit($entry.Handle, $wait)
             }
 
@@ -466,7 +437,7 @@ function Stop-WacProcessTree {
             }
         }
 
-        return (New-WacTerminationResult -Root $ProcessId -Proven $proven -Reason $reason -GrantedWaitMs $grantedWaitMs `
+        return (New-WacTerminationResult -Root $ProcessId -Proven $proven -Reason $reason `
                 -Bound @(@($bound | ForEach-Object { [int]$_.Id })) -Survivor @($survivor.ToArray()) `
                 -TaskkillExit $taskkillExit)
     }

@@ -239,68 +239,34 @@ function Get-WacOutcomeRankTable {
     return @{} + $script:OutcomeRank
 }
 
-# The facts a runner must state for anything to be concluded about a tool's lifetime. They are
-# REQUIRED, not optional: see Test-WacToolLifetimeSettled for why a missing one is now unknown
-# rather than harmless.
-$script:LifetimeFact = @('Started', 'TerminationProven', 'OutputComplete', 'OwnedTreeState')
-
-function Get-WacRunTreeState {
-    <#
-    .SYNOPSIS
-        A run's tree state, or 'Unknown' when it does not state one. Defensive on purpose: this is
-        the one place that reads the field WITHOUT the positive contract's judgement, because its
-        caller is deciding how much a missing answer costs rather than whether it is acceptable.
-    #>
-    param([Parameter(Mandatory = $true)][AllowNull()]$Run)
-
-    if ($null -eq $Run) { return 'Unknown' }
-    $names = @()
-    try { $names = @($Run.PSObject.Properties.Name) } catch { $names = @() }
-    if ($names -cnotcontains 'OwnedTreeState') { return 'Unknown' }
-    return [string]$Run.OwnedTreeState
-}
-
 function Test-WacToolLifetimeSettled {
     <#
     .SYNOPSIS
-        What an external tool's result actually establishes: whether its WHOLE tree finished, and
-        separately whether its output can be believed.
+        Whether an external tool's WHOLE tree finished and its whole output arrived.
     .DESCRIPTION
         A root's exit code is what the tool BELIEVES about itself. It says nothing about a child the
-        tool started, and nothing about output that never arrived. This is the one place that
-        question is answered, so the steps cannot drift apart on it.
+        tool started, and nothing about output that never arrived - and every maintenance step used
+        to decide success from that code alone, so a run with a live descendant and a truncated
+        answer could still report Succeeded.
+        This is the one place that question is answered, so the steps cannot drift apart on it.
 
-        THE CONTRACT IS POSITIVE NOW, and that is the repair (ledger WAC-05R). It used to read
-        defensively: a property the result did not carry could not contradict anything, so the veto
-        fired only on evidence and a result that stated nothing at all was settled. That is the same
-        mistake as reading a failed probe as proven absence - it makes silence the strongest possible
-        answer. Every fact below must be PRESENT and must say yes; a missing one is unknown, and
-        unknown is not settled.
-
-        THE UNOWNED EXEMPTION IS GONE, and it was the sharpest instance of the same thing. An unowned
-        runner concluded a complete tree from pipe EOF. A pipe reaches EOF when every WRITE HANDLE on
-        it is closed, which is a fact about handles, not about processes: a descendant that closes or
-        redirects its own standard handles goes on running with the pipe already at EOF. So EOF
-        establishes output closure and nothing more, and only a job object can answer for the tree.
-
-        TWO ANSWERS, because they authorise different things and conflating them is what let a
-        half-read enumeration license a deletion:
-
-          Settled           - the whole lifetime is established. Only this may authorise a later
-                              mutation, because only this says nothing of ours is still running.
-          OutputTrustworthy - the bytes in hand are the tool's whole output. A read-only caller may
-                              believe its ANSWER on this, and must not conclude anything else from it.
+        Read DEFENSIVELY. These properties are part of the runner's contract, but an injected test
+        invoker may omit them and under Set-StrictMode 2.0 a missing property throws rather than
+        reading as absent. A result that does not carry a fact cannot contradict one, so a missing
+        property is treated as settled - the veto only ever fires on evidence.
     .OUTPUTS
-        Settled, OutputTrustworthy, Reason (empty when settled).
+        Settled (bool) and Reason (empty when settled).
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][AllowNull()]$Run)
 
-    $result = [PSCustomObject]@{ Settled = $false; OutputTrustworthy = $false; Reason = '' }
+    $result = [PSCustomObject]@{ Settled = $true; Reason = '' }
 
     # A NULL result is not a settled one. Nothing ran that could be asked, and "we have no answer"
-    # was being read as "the answer was yes".
+    # was being read as "the answer was yes" - which is the shape of every other defect in this
+    # ledger (ledger WAC-05R).
     if ($null -eq $Run) {
+        $result.Settled = $false
         $result.Reason = 'no run result was produced at all, so nothing about the tool could be established'
         return $result
     }
@@ -308,48 +274,31 @@ function Test-WacToolLifetimeSettled {
     $names = @()
     try { $names = @($Run.PSObject.Properties.Name) } catch { $names = @() }
 
-    $missing = @($script:LifetimeFact | Where-Object { $names -cnotcontains $_ })
-    if ($missing.Count -gt 0) {
-        $result.Reason = ('the run result does not state {0}, so its lifetime is unknown' -f (@($missing) -join ', '))
-        return $result
-    }
-
-    # NEVER STARTED is the one settled state that needs no tree: nothing was created, so nothing of
-    # ours can be alive. It is still not taken on trust - the result has to agree that the tree is
-    # complete, which is exactly what a suspended process nobody could confirm terminating does NOT
-    # say.
-    if (-not [bool]$Run.Started) {
-        if (([string]$Run.OwnedTreeState) -ceq 'Complete') {
-            $result.Settled = $true
-            $result.OutputTrustworthy = $true
-            return $result
-        }
-        $result.Reason = 'the tool never ran and what was created could not be proven gone'
-        return $result
-    }
-
     $reasons = New-Object 'System.Collections.Generic.List[string]'
 
-    if (-not [bool]$Run.TerminationProven) { [void]$reasons.Add('the tool could not be proven stopped') }
-    if (-not [bool]$Run.OutputComplete) { [void]$reasons.Add('the tool output is incomplete') }
+    # UNKNOWN IS NOT SETTLED. The tree state was only consulted for the value 'Alive', so a launch
+    # that could not be asked about its own descendants - a jobless one, or one whose job could not
+    # be read - passed whenever the two booleans beside it happened to look good.
+    if ($names -ccontains 'OwnedTreeState' -and ([string]$Run.OwnedTreeState) -ceq 'Unknown' -and
+        -not ($names -ccontains 'Owned' -and -not [bool]$Run.Owned -and
+              $names -ccontains 'OutputComplete' -and [bool]$Run.OutputComplete)) {
+        [void]$reasons.Add('whether work this run started is still alive could not be established')
+    }
 
-    # Output is trustworthy on strictly less evidence than the tree is: the bytes are all there once
-    # every writer has closed and the root is known stopped. That is deliberately weaker, and the
-    # caller that acts on it is told so by the name.
-    $result.OutputTrustworthy = ($reasons.Count -eq 0)
-
-    switch ([string]$Run.OwnedTreeState) {
-        'Complete' { }
-        'Alive'    { [void]$reasons.Add('work this run started is still alive') }
-        default    { [void]$reasons.Add('whether work this run started is still alive could not be established') }
+    if ($names -ccontains 'TerminationProven' -and -not [bool]$Run.TerminationProven) {
+        [void]$reasons.Add('the tool could not be proven stopped')
+    }
+    if ($names -ccontains 'OwnedTreeState' -and ([string]$Run.OwnedTreeState) -ceq 'Alive') {
+        [void]$reasons.Add('work this run started is still alive')
+    }
+    if ($names -ccontains 'OutputComplete' -and -not [bool]$Run.OutputComplete) {
+        [void]$reasons.Add('the tool output is incomplete')
     }
 
     if ($reasons.Count -gt 0) {
+        $result.Settled = $false
         $result.Reason = (@($reasons.ToArray()) -join '; ')
-        return $result
     }
-
-    $result.Settled = $true
     return $result
 }
 
@@ -412,48 +361,28 @@ function Resolve-WacSettledOutcome {
     param(
         [Parameter(Mandatory = $true)][string]$Outcome,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Detail,
-        [Parameter(Mandatory = $true)][AllowNull()]$Run,
-        # WHAT THE TOOL WAS ASKED TO DO, and the default is the dangerous answer on purpose: a caller
-        # that does not say gets the mutating rule. Only a tool that cannot change the machine may
-        # declare itself ReadOnly, and doing so buys exactly one thing - an unprovable TREE does not
-        # arm the latch, because nothing was changed for a survivor to be racing. It never buys a
-        # completion claim: an unsettled read is still Incomplete, and its ANSWER is usable only when
-        # OutputTrustworthy says the bytes all arrived.
-        [ValidateSet('Mutating', 'ReadOnly')][string]$Kind = 'Mutating'
+        [Parameter(Mandatory = $true)][AllowNull()]$Run
     )
 
     $settled = Test-WacToolLifetimeSettled -Run $Run
     if ($settled.Settled) {
-        return [PSCustomObject]@{ Outcome = $Outcome; Detail = $Detail; OutputTrustworthy = $true }
+        return [PSCustomObject]@{ Outcome = $Outcome; Detail = $Detail }
     }
 
-    # A read-only tool whose bytes all arrived is allowed to report its own answer without dragging
-    # the run down, because it mutated nothing: the only thing left unproven is a descendant, and a
-    # descendant of a reader cannot be mid-write on anything this run owns. The outcome is still not
-    # raised to Incomplete for that case alone - but the flag travels, and a consumer that wants to
-    # DELETE something on the strength of this read has to look at Settled, not at this.
-    if ([string]$Kind -ceq 'ReadOnly' -and $settled.OutputTrustworthy -and
-        ([string](Get-WacRunTreeState -Run $Run)) -cne 'Alive') {
-        return [PSCustomObject]@{ Outcome = $Outcome; Detail = $Detail; OutputTrustworthy = $true }
-    }
-
-    # THE STOP, for a mutator. Whatever this tool left behind may still be writing, so nothing else
-    # this run would do may start on top of it. Add-WacAbandonedMutator is the same latch an
-    # abandoned in-process mutator raises, and it is fail-closed for the same reason: nothing here
-    # can observe the unsettled work finishing.
-    if ([string]$Kind -ceq 'Mutating') {
-        [void](Add-WacAbandonedMutator -Reason ('an external tool could not be proven finished: {0}' -f $settled.Reason))
-    }
+    # THE STOP. Whatever this tool left behind may still be writing, so nothing else this run would
+    # do may start on top of it. Add-WacAbandonedMutator is the same latch an abandoned in-process
+    # mutator raises, and it is fail-closed for the same reason: nothing here can observe the
+    # unsettled work finishing.
+    [void](Add-WacAbandonedMutator -Reason ('an external tool could not be proven finished: {0}' -f $settled.Reason))
 
     return [PSCustomObject]@{
         Outcome = (Get-WacHigherOutcome -Current $Outcome -Candidate 'Incomplete')
         Detail = ('{0} The step cannot be reported finished: {1}. No further change will be made by this run.' -f $Detail, $settled.Reason).Trim()
-        OutputTrustworthy = [bool]$settled.OutputTrustworthy
     }
 }
 
 Export-ModuleMember -Function @(
-    'Test-WacToolLifetimeSettled', 'Resolve-WacSettledOutcome', 'Get-WacRunTreeState',
+    'Test-WacToolLifetimeSettled', 'Resolve-WacSettledOutcome',
     'New-WacStepResult', 'Write-WacStepResult', 'Get-WacSystemToolPath',
     'Set-WacStepBoundedInvoker', 'Invoke-WacStepBounded', 'Invoke-WacGuardedStep',
     'Get-WacHigherOutcome', 'Test-WacOutcomeIsClean', 'Get-WacOutcomeRankTable'

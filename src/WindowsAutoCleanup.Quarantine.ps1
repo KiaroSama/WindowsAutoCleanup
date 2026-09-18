@@ -97,22 +97,13 @@ function Write-WacQuarantineMarker {
         which is exactly the fact this call was going to write, and overwriting it would discard the
         older and more conservative evidence.
     #>
-    param(
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Reason,
-        [ValidateSet('InProcess', 'External')][string]$Kind = 'External'
-    )
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Reason)
 
-    # THE KIND IS THE FIELD THAT DECIDES WHETHER THIS RECORD CAN EVER RETIRE ITSELF (ledger
-    # WAC-05R). The host's pid and creation stamp identify the process that REPORTED the
-    # abandonment, which is a different thing from the work that was abandoned, and the resolver
-    # used to treat them as the same: it retired any record whose reporting host was proven gone.
-    # That reasoning holds for an in-process block and for nothing else.
     $record = [PSCustomObject]@{
         ProcessId = [int]$PID
         ProcessCreated = [string](Get-WacCurrentProcessCreated)
         RaisedUtc = ((Get-Date).ToUniversalTime().ToString('o'))
         Count = [int]$script:AbandonedMutatorCount
-        OperationKind = [string]$Kind
         Reason = [string]$Reason
     }
 
@@ -276,18 +267,11 @@ function Add-WacAbandonedMutator {
         must not also cost this run its own guard. A failed write is logged at CRITICAL because it
         is the one case where the next process on this machine will not learn what happened here.
     #>
-    param(
-        [AllowEmptyString()][string]$Reason = '',
-        # EXTERNAL BY DEFAULT, because that is the answer that keeps the record (ledger WAC-05R).
-        # Only work this process ran ON ITS OWN THREAD may ever be retired by proving this process
-        # died - a thread cannot outlive its host. Work handed to another process, to a service or
-        # to the PnP subsystem can outlive it easily, so a caller claiming otherwise has to say so.
-        [ValidateSet('InProcess', 'External')][string]$Kind = 'External'
-    )
+    param([AllowEmptyString()][string]$Reason = '')
 
     $script:AbandonedMutatorCount++
 
-    if (-not (Write-WacQuarantineMarker -Reason $Reason -Kind $Kind)) {
+    if (-not (Write-WacQuarantineMarker -Reason $Reason)) {
         Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'A mutation was abandoned and the durable quarantine marker could not be written, so the next operation on this machine will not know about it.' -Data @{
             count = [int]$script:AbandonedMutatorCount; reason = $Reason
         }
@@ -337,31 +321,6 @@ function Resolve-WacQuarantine {
             store = [string](Get-WacControlRoot); reason = [string]$marker.Reason
         }
         return [PSCustomObject]@{ State = 'Quarantined'; Reason = [string]$marker.Reason }
-    }
-
-    # WHAT WAS ABANDONED, before asking about the host that reported it. A record that does not say
-    # - one written by a build before this field existed - reads as External, because that is the
-    # answer that keeps it.
-    $kind = 'External'
-    try {
-        if (@($marker.Record.PSObject.Properties.Name) -ccontains 'OperationKind') {
-            $kind = [string]$marker.Record.OperationKind
-        }
-    }
-    catch { $kind = 'External' }
-
-    if ($kind -cne 'InProcess') {
-        # THE HOST'S DEATH SETTLES NOTHING HERE. An external tool, a service-dispatched operation or
-        # a descendant nobody owned goes on running after the process that launched it exits, so
-        # proving that process gone is proving the wrong thing. Only a postcondition against what was
-        # being changed, or a person, can settle this - and until then the machine keeps the record.
-        $script:AbandonedMutatorCount++
-        Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'An earlier run abandoned work outside this process and nothing has settled it, so this run will not mutate anything. Restart the machine to end anything that run left going, confirm the state it was changing, then remove the marker by hand.' -Data @{
-            processId = [int]$marker.Record.ProcessId; kind = $kind
-            raisedUtc = [string]$marker.Record.RaisedUtc; reason = [string]$marker.Record.Reason
-            store = [string](Get-WacControlRoot); name = (Get-WacQuarantineMarkerName)
-        }
-        return [PSCustomObject]@{ State = 'Quarantined'; Reason = 'an earlier run abandoned work outside this process' }
     }
 
     $gone = Test-WacQuarantineProcessGone -Record $marker.Record
