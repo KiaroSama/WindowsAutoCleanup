@@ -122,7 +122,7 @@ function Use-TestControlStore {
     try { & $Body }
     finally {
         Set-WacDirectoryTrustJudge -ScriptBlock $null
-        Set-WacControlRoot -Path $null
+        Restore-SuiteControlStore
     }
 }
 
@@ -462,7 +462,7 @@ Test-Case 'A store that is genuinely absent stays absent, and a normal first rec
             Assert-Equal 'Absent' ([string](Test-WacControlStorePresence)) `
                 'a store that is genuinely not there was not reported absent'
         }
-        finally { Set-WacControlRoot -Path $null }
+        finally { Restore-SuiteControlStore }
 
         Invoke-WithProgramData -Path $fixture.ProgramData -Body {
             Assert-Equal 'Absent' ([string](Test-WacLegacyControlFile -Name $script:MarkerName)) `

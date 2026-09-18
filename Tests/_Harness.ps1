@@ -524,6 +524,40 @@ function Remove-TestSandbox {
     }
 }
 
+$script:WacSuiteControlRoot = $null
+
+function Use-SuiteControlStore {
+    <#
+    .SYNOPSIS
+        Gives this suite its own control store, once, before its first case runs.
+    .DESCRIPTION
+        The real store lives under %SystemRoot% and belongs to the MACHINE. A quarantine marker
+        written there outlives the run and refuses every later mutation, so ONE suite that arms the
+        quarantine without redirecting refuses every suite after it - and every later job on that
+        runner. Locally the write just fails, which is why such a leak was only ever visible in
+        elevated CI. Redirecting by default makes it unleakable rather than remembered.
+
+        Armed lazily: the harness is dot-sourced BEFORE the suite imports the module that exports
+        the seam. The sandbox is tracked, so Complete-TestRun disposes of it.
+    #>
+    if ($script:WacSuiteControlRoot) { return }
+    if (-not (Get-Command -Name 'Set-WacControlRoot' -ErrorAction SilentlyContinue)) { return }
+
+    $script:WacSuiteControlRoot = Join-Path -Path (New-TestSandbox -Prefix 'suite-control') -ChildPath 'Control'
+    Set-WacControlRoot -Path $script:WacSuiteControlRoot
+}
+
+function Restore-SuiteControlStore {
+    <#
+    .SYNOPSIS
+        Puts the control root back to THIS SUITE's store - what a fixture's finally actually wants.
+        Restoring to $null would hand the next case the machine's own store.
+    #>
+    if (Get-Command -Name 'Set-WacControlRoot' -ErrorAction SilentlyContinue) {
+        Set-WacControlRoot -Path $script:WacSuiteControlRoot
+    }
+}
+
 function Test-Case {
     <#
     .SYNOPSIS
@@ -533,6 +567,8 @@ function Test-Case {
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][scriptblock]$Body
     )
+
+    Use-SuiteControlStore
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $failure = $null
@@ -604,15 +640,16 @@ function Complete-TestRun {
 
     Remove-TestSandbox
 
-    # THE LEAK GUARD (ledger WAC-05R). A suite that arms the quarantine without redirecting the
-    # control store writes its marker under %SystemRoot%, where it belongs to the MACHINE - and a
-    # quarantine record stops every later mutation, so one leaky suite refuses every suite after it.
-    # CI proved how expensive and how confusing that is: the failures land in unrelated code, and it
-    # is invisible locally because an unelevated run cannot write there at all while the CI runner
-    # can. So the suite that does it is the suite that fails.
+    # THE LEAK GUARD (ledger WAC-05R). Use-SuiteControlStore should make this unreachable, so a hit
+    # here means something escaped it: a write before the first case, or a fixture that put the root
+    # back to $null instead of calling Restore-SuiteControlStore. It still fails the suite, because
+    # a marker under %SystemRoot% belongs to the MACHINE and a quarantine record stops every later
+    # mutation - one leaky suite refuses every suite after it, in this job and the next. CI proved
+    # how confusing that is: the failures land in unrelated code, and it is invisible locally
+    # because an unelevated run cannot write there at all while the CI runner can.
     $leaked = @(Get-MachineControlStoreEntry | Where-Object { $script:WacMachineStoreBaseline -cnotcontains $_ })
     if ($leaked.Count -gt 0) {
-        Write-Host ('FAIL  this suite wrote {0} entr(y/ies) into the MACHINE control store under %SystemRoot%: {1}. Redirect it with Set-WacControlRoot to a disposable sandbox, as _StepHarness.ps1 and _DriverFixtures.ps1 do, and remove it in the finally.' -f `
+        Write-Host ('FAIL  this suite wrote {0} entr(y/ies) into the MACHINE control store under %SystemRoot%: {1}. Every case already runs against a disposable store; a fixture that redirects further must call Restore-SuiteControlStore in its finally, never Set-WacControlRoot -Path $null.' -f `
                 $leaked.Count, (@($leaked) -join ', '))
         exit 1
     }

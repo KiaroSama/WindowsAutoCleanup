@@ -205,15 +205,9 @@ function Invoke-WithStubbedTool {
     # refuse every later case for the PREVIOUS case's reason.
     Reset-WacAbandonedMutator
 
-    # A DISPOSABLE CONTROL STORE, exactly as _StepHarness gives its own cases. Without it every
-    # driver case that arms the quarantine wrote abandoned-mutation.json into the MACHINE's store
-    # under %SystemRoot%, and CI proved how expensive that is: an elevated runner made the write
-    # succeed, and from that point every later run in the same job refused to mutate anything.
-    #
-    # The leak predates the completion work - it simply did not show, because the marker used to
-    # retire itself the moment the process that wrote it was proven gone. Now that an EXTERNAL
-    # abandonment is never retired on the reporting host's death, a suite that leaves one behind
-    # leaves it for good, so the isolation this always needed is the isolation it now must have.
+    # A control store PER CASE, narrower than the suite-wide one _Harness gives every suite: a case
+    # here plants markers the next case must not see, and Reset-WacAbandonedMutator alone does not
+    # remove what is on disk.
     $script:StoreSandbox = New-TestSandbox -Prefix 'driver-control'
     Set-WacControlRoot -Path (Join-Path -Path $script:StoreSandbox -ChildPath 'Control')
 
@@ -241,9 +235,9 @@ function Invoke-WithStubbedTool {
         if ($originalToolPath) {
             Set-ModuleFunctionBody -Module $script:DriversModule -Name 'Get-WacSystemToolPath' -Body $originalToolPath
         }
-        # The store goes back to the machine's own, and the sandbox with anything this case recorded
-        # in it goes away. A marker left here would follow every later suite in the same process.
-        Set-WacControlRoot -Path $null
+        # Back to the SUITE's store, and the per-case sandbox with anything recorded in it goes
+        # away. Restoring to the machine's own store is what the harness guard exists to catch.
+        Restore-SuiteControlStore
         Reset-WacAbandonedMutator
         if ($script:StoreSandbox) { Remove-TestSandbox -Path $script:StoreSandbox; $script:StoreSandbox = $null }
         $script:StubResult = @{}
