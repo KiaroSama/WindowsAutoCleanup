@@ -71,6 +71,7 @@ Export-ModuleMember -Function @(
     'Request-WacWaitMs',
     'Reset-WacAbandonedMutator', 'Get-WacAbandonedMutatorCount', 'Test-WacMutationAllowed',
     'Add-WacAbandonedMutator', 'Resolve-WacQuarantine', 'Get-WacQuarantineMarkerName',
+    'Get-WacMachineUptimeMs', 'Test-WacMachineRestartedSince',
     'Read-WacQuarantineMarker', 'Remove-WacQuarantineMarker', 'Test-WacQuarantineProcessGone',
     'Write-WacQuarantineMarker', 'Get-WacCurrentProcessCreated',
     'ConvertTo-WacCommandLineArgument', 'ConvertTo-WacCommandLine',
