@@ -296,6 +296,98 @@ function Add-WacAbandonedMutator {
     return [int]$script:AbandonedMutatorCount
 }
 
+# Absorbs ordinary clock skew and the record's own second-resolution stamp, so a restart has to be
+# clear of both before it settles anything.
+$script:RestartProofMarginMs = 120000
+
+function Get-WacMachineUptimeMs {
+    <#
+    .SYNOPSIS
+        Milliseconds since this machine booted, or $null when the runtime cannot answer.
+    .DESCRIPTION
+        TickCount64 and not Win32_OperatingSystem: the CIM query is an RPC round trip to the WMI
+        service, and this project already moved one diagnostic off it for exactly that reason - a
+        question asked before a cleanup step must not be able to block on an unavailable service.
+        TickCount64 is a counter the kernel keeps and costs nothing.
+
+        It also cannot be moved. That is the whole point of using it rather than a civil clock: a
+        restart is the event this is asked about, and an NTP or DST correction must not look like one.
+
+        $null when the runtime does not expose it (the property arrived in .NET Framework 4.8), and a
+        null uptime settles nothing - the caller keeps its record, which is where it started.
+    #>
+
+    try {
+        if (@([System.Environment].GetMember('TickCount64')).Count -eq 0) { return $null }
+        return [long][System.Environment]::TickCount64
+    }
+    catch { return $null }
+}
+
+function Test-WacMachineRestartedSince {
+    <#
+    .SYNOPSIS
+        Whether this machine has booted since a recorded moment. Proof only; never a guess.
+    .DESCRIPTION
+        THE SETTLEMENT PATH FOR EXTERNAL WORK (ledger WAC-05R). A record for work outside this
+        process cannot be retired by proving the reporting host died, because the work outlives that
+        host - but a RESTART ends everything the earlier run left, whatever it was and whoever owned
+        it. Without this the latch had no way back at all, and one abandoned operation would refuse
+        every mutation on the machine for ever.
+
+        The test is that the machine has been UP for less time than the record has EXISTED: if so it
+        booted after the record was written. Uptime is monotonic, so the half that matters cannot be
+        moved by a clock correction; the record's age is civil, and the margin absorbs ordinary skew
+        and the record's own second-resolution stamp. A clock moved BACKWARDS shrinks the age and
+        makes this answer no, which is the safe direction.
+    .OUTPUTS
+        Restarted (bool) and Reason.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()]$RaisedUtc)
+
+    $result = [PSCustomObject]@{ Restarted = $false; Reason = '' }
+
+    $uptimeMs = Get-WacMachineUptimeMs
+    if ($null -eq $uptimeMs) {
+        $result.Reason = 'this runtime cannot report how long the machine has been up'
+        return $result
+    }
+
+    # ConvertFrom-Json leaves an ISO-8601 stamp a string on Windows PowerShell 5.1 and parses it into
+    # a [datetime] on PowerShell 7, so both shapes arrive here and neither may be assumed.
+    $raised = [datetime]::MinValue
+    if ($RaisedUtc -is [datetime]) { $raised = ([datetime]$RaisedUtc).ToUniversalTime() }
+    else {
+        $text = [string]$RaisedUtc
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            $result.Reason = 'the record does not say when it was written'
+            return $result
+        }
+        $parsed = [datetime]::MinValue
+        if (-not [datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal,
+                [ref]$parsed)) {
+            $result.Reason = 'the time the record was written could not be read'
+            return $result
+        }
+        $raised = $parsed
+    }
+
+    $ageMs = ((Get-Date).ToUniversalTime() - $raised).TotalMilliseconds
+    if ($ageMs -le 0) {
+        $result.Reason = 'the record is stamped in the future, so nothing can be concluded from its age'
+        return $result
+    }
+
+    if (($uptimeMs + $script:RestartProofMarginMs) -lt $ageMs) {
+        $result.Restarted = $true
+        return $result
+    }
+
+    $result.Reason = 'the machine has been up since before the record was written'
+    return $result
+}
+
 function Resolve-WacQuarantine {
     <#
     .SYNOPSIS
@@ -353,15 +445,37 @@ function Resolve-WacQuarantine {
     if ($kind -cne 'InProcess') {
         # THE HOST'S DEATH SETTLES NOTHING HERE. An external tool, a service-dispatched operation or
         # a descendant nobody owned goes on running after the process that launched it exits, so
-        # proving that process gone is proving the wrong thing. Only a postcondition against what was
-        # being changed, or a person, can settle this - and until then the machine keeps the record.
-        $script:AbandonedMutatorCount++
-        Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'An earlier run abandoned work outside this process and nothing has settled it, so this run will not mutate anything. Restart the machine to end anything that run left going, confirm the state it was changing, then remove the marker by hand.' -Data @{
-            processId = [int]$marker.Record.ProcessId; kind = $kind
-            raisedUtc = [string]$marker.Record.RaisedUtc; reason = [string]$marker.Record.Reason
-            store = [string](Get-WacControlRoot); name = (Get-WacQuarantineMarkerName)
+        # proving that process gone is proving the wrong thing.
+        #
+        # A RESTART DOES settle it, and shipping that path is not optional: a latch with no way back
+        # turns one abandoned operation - or one leaky test - into a machine that refuses every
+        # mutation for ever. Measured, not theorised: without this a single leaked record made every
+        # later run in the same CI job refuse, down to Remove-WacTree deleting nothing.
+        $restart = Test-WacMachineRestartedSince -RaisedUtc $marker.Record.RaisedUtc
+        if (-not $restart.Restarted) {
+            $script:AbandonedMutatorCount++
+            Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'An earlier run abandoned work outside this process and the machine has not restarted since, so this run will not mutate anything. Restart the machine to end anything that run left going, then confirm the state it was changing.' -Data @{
+                processId = [int]$marker.Record.ProcessId; kind = $kind
+                raisedUtc = [string]$marker.Record.RaisedUtc; reason = [string]$marker.Record.Reason
+                unsettled = [string]$restart.Reason
+                store = [string](Get-WacControlRoot); name = (Get-WacQuarantineMarkerName)
+            }
+            return [PSCustomObject]@{ State = 'Quarantined'; Reason = 'an earlier run abandoned work outside this process' }
         }
-        return [PSCustomObject]@{ State = 'Quarantined'; Reason = 'an earlier run abandoned work outside this process' }
+
+        if (-not (Remove-WacQuarantineMarker)) {
+            $script:AbandonedMutatorCount++
+            Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'A restart ended the work an earlier run abandoned, but its marker could not be removed, so this run will not mutate anything rather than act against a marker it cannot retire.' -Data @{
+                store = [string](Get-WacControlRoot); name = (Get-WacQuarantineMarkerName)
+            }
+            return [PSCustomObject]@{ State = 'Quarantined'; Reason = 'the marker of a settled abandonment could not be removed' }
+        }
+
+        Write-WacLog -Level WARNING -Component 'Budget' -Message 'An earlier run abandoned work outside this process; the machine has restarted since, which ended it, so the record was retired.' -Data @{
+            processId = [int]$marker.Record.ProcessId; raisedUtc = [string]$marker.Record.RaisedUtc
+            reason = [string]$marker.Record.Reason
+        }
+        return [PSCustomObject]@{ State = 'Retired'; Reason = 'the machine restarted after the abandonment was recorded' }
     }
 
     $gone = Test-WacQuarantineProcessGone -Record $marker.Record

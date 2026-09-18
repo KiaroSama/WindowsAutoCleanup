@@ -573,6 +573,28 @@ function Test-Case {
     else { Write-Host ('pass  {0}  ({1} ms)' -f $Name, $ms) }
 }
 
+function Get-MachineControlStoreEntry {
+    <#
+    .SYNOPSIS
+        What is in the MACHINE's control store right now, as a sorted name list.
+    .DESCRIPTION
+        Never fails and never creates: an unreadable or missing store answers empty, because this is
+        a leak detector and an inability to look is not evidence of a leak.
+    #>
+
+    $root = Join-Path -Path $env:SystemRoot -ChildPath 'Logs\WindowsAutoCleanup\Control'
+    try {
+        if (-not [System.IO.Directory]::Exists($root)) { return @() }
+        return @([System.IO.Directory]::GetFileSystemEntries($root) |
+            ForEach-Object { [System.IO.Path]::GetFileName($_) } | Sort-Object)
+    }
+    catch { return @() }
+}
+
+# The baseline, taken before a single case runs. Compared again at the end, so a suite that writes
+# into the machine's own control store fails ITSELF rather than poisoning every suite after it.
+$script:WacMachineStoreBaseline = Get-MachineControlStoreEntry
+
 function Complete-TestRun {
     <#
     .SYNOPSIS
@@ -581,6 +603,19 @@ function Complete-TestRun {
     param()
 
     Remove-TestSandbox
+
+    # THE LEAK GUARD (ledger WAC-05R). A suite that arms the quarantine without redirecting the
+    # control store writes its marker under %SystemRoot%, where it belongs to the MACHINE - and a
+    # quarantine record stops every later mutation, so one leaky suite refuses every suite after it.
+    # CI proved how expensive and how confusing that is: the failures land in unrelated code, and it
+    # is invisible locally because an unelevated run cannot write there at all while the CI runner
+    # can. So the suite that does it is the suite that fails.
+    $leaked = @(Get-MachineControlStoreEntry | Where-Object { $script:WacMachineStoreBaseline -cnotcontains $_ })
+    if ($leaked.Count -gt 0) {
+        Write-Host ('FAIL  this suite wrote {0} entr(y/ies) into the MACHINE control store under %SystemRoot%: {1}. Redirect it with Set-WacControlRoot to a disposable sandbox, as _StepHarness.ps1 and _DriverFixtures.ps1 do, and remove it in the finally.' -f `
+                $leaked.Count, (@($leaked) -join ', '))
+        exit 1
+    }
 
     $failed = @($script:WacCases | Where-Object { $_.Failure })
     $skipped = @($script:WacCases | Where-Object { -not $_.Failure -and $_.Skip })
