@@ -275,7 +275,13 @@ function Invoke-WacDriverPackagePrune {
     # deletion candidate. So a store that was half read could nominate a live package for removal.
     # Resolve-WacSettledOutcome raises the outcome and arms the latch in one move, so the step stops
     # here rather than acting on a list it cannot stand behind.
-    $enumSettled = Resolve-WacSettledOutcome -Outcome 'SafeSkip' -Detail 'The driver store was not enumerated.' -Run $enum
+    # ReadOnly, and the distinction is load-bearing now that the contract is positive: an
+    # enumeration cannot be proven to have left no descendant on a machine without job ownership, and
+    # a Mutating verdict there would quarantine every prune on every such machine for a tool that
+    # changed nothing. What it still may not do is hand on a HALF-READ list - that is
+    # OutputTrustworthy, which the resolver checks before letting the answer through.
+    $enumSettled = Resolve-WacSettledOutcome -Outcome 'SafeSkip' -Detail 'The driver store was not enumerated.' `
+        -Run $enum -Kind 'ReadOnly'
     if ([string]$enumSettled.Outcome -cne 'SafeSkip') {
         return (Write-WacStepResult -Component $component -Result (New-WacDriverStepResult -Category $category `
             -Outcome (Get-WacHigherOutcome -Current ([string]$enumSettled.Outcome) -Candidate $floor) -Attempted $true `

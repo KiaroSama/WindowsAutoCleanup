@@ -203,7 +203,11 @@ foreach ($module in @($WacModulePath)) {
             # process can ever observe it finishing. The run stops scheduling mutations rather than
             # racing one it cannot see.
             if ($Mutating) {
-                [void](Add-WacAbandonedMutator -Reason ('{0} exceeded its {1} ms bound' -f $Component, $budgetMs))
+                # InProcess, and this is the ONLY caller entitled to say so: the work is a
+                # scriptblock on a runspace inside this process, so it cannot outlive it. Every other
+                # abandonment hands work to something that can.
+                [void](Add-WacAbandonedMutator -Kind 'InProcess' `
+                    -Reason ('{0} exceeded its {1} ms bound' -f $Component, $budgetMs))
                 Write-WacLog -Level CRITICAL -Component $Component -Message 'A mutating block was abandoned and cannot be proven stopped; no further mutation will be scheduled.' -Data @{
                     budgetMs = $budgetMs; waitMs = $waitMs
                 }

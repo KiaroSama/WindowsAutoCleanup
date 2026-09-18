@@ -77,28 +77,21 @@ function Test-WacControlStorePresence {
         carried an unexpected descriptor would stop cleaning anything, for ever, on the strength of a
         record that could not exist.
 
-        Asked of the PARENT rather than of the root itself, because Directory.Exists answers false
-        for "denied" exactly as it does for "not there" - and that collapse is the whole defect this
-        file exists to remove.
+        Answered by Get-WacPathPresence, the one inspection in this project that separates the two.
+        This probe used to ask Directory.Exists about the root's PARENT, which answers false for
+        "denied" exactly as it does for "not there" - so a %SystemRoot%\Logs whose own parent
+        refused an attribute read reported a store that is really there as Absent, and Absent is
+        what licenses clearing a quarantine. The shared probe classifies by the exception a single
+        enumeration THROWS instead: DirectoryNotFoundException is the container genuinely not being
+        there, and denial, a security refusal or an I/O error are not answers at all.
     #>
     $root = Get-WacControlRoot
     if ([string]::IsNullOrWhiteSpace($root)) { return 'Unknown' }
 
-    $parent = $null
-    $leaf = $null
-    try {
-        $parent = [System.IO.Path]::GetDirectoryName($root)
-        $leaf = [System.IO.Path]::GetFileName($root)
-    }
-    catch { return 'Unknown' }
-    if ([string]::IsNullOrWhiteSpace($parent) -or [string]::IsNullOrWhiteSpace($leaf)) { return 'Unknown' }
-
-    try {
-        if (-not [System.IO.Directory]::Exists($parent)) { return 'Absent' }
-        if (@([System.IO.Directory]::GetFileSystemEntries($parent, $leaf)).Count -eq 0) { return 'Absent' }
-        return 'Present'
-    }
-    catch { return 'Unknown' }
+    $presence = [string](Get-WacPathPresence -Path $root)
+    if ($presence -ceq 'Present') { return 'Present' }
+    if ($presence -ceq 'Absent') { return 'Absent' }
+    return 'Unknown'
 }
 
 function Write-WacControlFile {
@@ -290,14 +283,13 @@ function Test-WacLegacyControlFile {
     $root = Get-WacLegacyControlRoot
     if ([string]::IsNullOrWhiteSpace($root)) { return 'Absent' }
 
-    try {
-        # GetFileSystemEntries rather than Test-Path: it distinguishes "the parent says this name is
-        # not there" from "the parent could not be enumerated", and it answers for a directory or a
-        # dangling link at the name just as it does for a file.
-        if (-not [System.IO.Directory]::Exists($root)) { return 'Absent' }
-        $found = @([System.IO.Directory]::GetFileSystemEntries($root, $Name))
-        if ($found.Count -eq 0) { return 'Absent' }
-        return 'Present'
-    }
-    catch { return 'Unknown' }
+    # Get-WacPathPresence rather than Test-Path or a bare Directory.Exists: it answers for a
+    # directory or a link at the name just as it does for a file, and it keeps "the old root could
+    # not be read" apart from "the old root has nothing in it". The version before this one asked
+    # Directory.Exists about the root and read false as absence - which is also what a denied
+    # %ProgramData% answers, and an absence here is what lets a run out of quarantine.
+    $presence = [string](Get-WacPathPresence -Path (Join-Path -Path $root -ChildPath $Name))
+    if ($presence -ceq 'Present') { return 'Present' }
+    if ($presence -ceq 'Absent') { return 'Absent' }
+    return 'Unknown'
 }
