@@ -85,7 +85,7 @@ function Reset-TestDataRoot {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$SavedProgramData)
 
     Set-WacDirectoryTrustJudge -ScriptBlock $null
-    Set-WacControlRoot -Path $null
+    Restore-SuiteControlStore
     $env:ProgramData = $SavedProgramData
 }
 

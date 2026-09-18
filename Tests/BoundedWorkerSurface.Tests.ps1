@@ -167,7 +167,7 @@ function Invoke-WithRealWorker {
         Set-ModuleFunctionBody -Module $script:StepModule -Name 'Test-WacIsAdministrator' -Body $originalAdmin
         Set-ModuleFunctionBody -Module $script:StepModule -Name 'Get-WacSystemToolPath' -Body $originalToolPath
         Set-WacDirectoryTrustJudge -ScriptBlock $null
-        Set-WacControlRoot -Path $null
+        Restore-SuiteControlStore
         Remove-TestSandbox -Path $storeSandbox
         $script:StubResult = @{}
     }
