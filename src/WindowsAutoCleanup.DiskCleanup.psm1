@@ -570,17 +570,17 @@ function Invoke-WacLegacyDiskCleanup {
                 $detail = 'The cleanmgr profile could not be snapshotted, so nothing was changed: {0}' -f $snapshotRun.Error
             }
         }
-        elseif (@('Created', 'Present') -cnotcontains [string](Write-WacControlFile -Name $script:CleanMgrSnapshotName `
-                    -Content (ConvertTo-Json -InputObject @($snapshot) -Depth 4)).Kind) {
-            # BEFORE the first mutation, and this is the whole point (ledger WAC-05R). The original
-            # values lived only in this process's memory, so a run that wrote the profile and was
-            # then abandoned left somebody else's cleanmgr selection recoverable only from a
-            # variable that no longer exists - and a later run, having proved this host gone, would
-            # retire the quarantine and lose it for ever.
-            #
-            # Declining here costs nothing: not one value has been written yet.
+        elseif ([string](Write-WacControlFile -Name $script:CleanMgrSnapshotName `
+                    -Content (ConvertTo-Json -InputObject @($snapshot) -Depth 4)).Kind -cne 'Created') {
+            # BEFORE the first mutation (ledger WAC-05R): the originals live only in this process's
+            # memory, so an abandoned run leaves somebody else's selection recoverable from nothing.
+            # ONLY 'Created' COUNTS, and PRESENT was the dangerous half: a record already there is an
+            # EARLIER run's and proves nothing about its identity or contents. Run A records the real
+            # original P0 and is abandoned before restoring; run B snapshots the modified P1, adopts
+            # A's record, restores P1 and deletes the record holding P0 - every step reporting
+            # success. A pre-existing record is a RECOVERY question, not a create, so it is declined.
             $outcome = 'SafeSkip'
-            $detail = 'The original cleanmgr profile could not be recorded durably, so nothing was changed.'
+            $detail = 'The original cleanmgr profile was not recorded durably as this run''s own, so nothing was changed; an earlier run''s record may be present and must be settled first.'
         }
         elseif (-not (Test-WacMutationAllowed)) {
             # Writing the sage profile IS a mutation, and it is followed by a whole-machine

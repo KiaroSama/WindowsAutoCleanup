@@ -563,4 +563,42 @@ Test-Case 'a handler missing from the rollback snapshot is refused, not written'
     }
 }
 
+Test-Case 'R05-4 a snapshot record from an EARLIER run is never adopted as this run''s own' {
+    # The counterexample this closes, in full: run A records the real original profile P0, writes its
+    # own selection, and is abandoned before it can restore. Run B snapshots what it now finds - the
+    # MODIFIED P1 - and, because a pre-existing record at the name was accepted as a successful
+    # create, adopted A's record as its own. B then did its work, restored P1, and deleted the record
+    # that held P0. Nothing failed anywhere; every step reported success; P0 was gone.
+    #
+    # Merely persisting a snapshot is not recovery. A record already at that name belongs to another
+    # generation and proves nothing about its identity or its contents, so it is a RECOVERY question
+    # and this run declines rather than answering it.
+    $key = New-ScratchVolumeCacheKey -KeyPath (Join-Path -Path $script:ScratchKeyRoot -ChildPath 'VolumeCaches')
+    $originalKeyPath = Get-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath'
+    Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $key
+    try {
+        Invoke-WithStubbedTool -StubToolPath -Body {
+            # Run A's record, planted in the same disposable control store the step writes to.
+            $planted = '[{"Handler":"Temporary Files","ValueName":"StateFlags9999","Kind":"DWord","Value":2}]'
+            Assert-Equal 'Created' ([string](Write-WacControlFile -Name 'cleanmgr-profile.json' -Content $planted).Kind) `
+                'the fixture could not plant an earlier run''s recovery record'
+
+            $result = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999
+
+            Assert-Equal 'SafeSkip' ([string]$result.Outcome) ([string]$result.Detail)
+            Assert-Equal 0 $script:StubCall.Count 'cleanmgr ran while an earlier run''s recovery record was still outstanding'
+
+            # THE RECORD SURVIVES BYTE FOR BYTE. Declining is only half the repair: adopting it and
+            # then retiring it is what lost P0, so this run must not rewrite it either.
+            $after = Read-WacControlFile -Name 'cleanmgr-profile.json'
+            Assert-Equal 'Valid' ([string]$after.State) 'the earlier run''s recovery record was removed by a run that declined'
+            Assert-Equal $planted ([string]$after.Text) 'the earlier run''s recovery record was overwritten with this run''s own snapshot'
+        }
+    }
+    finally {
+        Set-ModuleVariableValue -Module $script:StepModule -Name 'VolumeCacheKeyPath' -Value $originalKeyPath
+        Remove-Item -LiteralPath $script:ScratchKeyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Complete-TestRun
