@@ -154,9 +154,13 @@ Set-WacDirectoryTrustJudge -ScriptBlock {
 # A parent suite's Set-WacControlRoot is in-process and cannot reach a child, so the child sets its
 # own. The descriptor judge above is what makes a store under a user-writable %ProgramData%
 # answerable at all.
-$script:RigControlRoot = Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\Control'
-[void][System.IO.Directory]::CreateDirectory($script:RigControlRoot)
-Set-WacControlRoot -Path $script:RigControlRoot
+#
+# The path only. CREATING it here made the shim the thing that created a directory under a state
+# root the run had just REFUSED, which RunStateRefusal.Tests.ps1 is precisely about: a refusal that
+# leaves a tree behind has travelled through the boundary it was supposed to stop at. The store
+# creates its own root when it has something to write, and a store that does not exist reads as
+# nothing outstanding - which is the correct answer for a run that was never allowed to record one.
+Set-WacControlRoot -Path (Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\Control')
 
 function Initialize-WacRun {
     [CmdletBinding()]
