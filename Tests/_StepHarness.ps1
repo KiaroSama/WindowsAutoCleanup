@@ -284,7 +284,7 @@ function Invoke-WithStubbedTool {
         $script:StubResult = @{}
         $script:BoundedForce = @{}
         Set-WacDirectoryTrustJudge -ScriptBlock $null
-        Set-WacControlRoot -Path $null
+        Restore-SuiteControlStore
         if ($script:StoreSandbox) { Remove-TestSandbox -Path $script:StoreSandbox; $script:StoreSandbox = $null }
     }
 }
