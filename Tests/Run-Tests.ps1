@@ -227,20 +227,8 @@ if ($env:HOOKMAKER_MAX_TEST_WORKERS) {
     }
 }
 
-# INSIDE THE PROJECT THAT OWNS IT, never the machine's temp. Per-run captures, redirect files and
-# the executed-suite manifest are this repository's test output, and the workstation rule is that a
-# project's test work, caches and temporary files live under its own root - so a second project, or
-# a second checkout of this one, can never walk into them and evidence kept for a failed run is
-# where the run was.
-#
-# AND AN UNAVAILABLE ROOT FAILS HERE. Falling back to the OS temp is what made the old behaviour
-# invisible: it always worked, so nothing ever said where the output had gone.
-$workRoot = [System.IO.Path]::GetFullPath((Join-Path -Path $repoRoot -ChildPath ('.ci-work\windows\run-{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 12))))
-try { [void][System.IO.Directory]::CreateDirectory($workRoot) }
-catch {
-    Write-Host ('The project-local test work root could not be created, so no run was started: {0} ({1})' -f $workRoot, $_.Exception.Message)
-    exit 1
-}
+$workRoot = [System.IO.Path]::GetFullPath((Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('wac-run-{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 12))))
+[void][System.IO.Directory]::CreateDirectory($workRoot)
 
 # A suite's IDENTITY is its path relative to Tests\, never its bare file name. -Recurse can discover
 # two suites sharing a name in different subdirectories, and a name-keyed identity gives those two
