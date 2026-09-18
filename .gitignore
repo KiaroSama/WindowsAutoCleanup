@@ -112,3 +112,6 @@ Desktop.ini
 
 # Local advisor output: generated implementation plans, not part of the shipped project.
 /plans/
+
+# Project-local test work root: per-run captures and the executed-suite manifest.
+/.ci-work/
