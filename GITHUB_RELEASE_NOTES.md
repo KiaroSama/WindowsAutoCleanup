@@ -381,6 +381,15 @@ all fixed:
   so a new suite is automatically covered by CI.
 - CI runs the analyzer and the full matrix on both hosts with explicit job-level and step-level
   timeouts, and upgrades `actions/checkout` from the stale v4 to v7.
+- **The deployment-lifecycle lane now actually runs.** It installs a real SYSTEM scheduled task,
+  triggers it through the scheduler, upgrades, refuses a recovery it cannot vouch for and
+  uninstalls - so it needs a machine it may change, and it is gated behind an environment switch
+  plus elevation. That gate meant it had only ever reported *refused*, which is a pass that has
+  validated nothing. It runs armed in its own CI job on both Windows images: a GitHub-hosted runner
+  is the disposable guest the lane asks for, and the job refuses outright on a self-hosted runner,
+  which is somebody's machine. Because the lane owns exclusive machine state - one deployment root,
+  one registration, one machine-wide lock - it runs single-worker, and the job fails when the lane
+  reports refused, because an exit code alone cannot tell "every step passed" from "nothing ran".
 - The "every discovered suite ran" guard used the same non-recursive glob as the runner, so a suite
   in a subdirectory would have been invisible to both — the guard could not detect the one thing it
   existed for. Both now discover recursively.
