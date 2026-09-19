@@ -142,6 +142,24 @@ function Get-WacVmDeploymentOutcome {
         # 2. SCHEDULED RUN. Started for real through the scheduler, under SYSTEM.
         if ($task) {
             Start-ScheduledTask -InputObject $task -ErrorAction Stop
+
+            # WAIT FOR THE LAUNCH BEFORE WAITING FOR THE FINISH. Start-ScheduledTask ASKS the
+            # scheduler and returns; for a moment afterwards the task is still Ready. Sampling the
+            # state once therefore read "not Running" before the task had ever started, broke out of
+            # the finish loop immediately, and then reported 267011 - SCHED_S_TASK_HAS_NOT_RUN -
+            # which is exactly what a task that never ran looks like. Measured on a github-hosted
+            # runner; the product was fine and the lane said otherwise.
+            $launched = $false
+            $launchDeadline = [datetime]::UtcNow.AddMinutes(2)
+            while ([datetime]::UtcNow -lt $launchDeadline) {
+                $current = @((Get-WacInstalledTask).Task)[0]
+                if (-not $current) { break }
+                $probe = Get-ScheduledTaskInfo -InputObject $task -ErrorAction SilentlyContinue
+                if (([string]$current.State -ceq 'Running') -or
+                    ($probe -and [int]$probe.LastTaskResult -ne 267011)) { $launched = $true; break }
+                Start-Sleep -Milliseconds 250
+            }
+
             $deadline = [datetime]::UtcNow.AddMinutes(6)
             $state = 'Running'
             while ([datetime]::UtcNow -lt $deadline) {
@@ -157,8 +175,9 @@ function Get-WacVmDeploymentOutcome {
             # happen is the task never finishing, or failing to start at all (0x8007010B and friends).
             [void]$steps.Add((New-LifecycleStep -Step 'scheduled run finishes' -Ok ($state -ne 'Running') `
                 -Detail ('state={0} lastResult={1}' -f $state, [string]$info.LastTaskResult)))
-            [void]$steps.Add((New-LifecycleStep -Step 'scheduled run actually launched' -Ok ([int]$info.LastTaskResult -ne 267011) `
-                -Detail ('lastResult={0} (267011 = never run)' -f [string]$info.LastTaskResult)))
+            [void]$steps.Add((New-LifecycleStep -Step 'scheduled run actually launched' `
+                -Ok ($launched -and [int]$info.LastTaskResult -ne 267011) `
+                -Detail ('launched={0} lastResult={1} (267011 = never run)' -f $launched, [string]$info.LastTaskResult)))
         }
 
         # 3. SECOND INSTALL - idempotence. A healthy reinstall must stay healthy and must not leave a

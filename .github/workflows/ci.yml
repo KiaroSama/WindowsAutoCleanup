@@ -287,7 +287,11 @@ jobs:
         env:
           WAC_VM_DEPLOYMENT_LIFECYCLE: '1'
         run: |
-          .\Tests\Run-Tests.ps1 -Host both -Filter VmDeploymentLifecycle *>&1 |
+          # -MaxWorkers 1 is not tuning, it is the contract. This lane owns EXCLUSIVE machine
+          # state - one deployment root, one registration, one machine-wide lock - so running the
+          # two host legs in parallel had the second one refuse with exit 3 because the first held
+          # the lock. Measured on both images; the product was right and the invocation was wrong.
+          .\Tests\Run-Tests.ps1 -Host both -MaxWorkers 1 -Filter VmDeploymentLifecycle *>&1 |
             Tee-Object -FilePath "$env:RUNNER_TEMP\lifecycle-output.log"
           $code = $LASTEXITCODE
 
