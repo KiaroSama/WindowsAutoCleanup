@@ -193,7 +193,22 @@ function Set-WacCampaignDurableArming {
 }
 
 $arming = Set-WacCampaignDurableArming
-try { Publish-WacCampaignValue -Name 'AgentArming' -Value $arming } catch { $null = $_ }
+try {
+    Publish-WacCampaignValue -Name 'AgentArming' -Value $arming
+
+    # The log tail goes out HERE, not only on a fault. Arming is the one step whose failure the host
+    # cannot otherwise see at all, and a result string that says only "failed" is what sent this
+    # round in circles twice.
+    $armingTail = '(no log)'
+    try {
+        $armingText = [System.IO.File]::ReadAllText($script:LogPath)
+        $armingFlat = ($armingText -replace '\s+', ' ').Trim()
+        $armingTail = $(if ($armingFlat.Length -le 700) { $armingFlat } else { '...' + $armingFlat.Substring($armingFlat.Length - 700) })
+    }
+    catch { $null = $_ }
+    Publish-WacCampaignValue -Name 'AgentLog' -Value $armingTail
+}
+catch { $null = $_ }
 
 function Publish-WacCampaignFault {
     <#
