@@ -307,5 +307,10 @@ function Write-WacRunFooter {
     # turned out to be - so they are written at the verdict's level and cannot outlive it.
     Write-WacLog -Level ([string]$script:OutcomeLogLevel[$outcome]) -Component 'Summary' -Message 'Cleanup totals.' -Data ([hashtable]$totals)
 
+    # The verdict is published as well as returned. The exit code alone cannot name it - 0 is both
+    # Succeeded and SafeSkip - so a reader that needs the OUTCOME, such as the machine-readable run
+    # summary, would otherwise have to guess which of the two it was.
+    $script:FinalOutcome = [string]$outcome
+
     return (Write-WacRunVerdict -Outcome $outcome)
 }

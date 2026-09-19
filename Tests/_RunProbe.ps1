@@ -87,6 +87,7 @@ $script:ArgumentProbeBody = @'
 [CmdletBinding()]
 param(
     [switch]$Scheduled,
+    [switch]$Preview,
     [switch]$ResetWindowsUpdateBase = $true,
     [switch]$PruneSupersededDrivers,
     [switch]$EnableLegacyDiskCleanup,
@@ -102,6 +103,7 @@ $split = @($SkipCategory | ForEach-Object { $_ -split ',' } | ForEach-Object { $
 
 Write-Output ('SELF=' + $PSCommandPath)
 Write-Output ('RESET=' + [bool]$ResetWindowsUpdateBase)
+Write-Output ('PREVIEW=' + [bool]$Preview)
 Write-Output ('PRUNE=' + [bool]$PruneSupersededDrivers)
 Write-Output ('LEGACY=' + [bool]$EnableLegacyDiskCleanup)
 Write-Output ('SKIPBIN=' + [bool]$SkipRecycleBin)

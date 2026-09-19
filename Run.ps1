@@ -92,6 +92,7 @@
     Justification = 'ResetWindowsUpdateBase has shipped as a default-on switch since v1.0.0 and the documented way to disable it is -ResetWindowsUpdateBase:$false. Changing it to [bool] would break every existing scheduled task and command line that passes it bare.')]
 param(
     [switch]$Scheduled,
+    [switch]$Preview,
     [switch]$ResetWindowsUpdateBase = $true,
     [switch]$PruneSupersededDrivers,
     [switch]$EnableLegacyDiskCleanup,
@@ -293,17 +294,20 @@ foreach ($moduleName in @('Core', 'FileSystem', 'Targets', 'Steps', 'Drivers')) 
     }
 }
 
-# The run's own report - the header, the shared outcome model and the footer - is DOT-SOURCED, not
-# imported: it reads and writes this script's $script: state, and an imported module would get its
-# own copy of all of it. It is treated exactly like a required module, because a run that cannot
-# state its verdict must not clean.
-$reportPart = Join-Path -Path $moduleRoot -ChildPath 'WindowsAutoCleanup.RunReport.ps1'
-try {
-    . $reportPart
-}
-catch {
-    Write-WacBootstrapLine -Message ('The run report part failed to load from {0}: {1}' -f $reportPart, $_.Exception.Message)
-    [void]$script:ImportFailure.Add('RunReport')
+# The run's own parts - the report (header, shared outcome model, footer), the preview and the
+# machine-readable summary - are DOT-SOURCED, not imported: they read and write this script's
+# $script: state, and an imported module would get its own copy of all of it. They are treated
+# exactly like required modules, because a run that cannot state its verdict must not clean.
+foreach ($runPart in @('WindowsAutoCleanup.RunReport.ps1', 'WindowsAutoCleanup.RunPreview.ps1',
+        'WindowsAutoCleanup.RunSummary.ps1')) {
+    $partPath = Join-Path -Path $moduleRoot -ChildPath $runPart
+    try {
+        . $partPath
+    }
+    catch {
+        Write-WacBootstrapLine -Message ('The run part {0} failed to load: {1}' -f $runPart, $_.Exception.Message)
+        [void]$script:ImportFailure.Add([System.IO.Path]::GetFileNameWithoutExtension($runPart))
+    }
 }
 
 if ($script:ImportFailure.Contains('Core')) {
@@ -329,6 +333,9 @@ function Get-WacRunRelaunchArgument {
         PruneSupersededDrivers = [bool]$PruneSupersededDrivers
         EnableLegacyDiskCleanup = [bool]$EnableLegacyDiskCleanup
         SkipRecycleBin = [bool]$SkipRecycleBin
+        # Carried because the relaunch happens BEFORE the preview cut: an elevated child that did
+        # not inherit this would clean the machine for the operator who asked only to see the plan.
+        Preview = [bool]$Preview
     }
 
     $namedValue = @{ LogLevel = $LogLevel; BudgetMinutes = [string]$BudgetMinutes }
@@ -516,6 +523,22 @@ try {
         exit (Write-WacRunVerdict -Outcome $preflight)
     }
 
+    # THE PREVIEW CUT, after the gate and before the first mutation. Log retention on the next few
+    # lines already deletes files, so a preview that ran past this point would have changed the
+    # machine it promised not to touch.
+    if ($Preview -and $Scheduled) {
+        # A scheduled trigger that only previews is a machine nobody is cleaning, reporting success
+        # every night. The two are refused together rather than one silently winning.
+        Write-WacLog -Level CRITICAL -Component 'Run' -Message '-Preview and -Scheduled cannot be used together: a scheduled run that only previews would never clean anything.'
+        exit 1
+    }
+
+    if ($Preview) {
+        exit (Show-WacRunPreview -SkipCategory @($SkipCategory) -SkipRecycleBin:$SkipRecycleBin `
+                -ResetWindowsUpdateBase:$ResetWindowsUpdateBase -PruneSupersededDrivers:$PruneSupersededDrivers `
+                -EnableLegacyDiskCleanup:$EnableLegacyDiskCleanup)
+    }
+
     # Get-WacLogDirectory, not Split-Path -Parent (Get-WacLogPath): a null path is a TERMINATING
     # binding error on both shipped hosts, so the old spelling crashed the run in its own retention
     # step on exactly the path where logging had already failed.
@@ -625,6 +648,13 @@ try {
     # The footer owns the mapping: the run exits on its worst outcome, not on a failure count.
     $script:ExitCode = Write-WacRunFooter -TargetResult @($targetResults.ToArray()) -StepResult @($stepResults.ToArray()) `
         -FreeBytesBefore $freeBefore -FreeBytesAfter $freeAfter -RebootRequired $rebootRequired
+
+    # A SECOND COPY of the verdict, for a reader that is not a person. Written after the footer
+    # decided, so it can never disagree with the exit code, and its failure is only a warning: the
+    # run's answer is the log's and the exit code's, and this repeats it in a shape a monitor reads.
+    [void](Write-WacRunSummary -Outcome ([string]$script:FinalOutcome) -ExitCode ([int]$script:ExitCode) `
+            -StepResult @($stepResults.ToArray()) -TargetResult @($targetResults.ToArray()) `
+            -FreeBytesBefore $freeBefore -FreeBytesAfter $freeAfter -RebootRequired $rebootRequired)
 
     exit $script:ExitCode
 }
