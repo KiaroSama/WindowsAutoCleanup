@@ -85,8 +85,23 @@ function Get-WacCampaignState {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    try { return ([System.IO.File]::ReadAllText($Path) | ConvertFrom-Json) }
+
+    $state = $null
+    try { $state = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json }
     catch { return $null }
+    if ($null -eq $state) { return $null }
+
+    # ConvertFrom-Json gives back a SCALAR for a one-element array and $null for an empty one, and
+    # this state is written and read across a power cut, so every list here has been both at some
+    # point. Normalising on the way in keeps `-ccontains` and `+` meaning what they look like.
+    foreach ($list in @('scenarios', 'completed', 'results')) {
+        $current = @()
+        if (@($state.PSObject.Properties.Name) -ccontains $list -and $null -ne $state.$list) {
+            $current = @($state.$list)
+        }
+        $state | Add-Member -NotePropertyName $list -NotePropertyValue $current -Force
+    }
+    return $state
 }
 
 function Save-WacCampaignState {
@@ -186,7 +201,11 @@ if ($null -ne $state -and [string]$state.phase -ceq 'awaiting-power-cut') {
 
     $result = Invoke-WacCampaignRecoveryCheck -State $state -ProjectRoot ([string]$state.projectRoot)
 
+    # THE SCENARIO IS NOW FINISHED. Recording only its result and not its completion is what made the
+    # first armed run loop: the scenario loop below skips what `completed` names, so an interrupted
+    # scenario that was never named there was interrupted again, for ever.
     $state.results = @(@($state.results) + $result)
+    $state.completed = @(@($state.completed) + [string]$state.cutStep)
     $state.phase = 'running'
     $state.cutStep = ''
     Save-WacCampaignState -Path $statePath -State $state
