@@ -114,4 +114,31 @@ Test-Case 'A capture record that outlived its own commit exits 6, not 0' {
     }
 }
 
+Test-Case 'A commit decision that could not be recorded retires NEITHER recovery copy' {
+    # R02-2. The decision is what a later process reads to tell this generation from one that died
+    # mid-swap, and it is written while the copy it replaced is still there to roll back to. If that
+    # write does not land, retiring the copy anyway would leave a machine that cannot tell the two
+    # apart - and would let the NEXT generation overwrite state nothing had settled. Keeping both is
+    # recoverable; discarding the copy is not. So the install is good, nothing is retired, and the
+    # run says so with a 6 rather than a 0.
+    $sandbox = New-TestSandbox -Prefix 'ce-decision'
+    try {
+        New-RollbackSandbox -Sandbox $sandbox
+        $run = Invoke-RollbackScenario -Sandbox $sandbox -Lookup 'Found,Found,Found' -Remove 'Verified' -Commit 'decision-fails'
+
+        Assert-InstallLanded -Run $run
+        Assert-Equal 6 $run.ExitCode $run.Console
+        Assert-True (Test-JournalHas -Run $run -Pattern '^Set-WacDeploymentCommitted$') `
+            ('the commit decision was never attempted: ' + ($run.Journal -join ' / '))
+        Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacDeploymentPrevious$') `
+            ('the recovery copy was retired although the decision that justifies it never landed: ' + ($run.Journal -join ' / '))
+        Assert-False (Test-JournalHas -Run $run -Pattern '^Remove-WacTaskCaptureRecord$') `
+            ('the capture record was ended while the swap record still says the generation is open: ' + ($run.Journal -join ' / '))
+        Assert-True ($run.ConsoleText -match 'Final status: incomplete') $run.Console
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun

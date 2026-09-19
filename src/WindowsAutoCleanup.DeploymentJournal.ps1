@@ -37,7 +37,17 @@
       1. The capture record is written, carrying the generation id, BEFORE the first unregister.
       2. The swap record is written, carrying the SAME generation id, BEFORE the first move.
       3. Every later write of either record repeats that id.
-      4. Commit deletes the swap record first, then the capture record.
+      4. The swap record is stamped Committed - after the replacement task AND the replacement
+         files are verified, and BEFORE either recovery copy is retired.
+      5. Commit deletes the swap record first, then the capture record.
+
+    Step 4 is what makes step 5's leftovers readable. Commitment used to be INFERRED by the next
+    process - a manifest hash that matched the record, or a healthy tree beside an original it could
+    not promote - and neither of those is the same claim. A tree can be healthy, be exactly the one
+    the record names, and still belong to a run that died before it registered the task that goes
+    with it; retiring the recovery copy on that reading discards the only installation that ever
+    worked. So commitment is now WRITTEN by the process that established it, and a record that does
+    not say it is treated as a transaction still open.
 
     It is crash-consistent because each record is durable before the mutation it describes, and
     because the id is what a later process reads to decide whether the two records are two halves of
@@ -72,7 +82,11 @@
 # Every field added at schema 2 is therefore read through Get-WacJournalField: absence has to read as
 # "not recorded", never as an error, and Set-StrictMode -Version 2.0 makes a plain property read of a
 # missing member terminating.
-$script:DeploymentJournalSchema = 3
+#
+# Schema 4 added Committed: the DECISION that a generation finished, rather than a shape a later
+# process infers from what it finds. Absence reads as "not recorded", which is "not committed" -
+# the safe direction, and the only one a record written before this build can honestly support.
+$script:DeploymentJournalSchema = 4
 $script:DeploymentJournalMinSchema = 1
 
 # The GENERATION this process's records belong to (ledger WAC-02R). One process performs at most one

@@ -49,6 +49,10 @@ function New-StateStage {
         [Parameter(Mandatory = $true)][string]$RunContent
     )
 
+    # BOTH halves, in the installer's order (ledger WAC-02R): reconciling the recovery slot was
+    # New-WacDeploymentStage's own first act until that put the file half behind the new install's
+    # source validation, and this fixture stands in for the caller that performs it now.
+    [void](Resolve-WacDeploymentRecoverySlot -Slots (Get-WacDeploymentSlotPath))
     return (New-WacDeploymentStage -SourceRoot (New-TestCheckout -Path (Join-Path -Path $Sandbox -ChildPath $Name) -RunContent $RunContent))
 }
 
@@ -265,13 +269,16 @@ Test-Case 'A record whose recovery slot is GONE is not cleared unless the outcom
         Assert-True (Test-Path -LiteralPath (Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root) -PathType Leaf) `
             'the record was deleted while the outcome it describes was still unknown'
 
-        # And the benign half: the replacement IS live, so the transaction is over in substance.
-        # The refusal above has to be cleared first, or staging the next tree refuses on it - which
-        # is the point of the first half and would prove nothing about the second.
+        # And the benign half. What makes it benign is NOT that the replacement is live - a live
+        # replacement is equally what a run that died before registering its task leaves behind - but
+        # that the generation wrote down that it finished, while the copy it replaced was still there
+        # to roll back to. The refusal above has to be cleared first, or staging the next tree refuses
+        # on it, which would prove nothing about the second half.
         [void](Remove-WacDeploymentJournal -DeploymentRoot $slots.Root)
         Reset-StateFixture
         [void](New-StateStage -Sandbox $sandbox -Name 'v3' -RunContent '# replacement v3')
         [void](Switch-WacDeploymentStage -KeepPrevious)
+        Assert-True ([bool](Set-WacDeploymentCommitted).Recorded) 'the commit decision could not be recorded'
         Reset-StateFixture
         [System.IO.Directory]::Delete($slots.Previous, $true)
 
@@ -401,7 +408,9 @@ Test-Case 'The installer maps a record that outlived its own commit to a non-suc
         'the swap record removal result is discarded again'
     Assert-True ($text -match '\$captureEnded = \[bool\]\(Remove-WacTaskCaptureRecord') `
         'the capture record removal result is discarded again'
-    Assert-True ($text -match '(?s)if \(-not \$committed -or -not \$captureEnded\) \{[\s\S]{0,900}?return 6') `
+    Assert-True ($text -match '\$decisionRecorded = \[bool\]\$decision\.Recorded') `
+        'the commit decision is no longer recorded before either recovery copy is retired'
+    Assert-True ($text -match '(?s)if \(-not \$decisionRecorded -or -not \$committed -or -not \$captureEnded\) \{[\s\S]{0,900}?return 6') `
         'an install whose transaction record outlived it no longer reports a non-success exit'
 
     # And it is reached on the SUCCESS path, after the commit, not from a catch.

@@ -289,8 +289,8 @@ function Resolve-InterruptedTaskCapture {
         neither should happen over a state nobody has accounted for.
 
         The decision is NOT made here. Get-WacDeploymentRecoveryPlan makes it once, from both
-        durable records and the disk, and this half and the file half inside New-WacDeploymentStage
-        act on that one verdict. Two halves reaching their own conclusions from their own evidence
+        durable records and the disk, and this half and the file half the caller runs straight
+        after it act on that one verdict. Two halves reaching their own conclusions from their own evidence
         is the defect: two individually durable records are not an atomic pair.
 
         The record is cleared only once EVERY task it names is accounted for AND the file half has

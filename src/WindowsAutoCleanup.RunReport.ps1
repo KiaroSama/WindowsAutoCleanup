@@ -164,6 +164,18 @@ function Get-WacRunLevelOutcome {
     # $null is NOT EVALUATED, which is the correct answer for an unelevated run whose log lives in
     # the invoking user's own profile. It must never refuse anything; only a verdict that was
     # actually reached and came back untrusted can.
+    # An installation whose two halves were never reconciled is not a state to clean FROM: the
+    # registration that started this run and the tree it is running were last touched by a process
+    # that did not finish, so neither vouches for the other. An installer under the common lock
+    # closes that generation; a cleanup run refuses until one has.
+    $settled = Test-WacDeploymentGenerationSettled
+    if (-not $settled.Settled) {
+        Write-WacLog -Level $script:OutcomeLogLevel['SecurityRefusal'] -Component 'Summary' -Message 'A deployment transaction left outstanding by an earlier installer has not been reconciled, so this run will not mutate anything. Re-run the installer to close it.' -Data @{
+            reason = [string]$settled.Reason; outstanding = ((@($settled.Outstanding)) -join ',')
+        }
+        $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'SecurityRefusal'
+    }
+
     $stateTrust = Get-WacStateTrust
     if ($null -ne $stateTrust -and -not $stateTrust.IsTrusted) {
         Write-WacLog -Level $script:OutcomeLogLevel['SecurityRefusal'] -Component 'Summary' -Message 'The directory holding this run state and audit log is not machine-trusted.' -Data @{

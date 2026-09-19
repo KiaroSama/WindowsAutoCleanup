@@ -390,8 +390,8 @@ function Invoke-Main {
     # reconciled by two pieces of code that each reached its own conclusion from its own half of the
     # evidence, and an upgrade interrupted before it committed ended with the ORIGINAL tree under the
     # REPLACEMENT task and the original task's definition deleted as "accounted for". The plan is
-    # made here, the task half acts on it below, and the file half inside New-WacDeploymentStage acts
-    # on the same one.
+    # made here, and both halves act on it below - the registrations first, then the trees - before
+    # anything about the new installation is asked.
     $plan = Get-WacDeploymentRecoveryPlan -DeploymentRoot $slots.Root
     if ([string]$plan.Verdict -eq 'Refuse') {
         Write-InstallerMessage -Level ERROR -Message ('Refusing to install: {0} Nothing was staged, swapped or registered.' -f [string]$plan.Reason)
@@ -411,6 +411,29 @@ function Invoke-Main {
     if (-not $reconciled.Ok) {
         Write-InstallerMessage -Level ERROR -Message ('Refusing to install: {0} Nothing was staged, swapped or registered.' -f [string]$reconciled.Reason)
         return 1
+    }
+
+    # The FILE half, immediately after the task half and before one single question about the new
+    # installation is asked (ledger WAC-02R). It used to run inside New-WacDeploymentStage, which is
+    # to say: after the source was validated, after a canonical host was found, and after the budget
+    # check below. Each of those can return, and a return between the two halves is what leaves task
+    # A standing over files B - a pair no later run is scheduled to close, because the installer that
+    # would have closed it is the one that just gave up.
+    #
+    # Both halves now complete under the one lock this run already holds, from the one plan read off
+    # the durable records above, and a failure here refuses the install rather than proceeding on
+    # half a recovery.
+    try {
+        $recovered = Resolve-WacDeploymentRecoverySlot -Slots $slots
+    }
+    catch {
+        Write-InstallerMessage -Level ERROR -Message ('Refusing to install: {0} Nothing was staged, swapped or registered.' -f $_.Exception.Message)
+        return 1
+    }
+    if ([string]$recovered.Action -cne 'None') {
+        Write-InstallerMessage -Level WARNING -Message 'The deployment left outstanding by an earlier run was reconciled before anything new was prepared.' -Data @{
+            action = [string]$recovered.Action; reason = [string]$recovered.Reason
+        }
     }
 
     $taskHost = Get-WacCanonicalPowerShellHost
@@ -541,18 +564,43 @@ function Invoke-Main {
         return 1
     }
 
-    # The commit point, and its two record deletions are RESULTS, not gestures (ledger WAC-02R).
-    # While either record is on disk a later run reads this committed installation as an unfinished
-    # transaction - the swap record makes it a candidate for rollback, the capture record sends it
-    # looking for a registration that is no longer missing. The install itself has succeeded, so
-    # this is not a rollback; it is an install whose audit state is not what it says, and it is
-    # reported as INCOMPLETE below rather than as success.
-    $committed = [bool](Remove-WacDeploymentPrevious)
+    # THE COMMIT POINT (ledger WAC-02R). The decision is written FIRST, while the recovery copy is
+    # still there to be rolled back to: both halves are verified above - the tree against its
+    # manifest, the registration against what was asked for - and this is the one moment at which
+    # "this generation finished" is a fact rather than a shape a later process would have to guess
+    # at from the leftovers.
+    #
+    # Its failure stops the retirement below. The install itself is good, but a recovery copy
+    # retired without the decision beside it leaves a machine that cannot tell this generation from
+    # one that died mid-swap, and the next installer would then be free to overwrite state nothing
+    # had settled. Keeping both is recoverable; discarding the copy is not.
+    $decision = Set-WacDeploymentCommitted
+    $decisionRecorded = [bool]$decision.Recorded
+    if (-not $decisionRecorded) {
+        Write-InstallerMessage -Level CRITICAL -Message 'This install is verified but its commit decision could not be recorded, so the copy of the previous deployment is being kept and nothing was retired; re-run the installer once the cause is fixed.' -Data @{
+            reason = [string]$decision.Reason
+        }
+    }
 
-    $captureEnded = [bool](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
-    if (-not $captureEnded) {
-        Write-InstallerMessage -Level CRITICAL -Message 'This install is committed but the task-capture record beside the deployment could not be deleted; a later run will try to reconcile a registration that is not missing. Delete it by hand.' -Data @{
-            record = [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root -Kind 'TaskCapture')
+    # The two record deletions are RESULTS, not gestures. While either record is on disk a later run
+    # reads this committed installation as an unfinished transaction - the swap record makes it a
+    # candidate for rollback, the capture record sends it looking for a registration that is no
+    # longer missing. The install itself has succeeded, so this is not a rollback; it is an install
+    # whose audit state is not what it says, and it is reported as INCOMPLETE below.
+    # Neither half is retired until the decision is on disk. Ending the capture record alone would
+    # destroy the only evidence of which registration was taken away, beside a swap record still
+    # saying the generation is open - the exact half-accounted pair the linking protocol exists to
+    # make impossible.
+    $committed = $false
+    $captureEnded = $false
+    if ($decisionRecorded) {
+        $committed = [bool](Remove-WacDeploymentPrevious)
+
+        $captureEnded = [bool](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
+        if (-not $captureEnded) {
+            Write-InstallerMessage -Level CRITICAL -Message 'This install is committed but the task-capture record beside the deployment could not be deleted; a later run will try to reconcile a registration that is not missing. Delete it by hand.' -Data @{
+                record = [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root -Kind 'TaskCapture')
+            }
         }
     }
 
@@ -577,9 +625,9 @@ function Invoke-Main {
     # tree are in place and proven, and the machine is nonetheless not in the state this run would
     # be claiming if it reported success, because a later run will read a settled deployment as an
     # unfinished one. INCOMPLETE (6), never success.
-    if (-not $committed -or -not $captureEnded) {
+    if (-not $decisionRecorded -or -not $committed -or -not $captureEnded) {
         Write-InstallerMessage -Level ERROR -Message 'Final status: incomplete. The task and the deployment are in place and verified, but a transaction record beside the deployment outlived the install that committed it; a later run will try to reconcile a state that is already settled.' -Data @{
-            swapRecordEnded = $committed; captureRecordEnded = $captureEnded
+            commitDecisionRecorded = $decisionRecorded; swapRecordEnded = $committed; captureRecordEnded = $captureEnded
             record = [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root)
         }
         return 6
