@@ -75,6 +75,62 @@ function Wait-WacCampaignFile {
     return $false
 }
 
+function Suspend-WacCampaignTree {
+    <#
+    .SYNOPSIS
+        Freezes a started process and everything it started, so the instant the power is cut at is
+        the instant the guest chose rather than whenever the host got round to it.
+    .DESCRIPTION
+        THE RACE THIS EXISTS TO REMOVE. The guest reaches the transaction, asks the host to cut, and
+        the host takes up to a poll interval to act - during which a short operation can FINISH. The
+        first real campaign lost `power-loss-during-uninstall` exactly that way: nothing was
+        interrupted, the installer correctly did not refuse, and the scenario proved nothing.
+
+        A suspended process cannot write another byte, so the on-disk state stays exactly as the
+        record left it for as long as the host needs. The parent is frozen FIRST so it cannot spawn
+        a child that outlives the sweep, and the descendants are enumerated twice because one can be
+        created between the parent's last instruction and its freeze.
+    .OUTPUTS
+        A result carrying Suspended (the ids frozen) and Detail.
+    #>
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    if (-not ('WacCampaign.Nt' -as [type])) {
+        Add-Type -Namespace 'WacCampaign' -Name 'Nt' -MemberDefinition @'
+[DllImport("ntdll.dll", SetLastError = true)]
+public static extern int NtSuspendProcess(System.IntPtr processHandle);
+'@
+    }
+
+    $frozen = New-Object 'System.Collections.Generic.List[int]'
+    $trouble = New-Object 'System.Collections.Generic.List[string]'
+
+    $freeze = {
+        param([int]$Id)
+        try {
+            $process = [System.Diagnostics.Process]::GetProcessById($Id)
+            $status = [WacCampaign.Nt]::NtSuspendProcess($process.Handle)
+            if ($status -eq 0) { [void]$frozen.Add($Id) }
+            else { [void]$trouble.Add(('{0}: NtSuspendProcess returned 0x{1:X8}' -f $Id, $status)) }
+        }
+        catch { [void]$trouble.Add(('{0}: {1}' -f $Id, $_.Exception.Message)) }
+    }
+
+    & $freeze $ProcessId
+    for ($pass = 0; $pass -lt 2; $pass++) {
+        foreach ($child in @(Get-CimInstance Win32_Process -Filter ("ParentProcessId={0}" -f $ProcessId) -ErrorAction SilentlyContinue)) {
+            if ($frozen -contains [int]$child.ProcessId) { continue }
+            & $freeze ([int]$child.ProcessId)
+        }
+    }
+
+    return [PSCustomObject]@{
+        Suspended = @($frozen.ToArray())
+        Detail = ('froze {0} process(es){1}' -f $frozen.Count,
+            $(if ($trouble.Count -gt 0) { '; ' + ($trouble.ToArray() -join '; ') } else { '' }))
+    }
+}
+
 function Stop-WacCampaignTree {
     <#
     .SYNOPSIS
@@ -261,9 +317,23 @@ function Start-WacCampaignInterruption {
                 (Get-WacCampaignTail -Text $said), $killed) }
     }
 
+    # FREEZE FIRST, then record, then ask. In that order the on-disk state cannot move again: the
+    # operation is stopped at the record, the resume point describes the state that will still be
+    # there after the power goes, and the host may take as long as it likes to act.
+    $held = Suspend-WacCampaignTree -ProcessId $started.Process.Id
+    if (@($held.Suspended).Count -eq 0) {
+        # Nothing was frozen, so the operation is still free to finish before the cut lands. That is
+        # the racy scenario this replaced, and running it anyway would produce a pass or a fail that
+        # means neither thing.
+        [void](Stop-WacCampaignTree -Process $started.Process)
+        return [PSCustomObject]@{ Scenario = $Scenario; Verdict = 'failed'
+            Detail = ('the operation reached its record but could not be held there ({0}), so the cut would have been a race.' -f $held.Detail) }
+    }
+
     $State.phase = 'awaiting-power-cut'
     $State.cutStep = $Scenario
     $State | Add-Member -NotePropertyName 'resumeKind' -NotePropertyValue $ResumeKind -Force
+    $State | Add-Member -NotePropertyName 'cutHeld' -NotePropertyValue ([string]$held.Detail) -Force
     & $Save -Path $StatePath -State $State
 
     if ($ResumeKind -ceq 'reboot') {
