@@ -115,8 +115,7 @@ function Publish-WacCampaignFault {
     $tail = ''
     try {
         $text = [System.IO.File]::ReadAllText($script:LogPath)
-        $flat = ($text -replace '[
-	 ]+', ' ').Trim()
+        $flat = ($text -replace '\s+', ' ').Trim()
         $tail = $(if ($flat.Length -le 700) { $flat } else { '...' + $flat.Substring($flat.Length - 700) })
     }
     catch { $tail = '(the agent log could not be read)' }
@@ -387,8 +386,7 @@ if ($status -cne 'complete') {
     # The guest's own account travels with a failure, because the host cannot go and read it.
     try {
         $text = [System.IO.File]::ReadAllText($script:LogPath)
-        $flat = ($text -replace '[
-	 ]+', ' ').Trim()
+        $flat = ($text -replace '\s+', ' ').Trim()
         Publish-WacCampaignValue -Name 'AgentLog' -Value $(if ($flat.Length -le 700) { $flat } else { '...' + $flat.Substring($flat.Length - 700) })
     }
     catch { $null = $_ }
