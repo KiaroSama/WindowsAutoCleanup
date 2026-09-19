@@ -271,6 +271,79 @@ Test-Case 'R06-2 two pipes held open in the managed path share ONE drain grant' 
     }
 }
 
+Test-Case 'R06-5 an identity discovered by the LAST pass is terminated, not counted as a survivor' {
+    # The loop binds whatever its rescan found and then ends, so an identity that appeared during the
+    # final pass was bound and never asked to terminate - and the survivor check that follows tests a
+    # process nobody told to stop. That reads as "1 identity/identities in the tree could not be
+    # proven gone", which is the shape of the intermittent this project has carried since 2026-09-11.
+    #
+    # The scan is shimmed rather than raced: a real child, returned only on the call that lands in
+    # the last pass, is the same situation arriving deterministically.
+    $sandbox = New-TestSandbox -Prefix 'late-descendant'
+    $marker = Join-Path -Path $sandbox -ChildPath 'child.pid'
+    $realEnum = Get-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId'
+    $root = $null
+    $child = $null
+    try {
+        $childSource = @(
+            ('[System.IO.File]::WriteAllText("{0}", [string]$PID)' -f $marker)
+            'Start-Sleep -Seconds 40'
+        ) -join '; '
+        $rootSource = @(
+            ('$c = Start-Process -FilePath "{0}" -WindowStyle Hidden -ArgumentList ' -f $script:HostExe) +
+                ("'-NoProfile','-NonInteractive','-EncodedCommand','{0}' -PassThru" -f
+                    [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childSource)))
+            'Start-Sleep -Seconds 40'
+        ) -join '; '
+
+        $root = Start-Process -FilePath $script:HostExe -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-EncodedCommand',
+            [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($rootSource)))
+
+        $appeared = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $marker -PathType Leaf) -and $appeared.Elapsed.TotalSeconds -lt 20) {
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (Test-Path -LiteralPath $marker -PathType Leaf) 'the fixture tree never formed, so this case measures nothing'
+
+        $childId = [int]([System.IO.File]::ReadAllText($marker).Trim())
+        $child = [System.Diagnostics.Process]::GetProcessById($childId)
+        Assert-False $child.HasExited 'the child was not running before the kill'
+
+        # Call 1 is the pre-loop scan; calls 2, 3 and 4 close passes 1, 2 and 3. Only the fourth
+        # hands over the real child, so it is bound by the pass after which the loop stops.
+        # The counter lives in the environment, not in a script variable: the shim runs inside the
+        # module's own scope, where StrictMode turns a first read of an unset variable into a
+        # terminating error - and a case that dies there has not measured its assertion.
+        $env:WAC_LATE_DESCENDANT = [string]$childId
+        $env:WAC_LATE_SCANS = '0'
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId' -Body {
+            param([Parameter(Mandatory = $true)][int]$ProcessId)
+            $null = $ProcessId
+            $seen = 1 + [int]$env:WAC_LATE_SCANS
+            $env:WAC_LATE_SCANS = [string]$seen
+            # Nothing owns 0xFFFFFFC, so it binds nothing and merely keeps the loop going.
+            if ($seen -lt 4) { return @(268435452) }
+            return @([int]$env:WAC_LATE_DESCENDANT)
+        }
+
+        $stopped = Stop-WacProcessTree -ProcessId $root.Id -TimeoutMs 20000
+
+        Assert-True ($child.WaitForExit(15000)) `
+            ('the child discovered by the last pass was never terminated; the call said: ' + [string]$stopped.Reason)
+        Assert-True $stopped.Proven `
+            ('a tree whose last-pass discovery was terminated still reported failure: ' + [string]$stopped.Reason)
+    }
+    finally {
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId' -Body $realEnum
+        $env:WAC_LATE_DESCENDANT = $null
+        $env:WAC_LATE_SCANS = $null
+        if ($child -and -not $child.HasExited) { try { $child.Kill() } catch { $null = $_ } }
+        if ($root) { Stop-Process -Id $root.Id -Force -ErrorAction SilentlyContinue }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Test-Case 'R06-3 the termination floor is granted once for a call, not once per pass' {
     # Stop-WacProcessTree makes up to three passes, and the floor that keeps a very short bound from
     # turning "asked" into "gave up" was recomputed inside the loop. The cap made each wait small and

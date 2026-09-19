@@ -440,6 +440,25 @@ function Stop-WacProcessTree {
             & $bindEach $descendant
         }
 
+        # ONE LAST ASK, because the loop above ends by BINDING rather than by terminating: an
+        # identity its final rescan discovered was bound and then evaluated below without anybody
+        # ever telling it to stop. That is a survivor the call created itself, and it reads exactly
+        # like a real one - "1 identity/identities in the tree could not be proven gone", which is
+        # the intermittent this project carried from 2026-09-11 (ledger R06-5). Costs nothing when
+        # the tree is already gone, because there is then nothing pending to ask.
+        $lastPending = @($bound | Where-Object { [WacNative]::WaitForProcessExit($_.Handle, 0) -ne 0 })
+        if ($lastPending.Count -gt 0) {
+            foreach ($entry in $lastPending) { [void][WacNative]::TerminateBoundProcess($entry.Handle) }
+
+            $grantMs = [int][Math]::Min(5000, (& $remaining))
+            $grantedWaitMs += $grantMs
+            $lastWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            foreach ($entry in $lastPending) {
+                $wait = [int][Math]::Max(0, $grantMs - $lastWatch.Elapsed.TotalMilliseconds)
+                [void][WacNative]::WaitForProcessExit($entry.Handle, $wait)
+            }
+        }
+
         $survivor = New-Object 'System.Collections.Generic.List[int]'
         foreach ($entry in $bound) {
             if ([WacNative]::WaitForProcessExit($entry.Handle, 0) -ne 0) { [void]$survivor.Add([int]$entry.Id) }
