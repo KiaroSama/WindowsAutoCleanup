@@ -1,0 +1,81 @@
+name: Validate reviewed retirement contract
+
+on:
+  push:
+    branches: [audit/review6-recovery-regressions]
+    paths: [.github/workflows/review6-contract-apply.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-apply:
+    if: github.repository == 'KiaroSama/WindowsAutoCleanup' && github.actor == 'KiaroSama' && github.ref == 'refs/heads/audit/review6-recovery-regressions'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Apply the exact assertion correction
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, subprocess
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^']).decode().strip() == '11d69ea0fe8413e8a972c5bbee12652b107f892c'
+          p = Path('Tests/DeploymentGenerationCommit.Tests.ps1')
+          s = p.read_text()
+          assert hashlib.sha256(s.encode()).hexdigest() == '9364e12b656a19766489c21b1779e36b7b147e38060864257dbbdcf23152db39'
+          old = """        # Staging now refuses EARLIER, before a later generation can create a replacement at all.
+                  # Preserve the original safety assertion instead of expecting the old clean-return shape.
+                  Assert-Throws -ScriptBlock {
+                      New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C'
+                  } -Pattern 'rollback journal could not be retired'
+                  Assert-False (Test-Path -LiteralPath $slots.Staging) 'a later generation staged over an unfinished rollback'
+                  Reset-CommitFixture
+          """
+          new = """        # Staging prepares an isolated copy; it does not authorize switching the live generation.
+                  # The installer reconciles before staging, while this lower-level test deliberately tries
+                  # the switch directly to prove an unfinished journal cannot be overwritten.
+                  [void](New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C')
+                  Assert-Throws -ScriptBlock { Switch-WacDeploymentStage -KeepPrevious } -Pattern 'transaction could not be recorded'
+                  Reset-CommitFixture
+          """
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+          assert hashlib.sha256(s.encode()).hexdigest() == '0a5ca0a3a076fe1d2156982db3562a86fcedc73c279da20d9098c07a8c49abc6'
+          p.write_text(s, newline='\n')
+      - name: Execute the complete affected suite on both PowerShell hosts
+        shell: pwsh
+        run: |
+          .\Tests\Run-Tests.ps1 -Host both -Filter DeploymentGenerationCommit -ManifestPath "$env:RUNNER_TEMP\contract-manifest.txt" *>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\contract-output.log"
+          exit $LASTEXITCODE
+      - name: Commit and publish only after the affected suite passes
+        shell: pwsh
+        env:
+          REVIEW_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git add -- Tests/DeploymentGenerationCommit.Tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git config user.name 'WindowsAutoCleanup review'
+          git config user.email '106400900+KiaroSama@users.noreply.github.com'
+          git commit -m 'test: preserve the switch admission check after failed recovery retirement'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $header = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('x-access-token:' + $env:REVIEW_TOKEN))
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $header" push origin HEAD:refs/heads/audit/review6-recovery-regressions
+          exit $LASTEXITCODE
+      - name: Retain the real pre-publication test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: retirement-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/contract-manifest.txt
+            ${{ runner.temp }}/contract-output.log
+          if-no-files-found: warn
+          retention-days: 14
