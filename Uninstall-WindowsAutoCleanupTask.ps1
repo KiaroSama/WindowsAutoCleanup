@@ -413,21 +413,35 @@ function Close-OutstandingJournal {
     #>
     param([Parameter(Mandatory = $true)]$Slots)
 
-    $ok = $true
-    foreach ($kind in @('Swap', 'TaskCapture')) {
-        $path = Get-WacDeploymentJournalPath -DeploymentRoot $Slots.Root -Kind $kind
-        if (-not $path -or -not (Test-Path -LiteralPath $path)) { continue }
-
-        if (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root -Kind $kind) {
-            Write-UninstallerMessage -Level INFO -Message 'A deployment transaction record an earlier run left behind was ended with the deployment it describes.' -Data @{ record = $path }
-            continue
+    foreach ($kind in @('TaskCapture', 'Swap', 'Uninstall')) {
+        if (-not (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root -Kind $kind)) {
+            Write-UninstallerMessage -Level ERROR -Message 'Uninstall evidence cleanup could not finish; its intent remains and blocks installation. Resume the uninstaller after resolving the reported I/O failure.' -Data @{ kind = $kind; root = $Slots.Root }
+            return $false
         }
-
-        Write-UninstallerMessage -Level ERROR -Message 'A deployment transaction record could not be deleted; a later install may try to re-register a task whose files this run removed. Delete it by hand.' -Data @{ record = $path }
-        $ok = $false
     }
+    return $true
+}
 
-    return $ok
+function Write-OutstandingIntentNotice {
+    <#
+    .SYNOPSIS
+        Says, in the run that caused it, that this machine is now fenced and which file fences it.
+    .DESCRIPTION
+        An uninstall records its intent before it removes anything, and every later installer and
+        every scheduled cleanup refuses while that record stands. A run that ends without retiring it
+        therefore leaves a machine that can neither install nor clean - and it used to say only that
+        the files had been kept, leaving the operator to infer both the fence and its cause.
+
+        The remedy named here is resuming the uninstaller, which is what retires the record on
+        evidence. The path is named so nobody has to go looking for what stopped them.
+    #>
+    param([Parameter(Mandatory = $true)]$Slots)
+
+    $path = Get-WacDeploymentJournalPath -DeploymentRoot $Slots.Root -Kind 'Uninstall'
+    if (-not $path) { return }
+    if ([string](Get-WacPathPresence -Path $path) -cne 'Present') { return }
+
+    Write-UninstallerMessage -Level ERROR -Message 'This uninstall did not finish, so the intent record it wrote before it started still stands. While that record is there, every install and every scheduled cleanup on this machine refuses to change anything. Re-run the uninstaller to resume: it retires the record once the removal is accounted for.' -Data @{ record = $path }
 }
 
 function Remove-RetainedLog {
@@ -505,6 +519,10 @@ function Invoke-Main {
     Import-Module -Name 'ScheduledTasks' -ErrorAction Stop
 
     if (-not (Test-RunBudget -Phase 'the registered task was unregistered')) { return 1 }
+    if (-not (Set-WacUninstallIntent -DeploymentRoot $slots.Root)) {
+        Write-UninstallerMessage -Level ERROR -Message 'The uninstall intent could not be recorded, so no task or deployment was removed.'
+        return 6
+    }
     $tasks = Remove-InstalledTask -DeploymentRoot $slots.Root
 
     # The files go LAST, and only when nothing can still reach them (ledger B2-3). A failed or
@@ -528,7 +546,13 @@ function Invoke-Main {
     }
     else {
         $deployment = Remove-InstalledDeployment -Slots $slots
-        if ($deployment.Clean) { [void](Close-OutstandingJournal -Slots $slots) }
+        if ($deployment.Clean -and $tasks.Clean -and -not $tasks.Refused) {
+            $journalsEnded = Close-OutstandingJournal -Slots $slots
+            if (-not $journalsEnded) {
+                Write-UninstallerMessage -Level ERROR -Message 'Final status: incomplete. Files were removed but recovery evidence is still pending; resume the uninstaller.'
+                return 6
+            }
+        }
     }
 
     if ($RemoveLogs -and $KeepLogs) {
@@ -547,11 +571,13 @@ function Invoke-Main {
     # is a different instruction to the operator than "something broke".
     if ($tasks.Refused -or $deployment.Refused) {
         Write-UninstallerMessage -Level ERROR -Message 'Final status: refused. Something at the task path or the deployment path could not be proven to belong to WindowsAutoCleanup and was left exactly as it was found.'
+        Write-OutstandingIntentNotice -Slots $slots
         return 7
     }
 
     if (-not $tasks.Clean -or -not $deployment.Clean) {
         Write-UninstallerMessage -Level ERROR -Message 'Final status: incomplete. See the errors above.'
+        Write-OutstandingIntentNotice -Slots $slots
         return 1
     }
 

@@ -223,6 +223,25 @@ function Get-WacProcessInvoker { return $script:ProcessInvoker }
 function Invoke-WacProcess {
     <#
     .SYNOPSIS
+        Measures the complete operation, including initialization and final handle cleanup.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [AllowEmptyCollection()][string[]]$ArgumentList = @(),
+        [Parameter(Mandatory = $true)][int]$TimeoutMs,
+        [string]$Component = 'Process'
+    )
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $result = Invoke-WacProcessCore -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutMs $TimeoutMs -Component $Component
+    $watch.Stop()
+    if ($null -ne $result -and -not $script:ProcessInvoker) { $result.DurationMs = [int]$watch.Elapsed.TotalMilliseconds }
+    return $result
+}
+
+function Invoke-WacProcessCore {
+    <#
+    .SYNOPSIS
         Runs an external tool with a hard deadline, full output capture and process-tree termination.
     #>
     [CmdletBinding()]
@@ -237,6 +256,7 @@ function Invoke-WacProcess {
         return (& $script:ProcessInvoker $FilePath $ArgumentList $TimeoutMs)
     }
 
+    $TimeoutMs = Get-WacStepTimeoutMs -RequestedMs $TimeoutMs
     if ($TimeoutMs -le 0) {
         Write-WacLog -Level WARNING -Component $Component -Message 'Run budget exhausted before the tool could start.' -Data @{ tool = $FilePath }
         return [PSCustomObject]@{
@@ -256,7 +276,9 @@ function Invoke-WacProcess {
     # time, and handing the root the original -TimeoutMs afterwards means the operation as a whole
     # always overruns by however long that took (ledger WAC-06R).
     $setupWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    try { $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList }
+    $deadlineTick = [System.Diagnostics.Stopwatch]::GetTimestamp() +
+        [long]($TimeoutMs * ([System.Diagnostics.Stopwatch]::Frequency / 1000.0))
+    try { $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList -DeadlineTick $deadlineTick }
     catch { $launch = $null }
     $setupWatch.Stop()
     $ownedBudgetMs = [int][Math]::Max(0, $TimeoutMs - $setupWatch.Elapsed.TotalMilliseconds)
@@ -294,7 +316,7 @@ function Invoke-WacProcess {
             }
 
             return [PSCustomObject]@{
-                ExitCode = $null; TimedOut = $false
+                ExitCode = $null; TimedOut = [bool]$launch.DeadlineExpired
                 StandardOutput = ''; StandardError = [string]$launch.Failure
                 DurationMs = 0; Started = $false
                 TerminationProven = $createdStopped; OutputComplete = $true
@@ -400,6 +422,13 @@ function Invoke-WacProcess {
             setupMs = ([int]$TimeoutMs - $fallbackBudgetMs)
         }
 
+        if ((& $remaining) -le 0 -or (Test-WacDeadlineExpired)) {
+            return [PSCustomObject]@{
+                ExitCode = $null; TimedOut = $true; StandardOutput = ''; StandardError = ''
+                DurationMs = 0; Started = $false; TerminationProven = $true; OutputComplete = $true
+                Owned = $false; OwnedTreeState = 'Complete'
+            }
+        }
         $process = [System.Diagnostics.Process]::Start($psi)
         if (-not $process) { throw 'Process.Start returned no process.' }
 
@@ -473,7 +502,8 @@ function Invoke-WacProcess {
         # case (ledger WAC-05R): incomplete output became the empty string, which a caller parsing
         # stdout reads as a real, empty answer - "pnputil found no drivers" rather than "the answer
         # never arrived" - and a finished root reported TerminationProven anyway.
-        $outputComplete = ($outTask.IsCompleted -and $errTask.IsCompleted)
+        $outputComplete = ($outTask.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion -and
+            $errTask.Status -eq [System.Threading.Tasks.TaskStatus]::RanToCompletion)
         $stdout = if ($outTask.IsCompleted) { [string]$outTask.Result } else { '' }
         $stderr = if ($errTask.IsCompleted) { [string]$errTask.Result } else { '' }
 

@@ -40,6 +40,22 @@ function Reset-WacTestBudget {
     Reset-WacAbandonedMutator
 }
 
+function Set-BudgetExpiryAfterLaunch {
+    param([switch]$Unowned)
+    # Warm compilation separately: these cases measure running-child teardown, not cold setup.
+    Assert-True (Initialize-WacOwnedProcessNative) 'the native fixture launcher could not be initialized'
+    if ($Unowned) { [void](Set-WacOwnedProcessFault -Phase JobAssign) }
+    Set-WacOwnedProcessLauncher -Launcher {
+        param($FilePath, $ArgumentList)
+        Set-WacOwnedProcessLauncher -Launcher $null
+        $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList
+        # The unowned fixture measures drains after root exit, not a pre-start timeout.
+        if (-not $launch.Owned) { [void][WacOwnedProcess]::WaitForExit($launch.Process, 10000) }
+        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddSeconds(-1))
+        return $launch
+    }
+}
+
 function New-BlockingModule {
     <#
     .SYNOPSIS
@@ -216,7 +232,7 @@ Test-Case 'a timed-out tool charges its own shutdown waits to the reserve' {
     try {
         Reset-WacTestBudget
         Reset-WacShutdownReserve -ReserveMs 3000
-        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddSeconds(-1))
+        Set-BudgetExpiryAfterLaunch
 
         $result = Invoke-WacProcess -FilePath $host5 -TimeoutMs 500 `
             -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 300')
@@ -226,6 +242,7 @@ Test-Case 'a timed-out tool charges its own shutdown waits to the reserve' {
             ('a timed-out tool took its shutdown waits without charging the reserve: {0} ms still there' -f (Get-WacShutdownReserveMs))
     }
     finally {
+        Set-WacOwnedProcessLauncher -Launcher $null
         Reset-WacTestBudget
     }
 }
@@ -268,7 +285,7 @@ Test-Case 'two held pipes drain against ONE grant, not one grant each' {
     try {
         Reset-WacTestBudget
         Reset-WacShutdownReserve -ReserveMs 3000
-        Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddSeconds(-1))
+        Set-BudgetExpiryAfterLaunch -Unowned
 
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         $result = Invoke-WacProcess -FilePath $host5 -TimeoutMs 20000 `
@@ -291,6 +308,8 @@ Test-Case 'two held pipes drain against ONE grant, not one grant each' {
             ('the two drains spent more than the one grant that was reserved: {0} ms' -f [int]$watch.Elapsed.TotalMilliseconds)
     }
     finally {
+        Set-WacOwnedProcessLauncher -Launcher $null
+        [void](Set-WacOwnedProcessFault -Phase None)
         [void](Stop-MarkedChild -MarkerPath $marker)
         Reset-WacTestBudget
         Remove-TestSandbox -Path $sandbox
@@ -306,6 +325,7 @@ Test-Case 'a root that exits leaves the tree what is LEFT of the operation, not 
     $host5 = if ($env:WAC_PROBE_HOST) { [string]$env:WAC_PROBE_HOST } else { [string](Get-Process -Id $PID).Path }
     try {
         Reset-WacTestBudget
+        Assert-True (Initialize-WacOwnedProcessNative)
 
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         # The root holds MOST of the budget on purpose: what is left for the tree is then about a

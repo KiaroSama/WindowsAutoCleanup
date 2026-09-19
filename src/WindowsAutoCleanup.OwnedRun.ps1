@@ -164,7 +164,7 @@ function Invoke-WacOwnedTool {
 
     # Reclamped immediately before the wait: acquiring the readers above is cheap but not free, and
     # a phase that starts from the ORIGINAL number has already overrun by whatever preceded it.
-    $exited = [WacOwnedProcess]::WaitForExit($Launch.Process, (& $remaining))
+    $exited = [WacOwnedProcess]::WaitForExit($Launch.Process, (Get-WacStepTimeoutMs -RequestedMs (& $remaining)))
     if ($script:OwnedRunFault -ceq 'Wait') {
         throw ('injected runner failure while waiting for {0}' -f $FilePath)
     }
@@ -233,6 +233,13 @@ function Invoke-WacOwnedTool {
                 activeProcesses = [int]$tree.ActiveProcesses
             }
         }
+    }
+    if (-not $timedOut -and [string]$tree.State -ceq 'Alive' -and
+        ((& $remaining) -le 0 -or (Test-WacDeadlineExpired))) {
+        $timedOut = $true
+        $exitCode = $null
+        $killedJob = [bool][WacOwnedProcess]::TerminateJob($Launch.Job)
+        $tree = Wait-WacOwnedTreeQuiet -Launch $Launch -BudgetMs (Request-WacWaitMs -RequestedMs 5000)
     }
     # ONE allowance, ONE deadline, BOTH pipes, and only now. Request-WacWaitMs CLAIMS what it grants
     # - that is the whole point of a reserve that cannot refill - so passing the same grant to two

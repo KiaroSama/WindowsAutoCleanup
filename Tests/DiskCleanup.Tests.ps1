@@ -585,7 +585,7 @@ Test-Case 'R05-4 a snapshot record from an EARLIER run is never adopted as this 
 
             $result = Invoke-WacLegacyDiskCleanup -Enabled -SageId 9999
 
-            Assert-Equal 'SafeSkip' ([string]$result.Outcome) ([string]$result.Detail)
+            Assert-Equal 'Incomplete' ([string]$result.Outcome) ([string]$result.Detail)
             Assert-Equal 0 $script:StubCall.Count 'cleanmgr ran while an earlier run''s recovery record was still outstanding'
 
             # THE RECORD SURVIVES BYTE FOR BYTE. Declining is only half the repair: adopting it and

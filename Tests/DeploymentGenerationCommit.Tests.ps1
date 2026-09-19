@@ -401,15 +401,18 @@ Test-Case 'A record that cannot be deleted keeps the transaction open, and no la
         [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::ReadOnly)
         [void][System.IO.Directory]::CreateDirectory($record + '.new')
 
-        $acted = Invoke-RecoveryHalf -Slots $slots
-        Assert-Equal 'Restored' ([string]$acted.Action) ([string]$acted.Reason)
+        # Restoring bytes is not a clean transaction close. The caller must receive the retirement
+        # failure while the original remains restored and the unfinished record remains on disk.
+        Assert-Throws -ScriptBlock { Invoke-RecoveryHalf -Slots $slots } -Pattern 'rollback journal could not be retired'
         Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'the tree the record described was not the one put back'
         Assert-True (Test-Path -LiteralPath $record -PathType Leaf) `
             'a record that could not be deleted vanished anyway, so the failure this case is about did not happen'
         Assert-False (Remove-WacDeploymentJournal -DeploymentRoot $slots.Root) `
             'a removal that cannot finish reported the transaction closed'
 
-        # And no other generation may write over what is still unfinished.
+        # Staging prepares an isolated copy; it does not authorize switching the live generation.
+        # The installer reconciles before staging, while this lower-level test deliberately tries
+        # the switch directly to prove an unfinished journal cannot be overwritten.
         [void](New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C')
         Assert-Throws -ScriptBlock { Switch-WacDeploymentStage -KeepPrevious } -Pattern 'transaction could not be recorded'
         Reset-CommitFixture
@@ -419,6 +422,11 @@ Test-Case 'A record that cannot be deleted keeps the transaction open, and no la
             'a later generation overwrote the record of the unfinished one'
 
         [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::Normal)
+        [System.IO.Directory]::Delete($record + '.new')
+        $retry = Invoke-RecoveryHalf -Slots $slots
+        Assert-Equal 'Restored' ([string]$retry.Action) ([string]$retry.Reason)
+        Assert-False (Test-Path -LiteralPath $record) 'recovery still could not retire its record after the obstruction was removed'
+        Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'a successful retirement retry changed the original'
     }
 }
 
@@ -459,18 +467,17 @@ Test-Case 'A capture from a DIFFERENT generation is never closed by this one, co
 
         $open = Get-WacDeploymentRecoveryPlan -DeploymentRoot $slots.Root
         Assert-False $open.Linked 'two records from different runs were read as one transaction'
-        Assert-Equal 'RestoreOriginal' ([string]$open.Verdict) `
+        Assert-Equal 'Refuse' ([string]$open.Verdict) `
             ('an open swap beside a capture it does not account for was closed anyway: {0}' -f [string]$open.Reason)
 
         [void](Set-RecordCommitted -Root $slots.Root -Committed)
         $done = Get-WacDeploymentRecoveryPlan -DeploymentRoot $slots.Root
         Assert-False $done.Linked 'stamping the swap record committed changed which generation the capture belongs to'
-        Assert-Equal 'CommitReplacement' ([string]$done.Verdict) ([string]$done.Reason)
+        Assert-Equal 'Refuse' ([string]$done.Verdict) ([string]$done.Reason)
 
-        $acted = Invoke-RecoveryHalf -Slots $slots
-        Assert-Equal 'Discarded' ([string]$acted.Action) ([string]$acted.Reason)
-        Assert-Equal ('root=' + $replacement + '; previous=<absent>; swapRecord=absent; captureRecord=present') (Get-CommitShape -Slots $slots) `
-            'the file half destroyed the only description this machine had of a registration it may be missing'
+        Assert-Throws { Resolve-WacDeploymentRecoverySlot -Slots $slots } -Pattern 'different generations'
+        Assert-Equal ('root=' + $replacement + '; previous=' + $original + '; swapRecord=present; captureRecord=present') (Get-CommitShape -Slots $slots) `
+            'generation disagreement altered files or erased either recovery record'
         Assert-True ($original.Length -gt 0) 'the fixture never inventoried the original it was meant to supersede'
     }
 }
@@ -527,8 +534,8 @@ Test-Case 'An ALTERED original is preserved rather than discarded, and an EMPTY 
         Assert-Equal 'Empty' ([string](Get-RecordField -Root $slots.Root -Name 'OriginalState')) `
             'the record does not describe the empty original this half of the case is about'
         Assert-True $open.Corroboration.Corroborated ([string]$open.Corroboration.Reason)
-        Assert-Equal 'Refuse' ([string]$open.Verdict) `
-            ('an open transaction was closed because what it moved aside happened to be worthless: {0}' -f [string]$open.Reason)
+        Assert-Equal 'RestoreOriginal' ([string]$open.Verdict) `
+            ('an empty original was not recognized as a recoverable pre-install state: {0}' -f [string]$open.Reason)
         Assert-Equal ('root=' + $replacement + '; previous=<empty>; swapRecord=present; captureRecord=absent') (Get-CommitShape -Slots $slots) `
             'reading the plan changed the disk'
 
