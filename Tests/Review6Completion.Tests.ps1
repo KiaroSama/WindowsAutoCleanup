@@ -16,9 +16,9 @@ Test-Case 'A monotonic uptime decrease proves a restart regardless of wall-clock
     $saved = & $script:Core { (Get-Command Get-WacMachineUptimeMs).ScriptBlock }
     try {
         & $script:Core { function script:Get-WacMachineUptimeMs { return 1000L } }
-        $proof = Test-WacMachineRestartedSince -RaisedUtc 'not a clock' -RaisedUptimeMs 2000L
+        $proof = Test-WacMachineRestartedSince -RaisedUtc 'not a clock' -RaisedUptimeMs (2000L)
         Assert-True ([bool]$proof.Restarted) 'positive monotonic restart evidence was rejected'
-        $same = Test-WacMachineRestartedSince -RaisedUtc '1900-01-01' -RaisedUptimeMs 500L
+        $same = Test-WacMachineRestartedSince -RaisedUtc '1900-01-01' -RaisedUptimeMs (500L)
         Assert-False ([bool]$same.Restarted) 'a larger current counter is not proof of a new boot'
     }
     finally { & $script:Core { param($body) Set-Item function:script:Get-WacMachineUptimeMs $body } $saved }
@@ -46,7 +46,7 @@ Test-Case 'A bounded mutator is external unless its caller proves host-confined 
         Assert-True ([bool]$run.TimedOut) 'the fixture did not reach abandonment'
         $record = Read-WacQuarantineMarker
         Assert-Equal 'Valid' ([string]$record.State) 'no durable abandonment was recorded'
-        Assert-Equal 'External' ([string]$record.Record.Kind) 'service-dispatching work was incorrectly tied to host lifetime'
+        Assert-Equal 'External' ([string]$record.Record.OperationKind) 'service-dispatching work was incorrectly tied to host lifetime'
     }
     finally {
         Start-Sleep -Milliseconds 2200

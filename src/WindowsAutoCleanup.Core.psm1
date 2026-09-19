@@ -46,6 +46,17 @@ $script:CoreModulePath      = $PSCommandPath
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Trust.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentFence.ps1')
 
+function Initialize-WacOwnedProcessBounded {
+    <#
+    .SYNOPSIS
+        Compile the exported native helper in a real bounded worker, never on the launch thread.
+    #>
+    param([int]$TimeoutMs)
+    return (Invoke-WacBounded -TimeoutMs $TimeoutMs -Component 'ProcessSetup' -ScriptBlock {
+        Initialize-WacOwnedProcessNative
+    })
+}
+
 Export-ModuleMember -Function @(
     'Initialize-WacNative',
     'Get-WacNormalizedPath', 'Get-WacLongPath', 'Get-WacTargetDrive',

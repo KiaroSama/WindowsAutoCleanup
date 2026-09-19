@@ -413,21 +413,13 @@ function Close-OutstandingJournal {
     #>
     param([Parameter(Mandatory = $true)]$Slots)
 
-    $ok = $true
-    foreach ($kind in @('Swap', 'TaskCapture')) {
-        $path = Get-WacDeploymentJournalPath -DeploymentRoot $Slots.Root -Kind $kind
-        if (-not $path -or -not (Test-Path -LiteralPath $path)) { continue }
-
-        if (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root -Kind $kind) {
-            Write-UninstallerMessage -Level INFO -Message 'A deployment transaction record an earlier run left behind was ended with the deployment it describes.' -Data @{ record = $path }
-            continue
+    foreach ($kind in @('TaskCapture', 'Swap', 'Uninstall')) {
+        if (-not (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root -Kind $kind)) {
+            Write-UninstallerMessage -Level ERROR -Message 'Uninstall evidence cleanup could not finish; its intent remains and blocks installation. Resume the uninstaller after resolving the reported I/O failure.' -Data @{ kind = $kind; root = $Slots.Root }
+            return $false
         }
-
-        Write-UninstallerMessage -Level ERROR -Message 'A deployment transaction record could not be deleted; a later install may try to re-register a task whose files this run removed. Delete it by hand.' -Data @{ record = $path }
-        $ok = $false
     }
-
-    return $ok
+    return $true
 }
 
 function Remove-RetainedLog {
@@ -505,6 +497,10 @@ function Invoke-Main {
     Import-Module -Name 'ScheduledTasks' -ErrorAction Stop
 
     if (-not (Test-RunBudget -Phase 'the registered task was unregistered')) { return 1 }
+    if (-not (Set-WacUninstallIntent -DeploymentRoot $slots.Root)) {
+        Write-UninstallerMessage -Level ERROR -Message 'The uninstall intent could not be recorded, so no task or deployment was removed.'
+        return 6
+    }
     $tasks = Remove-InstalledTask -DeploymentRoot $slots.Root
 
     # The files go LAST, and only when nothing can still reach them (ledger B2-3). A failed or
@@ -528,7 +524,13 @@ function Invoke-Main {
     }
     else {
         $deployment = Remove-InstalledDeployment -Slots $slots
-        if ($deployment.Clean) { [void](Close-OutstandingJournal -Slots $slots) }
+        if ($deployment.Clean -and $tasks.Clean -and -not $tasks.Refused) {
+            $journalsEnded = Close-OutstandingJournal -Slots $slots
+            if (-not $journalsEnded) {
+                Write-UninstallerMessage -Level ERROR -Message 'Final status: incomplete. Files were removed but recovery evidence is still pending; resume the uninstaller.'
+                return 6
+            }
+        }
     }
 
     if ($RemoveLogs -and $KeepLogs) {

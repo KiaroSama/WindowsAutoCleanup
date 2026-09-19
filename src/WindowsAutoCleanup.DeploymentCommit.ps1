@@ -86,8 +86,13 @@ function Set-WacRecoveryTaskAcknowledgement {
         Records completion of the task half before any recovery file is removed.
     #>
     param([string]$DeploymentRoot, [ValidateSet('RestoreOriginal', 'CommitReplacement')][string]$Verdict)
+    $kind = 'Swap'
     $read = Read-WacDeploymentJournal -DeploymentRoot $DeploymentRoot
+    if ([string]$read.State -ceq 'Absent') {
+        $kind = 'TaskCapture'
+        $read = Read-WacDeploymentJournal -DeploymentRoot $DeploymentRoot -Kind $kind
+    }
     if ([string]$read.State -cne 'Valid') { return $false }
     $read.Record | Add-Member -NotePropertyName TaskReconciledVerdict -NotePropertyValue $Verdict -Force
-    return (Write-WacDeploymentJournal -DeploymentRoot $DeploymentRoot -Record $read.Record)
+    return (Write-WacDeploymentJournal -DeploymentRoot $DeploymentRoot -Kind $kind -Record $read.Record)
 }

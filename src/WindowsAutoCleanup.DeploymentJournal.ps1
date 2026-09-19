@@ -228,13 +228,14 @@ function Get-WacDeploymentJournalPath {
     #>
     param(
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
     $root = Get-WacNormalizedPath -Path $DeploymentRoot
     if (-not $root) { return $null }
 
+    if ($Kind -ceq 'Uninstall') { return ($root + '.uninstall.json') }
     if ($Kind -ceq 'TaskCapture') { return ($root + $script:TaskCaptureJournalSuffix) }
     return ($root + $script:DeploymentJournalSuffix)
 }
@@ -248,7 +249,7 @@ function Write-WacDeploymentJournal {
     param(
         [Parameter(Mandatory = $true)]$Record,
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind $Kind
@@ -314,7 +315,7 @@ function Read-WacDeploymentJournal {
     #>
     param(
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     $result = [PSCustomObject]@{ State = 'Absent'; Record = $null; Schema = 0; Generation = ''; Reason = '' }
@@ -405,7 +406,7 @@ function Remove-WacDeploymentJournal {
     #>
     param(
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind $Kind

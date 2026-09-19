@@ -487,7 +487,8 @@ function Resolve-InterruptedTaskCapture {
     }
     else { $result = Resolve-WacInterruptedTaskCaptureCore -DeploymentRoot $DeploymentRoot -Lookup $Lookup -Plan $Plan }
 
-    if ($result.Ok -and $null -ne $Plan.Swap -and [string]$Plan.Swap.State -ceq 'Valid' -and [string]$Plan.Verdict -cne 'None') {
+    if ($result.Ok -and $null -ne $Plan.Swap -and [string]$Plan.Verdict -cne 'None' -and
+        ([string]$Plan.Swap.State -ceq 'Valid' -or [string]$Plan.Capture.State -ceq 'Valid')) {
         $result.Ok = [bool](Set-WacRecoveryTaskAcknowledgement -DeploymentRoot $DeploymentRoot -Verdict $Plan.Verdict)
         if (-not $result.Ok) { $result.Reason = 'The task state was reconciled but its durable acknowledgement failed; no file recovery is authorized.' }
     }

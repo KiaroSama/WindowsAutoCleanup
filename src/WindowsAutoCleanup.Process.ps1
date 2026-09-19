@@ -256,6 +256,7 @@ function Invoke-WacProcessCore {
         return (& $script:ProcessInvoker $FilePath $ArgumentList $TimeoutMs)
     }
 
+    $TimeoutMs = Get-WacStepTimeoutMs -RequestedMs $TimeoutMs
     if ($TimeoutMs -le 0) {
         Write-WacLog -Level WARNING -Component $Component -Message 'Run budget exhausted before the tool could start.' -Data @{ tool = $FilePath }
         return [PSCustomObject]@{

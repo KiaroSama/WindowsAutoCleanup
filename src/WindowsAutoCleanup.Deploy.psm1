@@ -41,6 +41,7 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanu
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentProof.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentJournal.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentRecovery.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.UninstallIntent.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentCommit.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ScheduledTask.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TaskMatch.ps1')
@@ -661,7 +662,7 @@ function Install-WacDeployment {
 }
 
 Export-ModuleMember -Function @(
-    'Get-WacTaskName', 'Get-WacTaskFolder', 'Get-WacTaskSentinel', 'Get-WacTaskDescription',
+    'Set-WacUninstallIntent', 'Get-WacTaskName', 'Get-WacTaskFolder', 'Get-WacTaskSentinel', 'Get-WacTaskDescription',
     'Get-WacOperationLockName', 'Get-WacDeploymentVersion', 'Get-WacDeploymentProjectId',
     'Get-WacDeploymentManifestPath', 'New-WacDeploymentManifest', 'Read-WacDeploymentManifest',
     'Get-WacDeploymentFileHash', 'Get-WacDeploymentOwnership', 'Get-WacDeploymentFingerprint',

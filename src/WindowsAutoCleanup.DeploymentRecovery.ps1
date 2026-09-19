@@ -197,6 +197,13 @@ function Get-WacDeploymentRecoveryPlan {
     }
     if (-not $slots) { return $plan }
 
+    # An authorized uninstall must finish before an older upgrade may restore any registration.
+    $uninstall = Read-WacDeploymentJournal -DeploymentRoot $slots.Root -Kind Uninstall
+    if ([string]$uninstall.State -cne 'Absent') {
+        $plan.Reason = 'An uninstall intent is outstanding or unreadable. Resume the uninstaller; no task or deployment was resurrected.'
+        return $plan
+    }
+
     $swap = Read-WacDeploymentJournal -DeploymentRoot $slots.Root
     $capture = Read-WacTaskCaptureRecord -DeploymentRoot $slots.Root
     $plan.Swap = $swap
@@ -473,8 +480,12 @@ function Resolve-WacDeploymentRecoverySlot {
         return $result
     }
 
+    $ackRecord = $plan.Swap.Record
+    if ([string]$plan.Swap.State -ceq 'Absent' -and [string]$plan.Capture.State -ceq 'Valid') {
+        $ackRecord = (Read-WacDeploymentJournal -DeploymentRoot $Slots.Root -Kind TaskCapture).Record
+    }
     if ([string]$plan.Capture.State -ceq 'Valid' -and
-        ([string](Get-WacJournalField -Record $plan.Swap.Record -Name 'TaskReconciledVerdict')) -cne [string]$plan.Verdict) {
+        ([string](Get-WacJournalField -Record $ackRecord -Name 'TaskReconciledVerdict')) -cne [string]$plan.Verdict) {
         throw 'The task half has not been durably reconciled to this recovery decision; no files were changed.'
     }
 

@@ -459,18 +459,17 @@ Test-Case 'A capture from a DIFFERENT generation is never closed by this one, co
 
         $open = Get-WacDeploymentRecoveryPlan -DeploymentRoot $slots.Root
         Assert-False $open.Linked 'two records from different runs were read as one transaction'
-        Assert-Equal 'RestoreOriginal' ([string]$open.Verdict) `
+        Assert-Equal 'Refuse' ([string]$open.Verdict) `
             ('an open swap beside a capture it does not account for was closed anyway: {0}' -f [string]$open.Reason)
 
         [void](Set-RecordCommitted -Root $slots.Root -Committed)
         $done = Get-WacDeploymentRecoveryPlan -DeploymentRoot $slots.Root
         Assert-False $done.Linked 'stamping the swap record committed changed which generation the capture belongs to'
-        Assert-Equal 'CommitReplacement' ([string]$done.Verdict) ([string]$done.Reason)
+        Assert-Equal 'Refuse' ([string]$done.Verdict) ([string]$done.Reason)
 
-        $acted = Invoke-RecoveryHalf -Slots $slots
-        Assert-Equal 'Discarded' ([string]$acted.Action) ([string]$acted.Reason)
-        Assert-Equal ('root=' + $replacement + '; previous=<absent>; swapRecord=absent; captureRecord=present') (Get-CommitShape -Slots $slots) `
-            'the file half destroyed the only description this machine had of a registration it may be missing'
+        Assert-Throws { Resolve-WacDeploymentRecoverySlot -Slots $slots } -Pattern 'different generations'
+        Assert-Equal ('root=' + $replacement + '; previous=' + $original + '; swapRecord=present; captureRecord=present') (Get-CommitShape -Slots $slots) `
+            'generation disagreement altered files or erased either recovery record'
         Assert-True ($original.Length -gt 0) 'the fixture never inventoried the original it was meant to supersede'
     }
 }
@@ -527,8 +526,8 @@ Test-Case 'An ALTERED original is preserved rather than discarded, and an EMPTY 
         Assert-Equal 'Empty' ([string](Get-RecordField -Root $slots.Root -Name 'OriginalState')) `
             'the record does not describe the empty original this half of the case is about'
         Assert-True $open.Corroboration.Corroborated ([string]$open.Corroboration.Reason)
-        Assert-Equal 'Refuse' ([string]$open.Verdict) `
-            ('an open transaction was closed because what it moved aside happened to be worthless: {0}' -f [string]$open.Reason)
+        Assert-Equal 'RestoreOriginal' ([string]$open.Verdict) `
+            ('an empty original was not recognized as a recoverable pre-install state: {0}' -f [string]$open.Reason)
         Assert-Equal ('root=' + $replacement + '; previous=<empty>; swapRecord=present; captureRecord=absent') (Get-CommitShape -Slots $slots) `
             'reading the plan changed the disk'
 

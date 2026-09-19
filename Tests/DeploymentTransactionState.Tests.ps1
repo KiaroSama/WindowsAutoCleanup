@@ -453,14 +453,14 @@ Test-Case 'The uninstaller ends outstanding records, and only once the removal i
     }, $true) | Where-Object { $_.GetCommandName() -eq 'Close-OutstandingJournal' })
     Assert-Equal 1 $closers.Count 'the uninstaller no longer ends the transaction records it leaves behind'
 
-    Assert-True ($text -match '(?s)\$deployment = Remove-InstalledDeployment[^\r\n]*\r?\n\s*if \(\$deployment\.Clean\) \{ \[void\]\(Close-OutstandingJournal') `
+    Assert-True ($text -match '(?s)\$deployment = Remove-InstalledDeployment[^\r\n]*\r?\n\s*if \(\$deployment\.Clean[^)]*\) \{\s*\$journalsEnded = Close-OutstandingJournal') `
         'the records are ended somewhere other than immediately after a PROVEN clean deployment removal'
 
     Assert-True ($text -match '(?s)function Close-OutstandingJournal[\s\S]{0,3000}?Remove-WacDeploymentJournal') `
         'the closing step no longer deletes the records'
     # No -f here: the quantifier {0,3000} IS a format placeholder to the format operator - argument
     # zero padded to a width of three thousand - so the pattern silently stopped being a pattern.
-    foreach ($kind in @('Swap', 'TaskCapture')) {
+    foreach ($kind in @('Swap', 'TaskCapture', 'Uninstall')) {
         Assert-True ($text -match ("(?s)function Close-OutstandingJournal[\s\S]{0,3000}?'" + $kind + "'")) `
             ('the closing step never names the {0} record' -f $kind)
     }

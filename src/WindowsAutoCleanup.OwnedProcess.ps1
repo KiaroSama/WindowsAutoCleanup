@@ -619,10 +619,8 @@ function Start-WacOwnedProcess {
         # Compilation runs inside the existing bounded worker; it can never launch a tool.
         $left = [int][Math]::Max(0, [Math]::Min([int]::MaxValue,
             ($DeadlineTick - [System.Diagnostics.Stopwatch]::GetTimestamp()) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency))
-        $compiled = Invoke-WacBounded -TimeoutMs $left -Component 'ProcessSetup' -ScriptBlock {
-            & (Get-Module WindowsAutoCleanup.Core) { Initialize-WacOwnedProcessNative }
-        }
-        if ($compiled.Outcome -cne 'Succeeded') { return $null }
+        $compiled = Initialize-WacOwnedProcessBounded -TimeoutMs $left
+        if ($compiled.Outcome -cne 'Succeeded' -or -not ('WacOwnedProcess' -as [type])) { return $null }
     }
     if (-not (Initialize-WacOwnedProcessNative)) { return $null }
     if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTick) { return $null }

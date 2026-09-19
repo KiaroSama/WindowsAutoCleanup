@@ -469,7 +469,7 @@ function Test-WacDiskCleanupProfileExact {
 function Save-WacCleanMgrSnapshot {
     param([object[]]$Snapshot)
     $write = Write-WacControlFile -Name $script:CleanMgrSnapshotName -Content (ConvertTo-Json -InputObject @($Snapshot) -Depth 4)
-    return ([string]$write.Kind -ceq 'Created')
+    return [string]$write.Kind
 }
 
 function Invoke-WacLegacyDiskCleanup {
@@ -570,8 +570,8 @@ function Invoke-WacLegacyDiskCleanup {
             $outcome = 'SafeSkip'
             $detail = 'The existing cleanmgr profile could not be read, so nothing was changed: {0}' -f $snapshotRun.Error
         }
-        elseif (-not (Save-WacCleanMgrSnapshot -Snapshot $snapshot)) {
-            $outcome = 'Incomplete'
+        elseif ([string]($snapshotWrite = Save-WacCleanMgrSnapshot -Snapshot $snapshot) -cne 'Created') {
+            $outcome = if ($snapshotWrite -ceq 'Present') { 'Incomplete' } else { 'SafeSkip' }
             $detail = 'The cleanmgr recovery record is unavailable or already held; no profile was changed. Resolve the retained original before retrying.'
         }
         elseif (-not (Test-WacMutationAllowed)) {
