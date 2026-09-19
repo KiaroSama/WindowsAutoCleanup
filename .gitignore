@@ -101,6 +101,7 @@ Desktop.ini
 /.cline/
 /graphify-out/
 /.codebase-memory/
+/.specify/
 .ignoreme
 **/.ignoreme
 /.env
