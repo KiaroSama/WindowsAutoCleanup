@@ -26,7 +26,19 @@ The host never asks for, accepts, stores or logs a guest credential. It has exac
 
 Because neither channel can run code in the guest, a campaign requires a guest that was armed **once, deliberately, by its owner**. That is what makes this opt-in structural rather than a flag somebody can set by accident.
 
-## Arming a guest (once, inside the VM, elevated)
+## Arming a guest
+
+**A guest that has the agent arms itself.** On every clean boot the agent waits for WMI, registers
+its own scheduled task through `Register-WacCampaignAgent.ps1`, and removes whatever weaker start
+path brought it up, so one durable path remains. It reports the result to the host as
+`AgentArming = task-registered+gp-removed`, then `task-already-present` on later boots. Nothing has
+to be typed in the guest for a machine that is already running the agent.
+
+### The first arming, inside the VM, elevated
+
+A guest with no agent at all still needs one deliberate act by its owner - the host can deliver files
+and read what the guest publishes, but it cannot start anything in there:
+
 
 **This step cannot be done from the host, and that is not a gap in the tooling.** Every credential-free
 route from outside the guest is a technique in its own right: reaching into the offline disk to write
