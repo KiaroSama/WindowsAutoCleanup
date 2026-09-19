@@ -264,6 +264,11 @@ function Resolve-WacPlanWithoutSlot {
     $journal = $Plan.Swap.Record
 
     if (Test-WacDeploymentGenerationCommitted -Record $journal) {
+        if (-not $Plan.Live.IsHealthy -or
+            -not (Test-WacDeploymentIsRecordedReplacement -Root $root -Record $journal)) {
+            $Plan.Reason = 'The committed replacement is no longer healthy or no longer matches its recorded identity; no recovery evidence was retired.'
+            return $Plan
+        }
         $Plan.Verdict = 'CommitReplacement'
         $Plan.Reason = 'An earlier run recorded that its generation committed and left no recovery copy, so nothing but its own record is outstanding.'
         return $Plan
@@ -352,7 +357,10 @@ function Resolve-WacPlanWithSlot {
     # ONE comparison, read by BOTH promotion branches. It used to be computed only for the
     # "interrupted" determination, so the branch below promoted whatever stood in the slot with no
     # content check at all.
-    $interrupted = ($promotable.Promotable -and [bool]$corroboration.Corroborated)
+    $emptyOriginal = [string]::Equals(
+        [string](Get-WacJournalField -Record $journal -Name 'OriginalState'),
+        'Empty', [System.StringComparison]::Ordinal)
+    $interrupted = (($promotable.Promotable -or $emptyOriginal) -and [bool]$corroboration.Corroborated)
 
     # OPEN is a valid record that does not say it committed. A slot with NO record beside it is not
     # open - it is a superseded copy an earlier commit failed to delete - so the commit gate covers
@@ -519,6 +527,11 @@ function Resolve-WacDeploymentRecoverySlot {
 
     # The transaction is over either way, so its record goes - and a record that could not be
     # deleted is reported, never swallowed: the next run would read a settled state as unfinished.
+    if ([string]$plan.Capture.State -ceq 'Valid' -and
+        -not (Remove-WacTaskCaptureRecord -DeploymentRoot $Slots.Root)) {
+        throw 'The recovered task capture could not be retired; its authoritative swap record was kept.'
+    }
+
     if (-not (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)) {
         Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'A reconciled deployment transaction record could not be deleted; a later run may read a settled state as unfinished. Delete it by hand.' -Data @{
             path = [string](Get-WacDeploymentJournalPath -DeploymentRoot $Slots.Root)

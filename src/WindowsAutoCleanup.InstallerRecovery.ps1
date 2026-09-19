@@ -68,6 +68,12 @@ function Resolve-ConflictingTask {
         return $result
     }
 
+    if ([string]$discovery.State -ceq 'Absent') {
+        $result.Ok = [bool](Write-WacTaskCaptureRecord -DeploymentRoot $DeploymentRoot -Capture @())
+        if (-not $result.Ok) { $result.Reason = 'The original absence of scheduled tasks could not be recorded; no installation was started.' }
+        return $result
+    }
+
     # The list, not the removal result, is what the record is built from: it accumulates across the
     # loop, so each write names every task this run has captured rather than only the current one.
     $recorded = New-Object 'System.Collections.Generic.List[object]'
@@ -321,14 +327,52 @@ function Resolve-InterruptedTaskCapture {
     }
 
     $record = $Plan.Capture
-    if (-not $record -or [string]$record.State -cne 'Valid') { return $result }
+    if (-not $record -or [string]$record.State -cne 'Valid') {
+        # Older first-install records did not capture the original absence of registrations.
+        # Never delete their files underneath a standing task whose provenance is unresolved.
+        if ([string]$Plan.Verdict -ceq 'RestoreOriginal' -and
+            ([string]$Lookup.State -ceq 'Failed' -or @($Lookup.Task).Count -gt 0)) {
+            $result.Ok = $false
+            $result.Reason = 'The interrupted installation has no task capture and a task may still reference its files; nothing was removed.'
+        }
+        return $result
+    }
 
     $result.Recorded = @($record.Capture).Count
     if ($result.Recorded -eq 0) {
-        # A valid record naming nothing describes no missing task, so it is debris rather than a
-        # transaction. Clearing it is the whole reconciliation.
+        # An empty capture is POSITIVE evidence that no task existed before a first installation.
+        # It is not debris: rollback must remove the replacement registration as well as its files.
+        if ([string]$Lookup.State -ceq 'Failed') {
+            $result.Ok = $false
+            $result.Reason = 'The original task set was empty but the current scheduler state is unknown.'
+            return $result
+        }
+        if ([string]$Plan.Verdict -ceq 'RestoreOriginal') {
+            if (-not [bool]$Plan.Linked) {
+                $result.Ok = $false
+                $result.Reason = 'The task-absence record is not linked to this swap; nothing was removed.'
+                return $result
+            }
+            foreach ($standing in @($Lookup.Task)) {
+                $removal = Remove-WacInstalledTask -Task $standing -DeploymentRoot $DeploymentRoot -AllowLegacyMigration
+                if (-not $removal.Verified) {
+                    $result.Ok = $false
+                    $result.Reason = ('The first-install replacement task could not be safely removed: {0}' -f $removal.Reason)
+                    return $result
+                }
+            }
+            $result.RecordEnded = $false
+            $result.Reason = 'The first-install registration was removed; its absence record stays until the file rollback is complete.'
+            return $result
+        }
+        if ([string]$Plan.Verdict -ceq 'None' -and @($Lookup.Task).Count -gt 0) {
+            $result.Ok = $false
+            $result.Reason = 'A task stands where the original absence was recorded, but there is no swap decision to account for it.'
+            return $result
+        }
         $result.RecordEnded = [bool](Remove-WacTaskCaptureRecord -DeploymentRoot $DeploymentRoot)
-        $result.Reason = 'A task-capture record from an earlier run named no task and was cleared.'
+        $result.Ok = [bool]$result.RecordEnded
+        $result.Reason = 'The recorded empty task set was accounted for.'
         return $result
     }
 

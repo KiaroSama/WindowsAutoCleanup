@@ -113,6 +113,7 @@ function Write-WacQuarantineMarker {
         RaisedUtc = ((Get-Date).ToUniversalTime().ToString('o'))
         Count = [int]$script:AbandonedMutatorCount
         OperationKind = [string]$Kind
+        RaisedUptimeMs = (Get-WacMachineUptimeMs)
         Reason = [string]$Reason
     }
 
@@ -170,6 +171,11 @@ function Read-WacQuarantineMarker {
         return $result
     }
 
+    foreach ($field in @('RaisedUtc', 'Reason')) {
+        if ($names -cnotcontains $field) {
+            Add-Member -InputObject $record -MemberType NoteProperty -Name $field -Value ''
+        }
+    }
     $result.State = 'Valid'
     $result.Record = $record
     return $result
@@ -303,23 +309,11 @@ $script:RestartProofMarginMs = 120000
 function Get-WacMachineUptimeMs {
     <#
     .SYNOPSIS
-        Milliseconds since this machine booted, or $null when the runtime cannot answer.
-    .DESCRIPTION
-        TickCount64 and not Win32_OperatingSystem: the CIM query is an RPC round trip to the WMI
-        service, and this project already moved one diagnostic off it for exactly that reason - a
-        question asked before a cleanup step must not be able to block on an unavailable service.
-        TickCount64 is a counter the kernel keeps and costs nothing.
-
-        It also cannot be moved. That is the whole point of using it rather than a civil clock: a
-        restart is the event this is asked about, and an NTP or DST correction must not look like one.
-
-        $null when the runtime does not expose it (the property arrived in .NET Framework 4.8), and a
-        null uptime settles nothing - the caller keeps its record, which is where it started.
+        Native 64-bit uptime, available on Windows PowerShell 5.1 as well as PowerShell 7.
     #>
-
     try {
-        if (@([System.Environment].GetMember('TickCount64')).Count -eq 0) { return $null }
-        return [long][System.Environment]::TickCount64
+        if (-not (Initialize-WacNative)) { return $null }
+        return [long][WacNative]::GetTickCount64()
     }
     catch { return $null }
 }
@@ -327,64 +321,40 @@ function Get-WacMachineUptimeMs {
 function Test-WacMachineRestartedSince {
     <#
     .SYNOPSIS
-        Whether this machine has booted since a recorded moment. Proof only; never a guess.
+        Proves a reset only from a decrease of the persisted native uptime counter.
     .DESCRIPTION
-        THE SETTLEMENT PATH FOR EXTERNAL WORK (ledger WAC-05R). A record for work outside this
-        process cannot be retired by proving the reporting host died, because the work outlives that
-        host - but a RESTART ends everything the earlier run left, whatever it was and whoever owned
-        it. Without this the latch had no way back at all, and one abandoned operation would refuse
-        every mutation on the machine for ever.
-
-        The test is that the machine has been UP for less time than the record has EXISTED: if so it
-        booted after the record was written. Uptime is monotonic, so the half that matters cannot be
-        moved by a clock correction; the record's age is civil, and the margin absorbs ordinary skew
-        and the record's own second-resolution stamp. A clock moved BACKWARDS shrinks the age and
-        makes this answer no, which is the safe direction.
-    .OUTPUTS
-        Restarted (bool) and Reason.
+        Civil-clock age is never evidence of a reboot. A forward clock correction can make a
+        month-old-looking record on the same boot, while its external mutator is still alive.
+        A decreasing 64-bit uptime is positive reset evidence; an equal or greater value is
+        inconclusive, NOT proof that no restart occurred. In particular, a late check after a
+        restart may have overtaken the old counter. Keep that record for operator recovery.
+        Legacy records without a counter are retained. RaisedUtc remains a compatibility and
+        diagnostic parameter only; it never authorizes retirement.
     #>
-    param([Parameter(Mandatory = $true)][AllowNull()]$RaisedUtc)
+    param(
+        [AllowNull()]$RaisedUtc,
+        [AllowNull()]$RaisedUptimeMs = $null
+    )
 
+    $null = $RaisedUtc
     $result = [PSCustomObject]@{ Restarted = $false; Reason = '' }
-
-    $uptimeMs = Get-WacMachineUptimeMs
-    if ($null -eq $uptimeMs) {
-        $result.Reason = 'this runtime cannot report how long the machine has been up'
+    $recorded = 0L
+    if ($null -eq $RaisedUptimeMs -or
+        -not [long]::TryParse([string]$RaisedUptimeMs, [ref]$recorded) -or $recorded -lt 0) {
+        $result.Reason = 'the record has no valid monotonic uptime evidence; inspect it before explicitly retiring it'
         return $result
     }
-
-    # ConvertFrom-Json leaves an ISO-8601 stamp a string on Windows PowerShell 5.1 and parses it into
-    # a [datetime] on PowerShell 7, so both shapes arrive here and neither may be assumed.
-    $raised = [datetime]::MinValue
-    if ($RaisedUtc -is [datetime]) { $raised = ([datetime]$RaisedUtc).ToUniversalTime() }
-    else {
-        $text = [string]$RaisedUtc
-        if ([string]::IsNullOrWhiteSpace($text)) {
-            $result.Reason = 'the record does not say when it was written'
-            return $result
-        }
-        $parsed = [datetime]::MinValue
-        if (-not [datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture,
-                [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal,
-                [ref]$parsed)) {
-            $result.Reason = 'the time the record was written could not be read'
-            return $result
-        }
-        $raised = $parsed
-    }
-
-    $ageMs = ((Get-Date).ToUniversalTime() - $raised).TotalMilliseconds
-    if ($ageMs -le 0) {
-        $result.Reason = 'the record is stamped in the future, so nothing can be concluded from its age'
+    $current = Get-WacMachineUptimeMs
+    if ($null -eq $current -or [long]$current -lt 0) {
+        $result.Reason = 'the native uptime could not be read; restart evidence is unavailable'
         return $result
     }
-
-    if (($uptimeMs + $script:RestartProofMarginMs) -lt $ageMs) {
+    if ([long]$current -lt $recorded) {
         $result.Restarted = $true
+        $result.Reason = 'the native 64-bit uptime counter reset after this record was written'
         return $result
     }
-
-    $result.Reason = 'the machine has been up since before the record was written'
+    $result.Reason = 'no monotonic reset is proven; elapsed wall time and the reporting host exiting cannot retire this record'
     return $result
 }
 
@@ -451,10 +421,14 @@ function Resolve-WacQuarantine {
         # turns one abandoned operation - or one leaky test - into a machine that refuses every
         # mutation for ever. Measured, not theorised: without this a single leaked record made every
         # later run in the same CI job refuse, down to Remove-WacTree deleting nothing.
-        $restart = Test-WacMachineRestartedSince -RaisedUtc $marker.Record.RaisedUtc
+        $uptime = $null
+        if (@($marker.Record.PSObject.Properties.Name) -ccontains 'RaisedUptimeMs') {
+            $uptime = $marker.Record.RaisedUptimeMs
+        }
+        $restart = Test-WacMachineRestartedSince -RaisedUtc $marker.Record.RaisedUtc -RaisedUptimeMs $uptime
         if (-not $restart.Restarted) {
             $script:AbandonedMutatorCount++
-            Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'An earlier run abandoned work outside this process and the machine has not restarted since, so this run will not mutate anything. Restart the machine to end anything that run left going, then confirm the state it was changing.' -Data @{
+            Write-WacLog -Level CRITICAL -Component 'Budget' -Message 'An earlier run abandoned work outside this process and a subsequent restart is not proven, so this run will not mutate anything. Inspect the operation and its recovery evidence; a legacy record or a late uptime check requires explicit operator retirement.' -Data @{
                 processId = [int]$marker.Record.ProcessId; kind = $kind
                 raisedUtc = [string]$marker.Record.RaisedUtc; reason = [string]$marker.Record.Reason
                 unsettled = [string]$restart.Reason

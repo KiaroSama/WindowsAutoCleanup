@@ -319,7 +319,8 @@ function Test-WacToolLifetimeSettled {
     # complete, which is exactly what a suspended process nobody could confirm terminating does NOT
     # say.
     if (-not [bool]$Run.Started) {
-        if (([string]$Run.OwnedTreeState) -ceq 'Complete') {
+        if (([string]$Run.OwnedTreeState) -ceq 'Complete' -and
+            [bool]$Run.TerminationProven -and [bool]$Run.OutputComplete) {
             $result.Settled = $true
             $result.OutputTrustworthy = $true
             return $result

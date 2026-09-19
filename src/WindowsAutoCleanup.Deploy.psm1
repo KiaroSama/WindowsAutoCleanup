@@ -598,6 +598,13 @@ function Remove-WacDeploymentPrevious {
     $slots = Get-WacDeploymentSlotPath
     if (-not $slots) { return $false }
 
+    # The task capture depends on the commit decision. Retire it FIRST; a crash or a sharing
+    # violation must never leave an old capture without the decision that superseded it.
+    if (-not (Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)) {
+        Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'The committed task capture could not be retired; the commit decision and recovery copy were kept.'
+        return $false
+    }
+
     $script:DeploymentTransaction = $null
 
     $ended = Remove-WacDeploymentJournal -DeploymentRoot $slots.Root

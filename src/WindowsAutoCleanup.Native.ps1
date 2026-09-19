@@ -25,6 +25,8 @@ using Microsoft.Win32.SafeHandles;
 
 public static class WacNative
 {
+    [DllImport("kernel32.dll")]
+    public static extern ulong GetTickCount64();
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern SafeFileHandle CreateFileW(
         string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
