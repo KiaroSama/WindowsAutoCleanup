@@ -95,29 +95,36 @@ The resume point is written to disk **before** the cut is requested. After the p
 
 ## Status
 
-**The campaign has run for real** on a Hyper-V Windows 11 guest, several times on 2026-09-19 and
-2026-09-20, with scenario isolation and deterministic cuts. What is proved, and what is not:
+**The campaign has run for real** on a Hyper-V Windows 11 guest, repeatedly on 2026-09-19 and
+2026-09-20. Two scenarios pass; two are blocked by something now identified.
 
-| scenario | best observed | evidence |
+| scenario | verdict | evidence |
 | --- | --- | --- |
 | `service-dispatched-maintenance` | **passed** (twice) | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 and 204 entries / 13.4 and 14.8 MB actually removed, read from the run's own `.summary.json` |
 | `reboot-recovery` | **passed** (twice) | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
-| `power-loss-during-install` | passed once, then not reproducible | the guest returns from the cut - measured directly at **12 seconds** - but later runs saw it publish nothing for the driver's whole idle bound |
-| `power-loss-during-uninstall` | never passed | the same |
+| `power-loss-during-install` | blocked | the agent does not start after the cut - see below |
+| `power-loss-during-uninstall` | blocked | the same |
 
-**The power-cut scenarios are not yet reliable, and the reason is not the cut.** A dedicated probe -
-one cut, then an hour of watching, no budget changed - showed the heartbeat AND the agent both back
-**0.2 minutes** after the power was restored. An earlier reading of "the guest cannot come back"
-was wrong: in that run the guest held 1170 MB of a configured 4096 MB because the host had nothing
-to give it, and a starved Windows guest booting after a dirty stop is indistinguishable from a hung
-one through every channel the campaign can see.
+### Why the two power-cut scenarios are blocked, and what it is not
 
-So the failures are environmental and not yet fully characterised. Before trusting either scenario:
+The agent publishes `AgentBoot` as its first act, before anything else can throw. On every clean
+boot it appears within seconds. **After a hard power cut it never appears at all**, on a guest that
+is Running with its memory assigned. Nothing starts, so nothing reports.
 
-1. Read `MemoryAssigned` against the configured startup whenever a guest will not respond. Dynamic
-   memory with a low minimum lets the host squeeze a guest below what Windows needs to boot.
-2. Give the host real headroom for the whole run, not just at `Start-VM`.
-3. Only then look at the campaign again - and do not raise a bound to make a starved guest pass.
+That pattern fits the results exactly: both passing scenarios boot cleanly - `reboot-recovery` uses
+`Restart-Computer`, which is a clean, flushing restart - and only the cut scenarios are silent.
 
-**Until that is settled these two scenarios prove nothing either way**, and the campaign reports
-them as failures rather than issuing a verdict about the product.
+**The suspect is how the guest was armed, not the product and not the campaign.** A guest armed from
+the HOST can only be armed with a local Group Policy machine startup script, whose registration the
+Group Policy service keeps in the registry; a dirty shutdown can roll that back, leaving nothing for
+`gpscript.exe /startup` to run. The scheduled task that `Register-WacCampaignAgent.ps1` registers -
+the procedure above, run by the machine's owner from inside - goes through Task Scheduler's own
+transactional store, which is the mechanism designed to survive exactly this.
+
+**This is not yet proven**: nobody has run a cut against a task-armed guest. That is the next test,
+and it needs one command run inside the VM. Until then the two scenarios prove nothing about the
+product either way, and the campaign reports them rather than issuing a verdict.
+
+Two earlier readings of these failures were wrong and are retracted here: they were not a guest that
+could not come back (it returns in **12 seconds**, measured), and not memory starvation (a 2 GB
+dynamic floor stopped the squeezing and the silence continued).
