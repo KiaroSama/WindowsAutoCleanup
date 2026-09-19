@@ -269,10 +269,16 @@ try {
     }
 }
 catch {
+    # The SCENARIO, not the phase. Labelling the failure `running` - which is what `phase` holds
+    # while the loop is working - produced a report whose first line named a scenario that does not
+    # exist and left the real one in `notRun`, so the reader had to guess which one died.
     $status = 'failed'
+    $failed = @(@($state.scenarios) | Where-Object { @($state.completed) -cnotcontains $_ })
     $state.results = @(@($state.results) + [PSCustomObject]@{
-            Scenario = [string]$state.phase; Verdict = 'failed'
+            Scenario = [string]$(if ($failed.Count -gt 0) { $failed[0] } else { 'the agent itself' })
+            Verdict = 'failed'
             Detail = ('the agent stopped on an error: ' + $_.Exception.Message) })
+    if ($failed.Count -gt 0) { $state.completed = @(@($state.completed) + [string]$failed[0]) }
 }
 
 $report = [PSCustomObject]@{

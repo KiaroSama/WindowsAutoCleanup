@@ -95,28 +95,29 @@ The resume point is written to disk **before** the cut is requested. After the p
 
 ## Status
 
-**The campaign has run for real**, on a Hyper-V Windows 11 guest, most recently on 2026-09-19 with
-scenario isolation and deterministic cuts. Two of the four default scenarios pass:
+**The campaign has run for real** on a Hyper-V Windows 11 guest, several times on 2026-09-19 and
+2026-09-20, with scenario isolation and deterministic cuts. What is proved, and what is not:
 
-| scenario | verdict | what it showed |
+| scenario | best observed | evidence |
 | --- | --- | --- |
-| `service-dispatched-maintenance` | **passed** | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 204 entries and 14.8 MB actually removed, read from the run's own `.summary.json` |
-| `reboot-recovery` | **passed** | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
-| `power-loss-during-install` | failed | the guest published nothing for 900 s after the cut |
-| `power-loss-during-uninstall` | failed | the same |
+| `service-dispatched-maintenance` | **passed** (twice) | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 and 204 entries / 13.4 and 14.8 MB actually removed, read from the run's own `.summary.json` |
+| `reboot-recovery` | **passed** (twice) | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
+| `power-loss-during-install` | passed once, then not reproducible | the guest returns from the cut - measured directly at **12 seconds** - but later runs saw it publish nothing for the driver's whole idle bound |
+| `power-loss-during-uninstall` | never passed | the same |
 
-The two power-cut scenarios fail on the guest, not on the product: after a cut taken at the frozen
-instant, the machine ran for 15 minutes with no heartbeat - a repair pass or a stuck boot - and the
-driver's idle bound correctly declared it blocked rather than waiting for ever. **Until that is
-understood they prove nothing either way**, and the campaign says so rather than reporting a verdict.
+**The power-cut scenarios are not yet reliable, and the reason is not the cut.** A dedicated probe -
+one cut, then an hour of watching, no budget changed - showed the heartbeat AND the agent both back
+**0.2 minutes** after the power was restored. An earlier reading of "the guest cannot come back"
+was wrong: in that run the guest held 1170 MB of a configured 4096 MB because the host had nothing
+to give it, and a starved Windows guest booting after a dirty stop is indistinguishable from a hung
+one through every channel the campaign can see.
 
-Known limitation, with its investigation order:
+So the failures are environmental and not yet fully characterised. Before trusting either scenario:
 
-1. Find out whether the guest returns at all given more than 15 minutes. One cut, then watch the
-   heartbeat for an hour, **before** any budget is changed.
-2. If it returns, raise only the post-cut ready wait - a scenario that is genuinely stuck should
-   still fail fast.
-3. If it does not, the freeze has to flush before it holds: suspend once the record's write has
-   settled rather than the instant the path appears.
+1. Read `MemoryAssigned` against the configured startup whenever a guest will not respond. Dynamic
+   memory with a low minimum lets the host squeeze a guest below what Windows needs to boot.
+2. Give the host real headroom for the whole run, not just at `Start-VM`.
+3. Only then look at the campaign again - and do not raise a bound to make a starved guest pass.
 
-Raising a timeout first is how a hang becomes a long hang.
+**Until that is settled these two scenarios prove nothing either way**, and the campaign reports
+them as failures rather than issuing a verdict about the product.
