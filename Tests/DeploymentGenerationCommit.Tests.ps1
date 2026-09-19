@@ -410,12 +410,11 @@ Test-Case 'A record that cannot be deleted keeps the transaction open, and no la
         Assert-False (Remove-WacDeploymentJournal -DeploymentRoot $slots.Root) `
             'a removal that cannot finish reported the transaction closed'
 
-        # Staging now refuses EARLIER, before a later generation can create a replacement at all.
-        # Preserve the original safety assertion instead of expecting the old clean-return shape.
-        Assert-Throws -ScriptBlock {
-            New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C'
-        } -Pattern 'rollback journal could not be retired'
-        Assert-False (Test-Path -LiteralPath $slots.Staging) 'a later generation staged over an unfinished rollback'
+        # Staging prepares an isolated copy; it does not authorize switching the live generation.
+        # The installer reconciles before staging, while this lower-level test deliberately tries
+        # the switch directly to prove an unfinished journal cannot be overwritten.
+        [void](New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C')
+        Assert-Throws -ScriptBlock { Switch-WacDeploymentStage -KeepPrevious } -Pattern 'transaction could not be recorded'
         Reset-CommitFixture
 
         Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'a swap that could not record itself moved the deployment anyway'
