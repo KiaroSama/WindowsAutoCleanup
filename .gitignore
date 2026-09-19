@@ -102,6 +102,7 @@ Desktop.ini
 /graphify-out/
 /.codebase-memory/
 /.specify/
+/specs/
 .ignoreme
 **/.ignoreme
 /.env
