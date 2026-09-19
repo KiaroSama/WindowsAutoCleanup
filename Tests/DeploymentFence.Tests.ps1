@@ -140,8 +140,7 @@ Test-Case 'A deployment root that cannot be resolved settles nothing' {
             return $null
         }
 
-        $verdict = Test-WacDeploymentGenerationSettled -DeploymentRoot 'C:
-owhere\WindowsAutoCleanup'
+        $verdict = Test-WacDeploymentGenerationSettled -DeploymentRoot 'C:\nowhere\WindowsAutoCleanup'
         Assert-False ([bool]$verdict.Settled) 'an unresolvable deployment root was read as settled'
         Assert-True ([string]$verdict.Reason).Contains('could not be resolved') `
             ('the refusal did not say the root was unresolvable: {0}' -f [string]$verdict.Reason)

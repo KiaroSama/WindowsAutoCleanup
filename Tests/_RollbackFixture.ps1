@@ -243,5 +243,11 @@ function New-FixtureStage {
     )
 
     $checkout = New-TestCheckout -Path (Join-Path -Path $Sandbox -ChildPath $Name) -RunContent $RunContent
+
+    # BOTH halves, in the installer's order (ledger WAC-02R). Reconciling the recovery slot was
+    # New-WacDeploymentStage's own first act until that put the file half behind the new install's
+    # source, host and budget checks - a run that failed one of those returned leaving an unfinished
+    # pair exposed. The caller performs it now, and this fixture stands in for that caller.
+    [void](Resolve-WacDeploymentRecoverySlot -Slots (Get-WacDeploymentSlotPath))
     return (New-WacDeploymentStage -SourceRoot $checkout)
 }
