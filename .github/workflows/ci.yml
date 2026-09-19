@@ -232,3 +232,85 @@ jobs:
             ${{ runner.temp }}/run-environment.json
           if-no-files-found: warn
           retention-days: 14
+
+  # THE LANE THAT NEEDS A MACHINE IT MAY CHANGE (ledger WAC-02R). Every other job here is read-only
+  # about the host: this one installs a real SYSTEM scheduled task, deploys to the real deployment
+  # root, triggers the task through the scheduler, upgrades, rolls back and uninstalls. It is the
+  # only way to prove the installation transaction end to end, and it cannot run on anyone's
+  # workstation - which is why the suite refuses unless WAC_VM_DEPLOYMENT_LIFECYCLE=1 AND the
+  # session is elevated, and why a refused lane is a pass that has validated nothing.
+  #
+  # A GitHub-hosted runner IS the disposable, explicitly armed Windows guest the lane asks for: it
+  # is an ephemeral VM, it runs elevated, and it is destroyed when the job ends. A SELF-HOSTED
+  # runner is somebody's machine, so the first step refuses there rather than trusting the label.
+  #
+  # Separate from `validate` on purpose: that job must stay a clean-room read of the unit suites, and
+  # a machine-changing lane sharing its runner would make every later suite's environment a
+  # consequence of this one.
+  deployment-lifecycle:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Refuse a runner this lane may not change
+        shell: pwsh
+        run: |
+          # RUNNER_ENVIRONMENT is set by the runner itself, not by the workflow. Anything other than
+          # github-hosted is a machine somebody owns, and this lane registers a SYSTEM task on it.
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            Write-Host ('Refusing: this lane changes the machine and RUNNER_ENVIRONMENT is "{0}", not github-hosted.' -f $env:RUNNER_ENVIRONMENT)
+            exit 1
+          }
+          $elevated = [bool](New-Object Security.Principal.WindowsPrincipal(
+            [Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host ('Disposable github-hosted runner, elevated={0}.' -f $elevated)
+          if (-not $elevated) {
+            Write-Host 'Refusing: the lane needs elevation and would otherwise report refused, which validates nothing.'
+            exit 1
+          }
+
+      - name: Deployment lifecycle, armed
+        shell: pwsh
+        timeout-minutes: 20
+        env:
+          WAC_VM_DEPLOYMENT_LIFECYCLE: '1'
+        run: |
+          .\Tests\Run-Tests.ps1 -Host both -Filter VmDeploymentLifecycle *>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\lifecycle-output.log"
+          $code = $LASTEXITCODE
+
+          # A GREEN REFUSAL IS THE FAILURE MODE THIS GUARD EXISTS FOR. The suite passes when it is
+          # not armed, so an exit code alone cannot tell "every step passed" from "nothing ran".
+          $log = Get-Content -LiteralPath "$env:RUNNER_TEMP\lifecycle-output.log" -Raw
+          if ($log -match '\(not armed:') {
+            Write-Host 'The lane reported NOT ARMED, so this job proved nothing about the deployment lifecycle.'
+            exit 1
+          }
+          if ($log -notmatch 'uninstall exits clean') {
+            Write-Host 'The lane did not reach its uninstall step, so the lifecycle was not exercised end to end.'
+            exit 1
+          }
+          Write-Host 'The lane ran armed and reached its last step.'
+          exit $code
+
+      - name: Upload lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        timeout-minutes: 5
+        with:
+          name: lifecycle-evidence-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lifecycle-output.log
+          if-no-files-found: warn
+          retention-days: 14
