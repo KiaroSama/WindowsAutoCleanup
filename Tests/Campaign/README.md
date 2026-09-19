@@ -95,4 +95,25 @@ The resume point is written to disk **before** the cut is requested. After the p
 
 ## Status
 
-The host driver, the guest agent, the scenarios and the refusals are implemented and the refusals are covered by `Tests/VmCampaign.Tests.ps1`. **The scenarios themselves have not yet been executed against an armed guest** — arming is the owner's step, and until a campaign has actually run, nothing in here is evidence about the product. That is the same rule the campaign applies to itself.
+**The campaign has run for real**, on a Hyper-V Windows 11 guest, on 2026-09-19. Two of the four
+default scenarios passed, and they are the two this work exists for:
+
+| scenario | verdict | what it showed |
+| --- | --- | --- |
+| `service-dispatched-maintenance` | **passed** | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 entries and 13.4 MB actually removed, read from the run's own `.summary.json` |
+| `power-loss-during-install` | **passed** | a real power cut at the instant the guest reported reaching the transaction; after restart, recovery left the files, the registration and the records agreeing |
+| `power-loss-during-uninstall` | failed | **a defect in this campaign, not in the product** — a short uninstall can finish between the guest asking for the cut and the host taking it, so nothing was interrupted |
+| `reboot-recovery` | failed | **a defect in this campaign** — it inherited the previous scenario's half-removed state and was refused before it began |
+
+Both failures are worth reading for what they show about the product: the installer met an
+outstanding uninstall intent, refused, named the condition, said which manual step clears it, and
+confirmed that nothing was staged, swapped or registered. That sentence came off a real machine.
+
+Known limitations, in this order:
+
+1. **The cut is not instantaneous.** It is armed by the guest and taken by the host on its next poll,
+   so an operation that finishes inside that window is not interrupted at all.
+2. **Scenarios are not isolated from one another.** They run in sequence on an accumulating guest, so
+   one that leaves the machine in a refused state blocks the next.
+
+Until those are closed, `power-loss-during-uninstall` and `reboot-recovery` prove nothing either way.
