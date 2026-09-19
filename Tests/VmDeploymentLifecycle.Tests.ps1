@@ -160,17 +160,18 @@ function Get-WacVmDeploymentOutcome {
         $task = @($lookup.Task)[0]
         [void]$steps.Add((New-LifecycleStep -Step 'task lookup answered Found' -Ok ([string]$lookup.State -ceq 'Found') `
             -Detail ('state={0} count={1}' -f [string]$lookup.State, @($lookup.Task).Count)))
+
         $proof = $null
         if ($task) { $proof = Test-WacTaskIsOurs -Task $task -DeploymentRoot $root }
         [void]$steps.Add((New-LifecycleStep -Step 'task registered and recognised' -Ok ([bool]($proof -and $proof.IsOurs)) `
-            -Detail $(if ($proof) { [string]$proof.Reason } else { 'no task was found after the install' }))))
+            -Detail $(if ($proof) { [string]$proof.Reason } else { 'no task was found after the install' })))
 
         # ResetBase is asserted from the registered action, which is the only place it could reach
         # the machine from.
         $action = ''
         if ($task) { $action = [string]@($task.Actions)[0].Arguments }
         [void]$steps.Add((New-LifecycleStep -Step 'ResetBase stays disabled' -Ok ($action -match '(?i)-ResetWindowsUpdateBase:\$false' -and $action -notmatch '(?i)-ResetWindowsUpdateBase:\$true') `
-            -Detail $action)))
+            -Detail $action))
 
         # 2. SCHEDULED RUN. Started for real through the scheduler, under SYSTEM.
         if ($task) {
@@ -216,11 +217,11 @@ function Get-WacVmDeploymentOutcome {
         $ownedAgain = Get-WacDeploymentOwnership -DeploymentRoot $root
         [void]$steps.Add((New-LifecycleStep -Step 'second install is clean and idempotent' `
             -Ok (([int]$again.ExitCode -eq 0) -and [bool]$ownedAgain.IsHealthy) `
-            -Detail ('exit={0} health={1}' -f [string]$again.ExitCode, [string]$ownedAgain.Reason))))
+            -Detail ('exit={0} health={1}' -f [string]$again.ExitCode, [string]$ownedAgain.Reason)))
 
         $slots = Get-WacDeploymentSlotPath -DeploymentRoot $root
         [void]$steps.Add((New-LifecycleStep -Step 'no recovery slot survives a committed install' `
-            -Ok (-not (Test-Path -LiteralPath $slots.Previous)) -Detail ([string]$slots.Previous))))
+            -Ok (-not (Test-Path -LiteralPath $slots.Previous)) -Detail ([string]$slots.Previous)))
 
         # 4. UPGRADE. The source is changed so the staged tree really differs, which is what makes
         #    the swap a swap rather than a copy over itself.
@@ -256,7 +257,7 @@ function Get-WacVmDeploymentOutcome {
 
             $tampered = Get-WacDeploymentOwnership -DeploymentRoot $root
             [void]$steps.Add((New-LifecycleStep -Step 'a tampered deployment is ours but NOT healthy' `
-                -Ok ([bool]$tampered.IsOurs -and -not [bool]$tampered.IsHealthy) -Detail ([string]$tampered.Reason))))
+                -Ok ([bool]$tampered.IsOurs -and -not [bool]$tampered.IsHealthy) -Detail ([string]$tampered.Reason)))
 
             # Resolve-WacDeploymentRecoverySlot is INTERNAL to the module, so it is called through
             # the module's own scope. Calling it by bare name threw "the term is not recognized" -
@@ -271,7 +272,7 @@ function Get-WacVmDeploymentOutcome {
             $isRefusal = ($refused -and $reason -match 'recovery slot' -and $reason -match 'neither was touched|could not be put back')
             [void]$steps.Add((New-LifecycleStep -Step 'recovery refuses to guess and keeps both copies' `
                 -Ok ($isRefusal -and (Test-Path -LiteralPath $slots.Previous) -and (Test-Path -LiteralPath $runScript)) `
-                -Detail $reason)))
+                -Detail $reason))
         }
         finally {
             [System.IO.File]::WriteAllBytes($runScript, $original)
