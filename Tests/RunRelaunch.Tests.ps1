@@ -71,6 +71,7 @@ function Get-RelaunchVector {
         [bool]$Prune = $false,
         [bool]$Legacy = $false,
         [bool]$SkipBin = $false,
+        [bool]$Preview = $false,
         [string]$Level = 'INFO',
         [int]$Budget = 210,
         [AllowEmptyCollection()][string[]]$Category = @(),
@@ -82,6 +83,7 @@ function Get-RelaunchVector {
     $script:PruneSupersededDrivers = $Prune
     $script:EnableLegacyDiskCleanup = $Legacy
     $script:SkipRecycleBin = $SkipBin
+    $script:Preview = $Preview
     $script:LogLevel = $Level
     $script:BudgetMinutes = $Budget
     $script:SkipCategory = @($Category)
@@ -174,10 +176,23 @@ Test-Case 'The default relaunch vector states every switch explicitly' {
 
     $expected = "-NoProfile -ExecutionPolicy Bypass -Command " +
         "`$LASTEXITCODE = 1; & 'C:\Tools\WindowsAutoCleanup\Run.ps1' -EnableLegacyDiskCleanup:`$false " +
-        "-PruneSupersededDrivers:`$false -ResetWindowsUpdateBase:`$true -SkipRecycleBin:`$false " +
+        "-Preview:`$false -PruneSupersededDrivers:`$false -ResetWindowsUpdateBase:`$true -SkipRecycleBin:`$false " +
         "-BudgetMinutes '210' -LogLevel 'INFO'; exit `$LASTEXITCODE"
 
     Assert-Equal $expected ($vector -join ' ')
+}
+
+Test-Case 'A -Preview survives the relaunch, so the elevated child does not clean instead' {
+    # The relaunch happens while the operator is still unelevated, which is BEFORE the run reaches
+    # the preview cut. A child that did not inherit this switch would perform a full, real cleanup
+    # on behalf of the one operator who explicitly asked to see the plan before anything was
+    # touched - and it would do it in its own elevated window, out of that operator's sight.
+    $payload = Get-RelaunchPayload -Vector (Get-RelaunchVector -Preview $true)
+
+    Assert-True (Test-PayloadHasSwitch -Payload $payload -Token '-Preview:$true') `
+        ('the elevated child does not inherit -Preview, so it would clean the machine: ' + $payload)
+    Assert-False (Test-PayloadHasBareSwitch -Payload $payload -Name 'Preview') `
+        ('-Preview reached the child bare, where a default could still override it: ' + $payload)
 }
 
 Test-Case 'An explicit -ResetWindowsUpdateBase:$false survives the relaunch (ledger P0-2)' {
@@ -195,7 +210,7 @@ Test-Case 'An explicit -ResetWindowsUpdateBase:$false survives the relaunch (led
         'a bare switch lets the child fall back to its default'
 
     $expected = "`$LASTEXITCODE = 1; & 'C:\Tools\WindowsAutoCleanup\Run.ps1' -EnableLegacyDiskCleanup:`$false " +
-        "-PruneSupersededDrivers:`$false -ResetWindowsUpdateBase:`$false -SkipRecycleBin:`$false " +
+        "-Preview:`$false -PruneSupersededDrivers:`$false -ResetWindowsUpdateBase:`$false -SkipRecycleBin:`$false " +
         "-BudgetMinutes '210' -LogLevel 'INFO'; exit `$LASTEXITCODE"
     Assert-Equal $expected $payload
 }
