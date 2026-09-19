@@ -60,6 +60,18 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Run.ps1
 
 Started without administrator privileges, the script relaunches itself elevated through a canonical PowerShell host, waits for the child, and returns the child's real exit code.
 
+### See what a run would do, without doing any of it
+
+```bash
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File .\Run.ps1 -Preview
+```
+
+Prints the destructive options as this invocation sets them, the categories `-SkipCategory` excludes, and every allow-list target that would be swept — then exits without deleting anything. The list comes from the same builder the real run uses, so it cannot drift from what would actually happen.
+
+It is **not** a dry run of the whole run, and says so. The maintenance steps — the component store, the driver handler, `cleanmgr`, the Recycle Bin — cannot enumerate what they would remove without doing it, so the preview reports whether each is switched on rather than listing its contents. An empty allow-list does not mean nothing would happen.
+
+The preview is carried into the elevated relaunch, so starting it from an ordinary session previews there too. `-Preview` and `-Scheduled` are refused together: a trigger that only previews is a machine nobody is cleaning, reporting success every night.
+
 ### Keep Windows updates uninstallable
 
 ```bash
@@ -168,6 +180,7 @@ Delete that directory once you are done with it; nothing else will.
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `-Scheduled` | off | Set by the scheduled task. A scheduled run fails fast instead of attempting a UAC relaunch. |
+| `-Preview` | off | Print what would be swept and exit without changing anything. Refused together with `-Scheduled`. |
 | `-ResetWindowsUpdateBase` | `$true` | Adds `/ResetBase` to DISM component cleanup. Updates installed before the run can no longer be uninstalled. |
 | `-PruneSupersededDrivers` | off | Opt in to removing superseded OEM driver packages. Exports a backup first. |
 | `-EnableLegacyDiskCleanup` | off | Opt in to `cleanmgr /sagerun`. **Affects every drive, not just `C:`.** |
@@ -346,6 +359,41 @@ Levels are `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Skips are broken out
 
 Logs contain local usernames, paths and host details. They are ignored by Git and should not be published.
 
+### Machine-readable run summary
+
+Every run also writes one JSON document beside its own log, with the same base name and a `.summary.json` extension. The log is written for a person, one line per event in the order the events happened; the summary answers "did last night's run clean, or did it refuse?" without parsing prose.
+
+```json
+{
+  "schema": 1,
+  "version": "1.2.0",
+  "executionId": "6a2f...",
+  "elapsed": "00:04:11",
+  "completedUtc": "2026-09-19T02:31:44Z",
+  "outcome": "Succeeded",
+  "exitCode": 0,
+  "rebootRequired": false,
+  "logPath": "C:\ProgramData\WindowsAutoCleanup\Logs\WindowsAutoCleanup_2026-09-19_02-27-33_UTC.log",
+  "steps": [
+    { "category": "Delivery Optimization cache", "state": "executed", "outcome": "Succeeded", "detail": "", "durationMs": 1204, "rebootRequired": false }
+  ],
+  "removed": { "entries": 812, "bytes": 1596440576, "failed": 0, "refused": 0 },
+  "freeBytes": { "before": 41203499008, "after": 42799939584 }
+}
+```
+
+Each step carries one of three states, and the distinction is the point of the file:
+
+| `state` | Meaning |
+| --- | --- |
+| `executed` | The step ran. Whatever it concluded is in `outcome`. |
+| `refused` | The step did not start because the run refused it — a security refusal, or an unresolved mutation this run inherited. |
+| `unarmed` | The step did not start because it was not switched on. |
+
+A reader that sees only "0 files removed" cannot tell a quiet night from a refusal; these three can. `schema` changes only when a field changes meaning, never when one is added, so a reader that ignores unknown fields keeps working.
+
+The summary holds outcomes, categories, counts and durations. It carries no command line, no environment, no per-path inventory and no credential of any kind. If it cannot be written the run logs a warning and carries on: the run's verdict is the log's and the exit code's, and this only repeats it.
+
 ## Restoring a folder hardened by an older version
 
 Versions before 1.2.0 could leave your checkout owned by a group, with inheritance disabled and your own account reduced to read and execute. They also dropped a `.WindowsAutoCleanupAclHardened` marker file.
@@ -500,6 +548,8 @@ unlocked scratch files, so do not run it during work that depends on those files
 | `src/WindowsAutoCleanup.InstallerRecovery.ps1` | The installer's task-capture transaction: resolving the conflicting registration behind that durable record, reconciling a record an earlier interrupted run left, and ending the transaction when the replacement is proven registered or the removal is proven undone. |
 | `src/WindowsAutoCleanup.InstallerTask.ps1` | The installer's scheduled-task lifecycle: trigger, conflict resolution with definition capture, post-registration read-back, and the rollback that restores both the tree and the task. |
 | `src/WindowsAutoCleanup.RunReport.ps1` | Dot-sourced by `Run.ps1`: the header, the run-level verdicts and the footer. |
+| `src/WindowsAutoCleanup.RunPreview.ps1` | Dot-sourced by `Run.ps1`: `-Preview`, the read-only report of what a run would sweep. |
+| `src/WindowsAutoCleanup.RunSummary.ps1` | Dot-sourced by `Run.ps1`: the versioned `.summary.json` written beside each run's log. |
 | `Tests/` | Self-contained test harness, bounded parallel runner, and behavioural suites. |
 | `Tests/Invoke-ElevatedVerification.ps1` | Elevated-only harness (with its `_ElevatedVerification.*.ps1` parts) for the exit paths and the opt-in switches that cannot be reached unprivileged. Refuses to run without administrator rights, and is not one of the discovered `*.Tests.ps1` suites. |
 | `.github/workflows/ci.yml` | Whitespace and conflict markers over the whole tracked tree, the analyzer, and every suite on Windows PowerShell 5.1 and PowerShell 7, plus a guard that each discovered suite actually ran - the guard checks the manifest's case totals and exit-code consistency, not just that a `TOTAL` line is present. The matrix runs both `windows-2025` and `windows-2022` without fail-fast, and the transcript, executed manifest and environment record are uploaded on success **and** on failure, so a red run leaves reproducible evidence rather than only a red mark. Pure-ASCII source, no byte-order mark, and the 800-line file ceiling are enforced by `Tests/RepositoryHygiene.Tests.ps1` rather than by a bespoke CI step, so they hold locally too. |
