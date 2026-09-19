@@ -389,4 +389,51 @@ Test-Case 'Two clean reinstalls in a row leave no record, no recovery slot and o
     }
 }
 
+Test-Case 'A new install that fails its OWN prerequisites still leaves the pair coherent' {
+    # R02-1. The two halves used to be reconciled at different distances from the door: the task
+    # half ran first, and the file half lived inside New-WacDeploymentStage - behind that function's
+    # validation of the NEW source, and behind the canonical-host and budget checks the caller makes
+    # in front of it. Each of those can return, and a return in that window is what leaves task A
+    # standing over files B: an unfinished pair, exposed, with no further attempt scheduled to close
+    # it, because the installer that would have closed it is the one that just gave up.
+    #
+    # The prerequisite modelled here is the source, which is the one this driver can fail honestly.
+    # The host and budget checks sit in the installer itself and are covered by Installer.Tests.ps1;
+    # what makes them the same case is their POSITION, and position is what this asserts.
+    $sandbox = New-TestSandbox -Prefix 'wac02r-prereq'
+    try {
+        $fixture = New-PairSandbox -Sandbox $sandbox
+        $baseline = Install-PairBaseline -Sandbox $sandbox -Fixture $fixture
+
+        $upgraded = Get-WacTaskActionArgument -RunScript (Join-Path -Path $fixture.Root -ChildPath 'Run.ps1') -PruneSupersededDrivers
+        $killed = Invoke-PairRun -Sandbox $sandbox -Fixture $fixture -Source (New-PairCheckout -Sandbox $sandbox -Name 'B') `
+            -NewArguments $upgraded -Stop 'after-register'
+        Assert-False $killed.TimedOut 'the upgrade never reached its stopping point inside the bound'
+        Assert-True (Test-Path -LiteralPath $fixture.Previous -PathType Container) 'the fixture did not reach the state this case is about'
+
+        # A source with no Run.ps1 in it: the run refuses, as it should, AFTER both halves are back.
+        $unusable = Join-Path -Path $sandbox -ChildPath 'unusable'
+        [void][System.IO.Directory]::CreateDirectory((Join-Path -Path $unusable -ChildPath 'src'))
+
+        $next = Invoke-PairRun -Sandbox $sandbox -Fixture $fixture -Source $unusable
+        Assert-False $next.TimedOut 'the resuming run never finished inside the bound'
+        Assert-True ([int]$next.ExitCode -ne 0) 'a run given a source it cannot deploy reported success'
+        Assert-True (Test-PairJournalHas -Run $next -Pattern '^EVENT\|recover\|Restored') `
+            ('the file half never ran, so the new install''s own prerequisite decided it: ' + ($next.Journal -join ' / '))
+
+        # THE PAIR, after a run that failed. Both halves are the baseline's, and neither the slot nor
+        # the record is left standing for a later run to find.
+        Assert-Equal $baseline.Inventory (Get-PairInventory -Path $fixture.Root) `
+            'the deployment root was left holding the replacement of a transaction that never committed'
+        Assert-Equal $baseline.Semantics (Get-PairTaskSemantics -Task @(Get-PairTask -Fixture $fixture)[0]) `
+            'the registration was left pointing at a tree that is no longer there'
+        Assert-Equal 1 @(Get-PairTask -Fixture $fixture).Count 'the resumed run left two registrations behind'
+        Assert-False (Test-Path -LiteralPath $fixture.Previous) 'the recovery slot was left behind after both halves were reconciled'
+        Assert-False (Test-Path -LiteralPath $fixture.SwapRecord) 'the reconciled swap record was left on disk'
+    }
+    finally {
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
 Complete-TestRun

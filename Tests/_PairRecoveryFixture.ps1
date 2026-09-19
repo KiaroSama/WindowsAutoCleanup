@@ -247,6 +247,15 @@ if (-not $reconciled.Ok) {
 }
 Stop-AtPoint -Name 'after-reconcile'
 
+# The FILE half, back to back with the task half and ahead of everything about the new install -
+# the installer's own order since ledger WAC-02R. It used to live inside New-WacDeploymentStage,
+# behind that function's source validation and behind the host and budget checks in front of it, so
+# a run that restored the task half and then failed one of those returned leaving task A over
+# files B.
+$recovered = Resolve-WacDeploymentRecoverySlot -Slots $slots
+Add-PairEvent ('recover|' + [string]$recovered.Action)
+Stop-AtPoint -Name 'after-recover'
+
 [void](New-WacDeploymentStage -SourceRoot $source)
 Add-PairEvent 'staged'
 Stop-AtPoint -Name 'after-stage'
@@ -289,12 +298,22 @@ catch {
     exit 1
 }
 
-$committed = [bool](Remove-WacDeploymentPrevious)
-Add-PairEvent ('committed|' + $committed)
-Stop-AtPoint -Name 'after-commit'
+# The decision first, while the recovery copy is still there to roll back to, and neither half
+# retired until it is on disk.
+$decision = Set-WacDeploymentCommitted
+Add-PairEvent ('decision|' + [bool]$decision.Recorded)
+Stop-AtPoint -Name 'after-decision'
 
-$captureEnded = [bool](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
-Add-PairEvent ('capture-ended|' + $captureEnded)
+$committed = $false
+$captureEnded = $false
+if ([bool]$decision.Recorded) {
+    $committed = [bool](Remove-WacDeploymentPrevious)
+    Add-PairEvent ('committed|' + $committed)
+    Stop-AtPoint -Name 'after-commit'
+
+    $captureEnded = [bool](Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)
+    Add-PairEvent ('capture-ended|' + $captureEnded)
+}
 Stop-AtPoint -Name 'after-evidence'
 
 if (-not $committed -or -not $captureEnded) {
