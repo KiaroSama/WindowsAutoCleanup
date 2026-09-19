@@ -41,6 +41,7 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanu
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentProof.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentJournal.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentRecovery.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.UninstallIntent.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentCommit.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ScheduledTask.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TaskMatch.ps1')
@@ -122,6 +123,8 @@ function Save-WacDeploymentJournal {
         OriginalFileCount = [int]$Transaction.OriginalFileCount
         ReplacementManifestHash = [string]$Transaction.ReplacementManifestHash
         Committed = [bool]$Transaction.Committed
+        ReplacementTask = @(Get-WacJournalField -Record $Transaction -Name 'ReplacementTask')
+        TaskDecision = [bool](Get-WacJournalField -Record $Transaction -Name 'TaskDecision')
     }))
 }
 
@@ -487,6 +490,10 @@ function Restore-WacDeploymentPrevious {
         return $result
     }
 
+    if ([bool]$transaction.Committed) {
+        $result.Reason = 'This generation is committed; a late rollback cannot remove it.'
+        return $result
+    }
     $result.HadPrevious = [bool]$transaction.HadOriginal
 
     # OriginalRestored means the tree is back where it belongs; RestoreVerdict carries the reason it
@@ -598,6 +605,13 @@ function Remove-WacDeploymentPrevious {
     $slots = Get-WacDeploymentSlotPath
     if (-not $slots) { return $false }
 
+    # The task capture depends on the commit decision. Retire it FIRST; a crash or a sharing
+    # violation must never leave an old capture without the decision that superseded it.
+    if (-not (Remove-WacTaskCaptureRecord -DeploymentRoot $slots.Root)) {
+        Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'The committed task capture could not be retired; the commit decision and recovery copy were kept.'
+        return $false
+    }
+
     $script:DeploymentTransaction = $null
 
     $ended = Remove-WacDeploymentJournal -DeploymentRoot $slots.Root
@@ -648,7 +662,7 @@ function Install-WacDeployment {
 }
 
 Export-ModuleMember -Function @(
-    'Get-WacTaskName', 'Get-WacTaskFolder', 'Get-WacTaskSentinel', 'Get-WacTaskDescription',
+    'Set-WacUninstallIntent', 'Get-WacTaskName', 'Get-WacTaskFolder', 'Get-WacTaskSentinel', 'Get-WacTaskDescription',
     'Get-WacOperationLockName', 'Get-WacDeploymentVersion', 'Get-WacDeploymentProjectId',
     'Get-WacDeploymentManifestPath', 'New-WacDeploymentManifest', 'Read-WacDeploymentManifest',
     'Get-WacDeploymentFileHash', 'Get-WacDeploymentOwnership', 'Get-WacDeploymentFingerprint',
@@ -658,7 +672,7 @@ Export-ModuleMember -Function @(
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
     'New-WacDeploymentStage', 'Switch-WacDeploymentStage', 'Resolve-WacDeploymentRecoverySlot',
-    'Set-WacDeploymentCommitted',
+    'Set-WacDeploymentCommitted', 'Set-WacRecoveryTaskAcknowledgement', 'Get-WacJournalField',
     'Restore-WacDeploymentPrevious', 'Remove-WacDeploymentPrevious',
     'Test-WacDeploymentTrusted',
     'Get-WacTaskScriptPath', 'Get-WacLegacyTaskScriptPath', 'Test-WacTaskExecuteIsCanonicalHost',

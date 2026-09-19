@@ -28,7 +28,7 @@
 # imported for the reason above. WindowsAutoCleanup.DeploymentJournal.ps1 owns the originals;
 # DeploymentFence.Tests.ps1 parses both files and fails if the two ever drift, which is the guard
 # the operation-lock name already carries between this module and Run.ps1.
-$script:FenceRecordSuffix = @('.transaction.json', '.taskcapture.json')
+$script:FenceRecordSuffix = @('.transaction.json', '.taskcapture.json', '.uninstall.json')
 
 function Test-WacDeploymentGenerationSettled {
     <#

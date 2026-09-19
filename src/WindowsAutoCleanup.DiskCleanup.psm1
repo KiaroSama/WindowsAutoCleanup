@@ -466,6 +466,12 @@ function Test-WacDiskCleanupProfileExact {
     return $result
 }
 
+function Save-WacCleanMgrSnapshot {
+    param([object[]]$Snapshot)
+    $write = Write-WacControlFile -Name $script:CleanMgrSnapshotName -Content (ConvertTo-Json -InputObject @($Snapshot) -Depth 4)
+    return [string]$write.Kind
+}
+
 function Invoke-WacLegacyDiskCleanup {
     <#
     .SYNOPSIS
@@ -534,6 +540,7 @@ function Invoke-WacLegacyDiskCleanup {
     $keyPath = $script:VolumeCacheKeyPath
     $snapshot = @()
     $mutated = $false
+    $snapshotOwned = $false
     $attempted = $false
     $outcome = 'SafeSkip'
     $detail = ''
@@ -563,39 +570,26 @@ function Invoke-WacLegacyDiskCleanup {
             $outcome = 'SafeSkip'
             $detail = 'The existing cleanmgr profile could not be read, so nothing was changed: {0}' -f $snapshotRun.Error
         }
-        elseif ($snapshot.Count -eq 0) {
-            $outcome = 'SafeSkip'
-            $detail = 'No VolumeCaches handlers were readable.'
-            if ($snapshotRun.HadErrors) {
-                $detail = 'The cleanmgr profile could not be snapshotted, so nothing was changed: {0}' -f $snapshotRun.Error
-            }
-        }
-        elseif ([string](Write-WacControlFile -Name $script:CleanMgrSnapshotName `
-                    -Content (ConvertTo-Json -InputObject @($snapshot) -Depth 4)).Kind -cne 'Created') {
-            # BEFORE the first mutation (ledger WAC-05R): the originals live only in this process's
-            # memory, so an abandoned run leaves somebody else's selection recoverable from nothing.
-            # ONLY 'Created' COUNTS, and PRESENT was the dangerous half: a record already there is an
-            # EARLIER run's and proves nothing about its identity or contents. Run A records the real
-            # original P0 and is abandoned before restoring; run B snapshots the modified P1, adopts
-            # A's record, restores P1 and deletes the record holding P0 - every step reporting
-            # success. A pre-existing record is a RECOVERY question, not a create, so it is declined.
-            $outcome = 'SafeSkip'
-            $detail = 'The original cleanmgr profile was not recorded durably as this run''s own, so nothing was changed; an earlier run''s record may be present and must be settled first.'
+        elseif ([string]($snapshotWrite = Save-WacCleanMgrSnapshot -Snapshot $snapshot) -cne 'Created') {
+            $outcome = if ($snapshotWrite -ceq 'Present') { 'Incomplete' } else { 'SafeSkip' }
+            $detail = 'The cleanmgr recovery record is unavailable or already held; no profile was changed. Resolve the retained original before retrying.'
         }
         elseif (-not (Test-WacMutationAllowed)) {
+            $snapshotOwned = $true
             # Writing the sage profile IS a mutation, and it is followed by a whole-machine
             # /sagerun. Neither may start while an earlier mutator could still be running.
             $outcome = 'Incomplete'
             $detail = 'An earlier operation could not be proven stopped, so the cleanmgr profile was not written and cleanmgr was not started.'
         }
         else {
+            $snapshotOwned = $true
             # The snapshot's handler names travel with the write. A handler that turned up after the
             # snapshot has no recorded original, and writing to a borrowed profile value this run
             # cannot put back is exactly what the rollback exists to prevent.
             # BOUNDED, and -Mutating. Writing the sage profile is a registry mutation and it was
             # called directly: a wedged registry blocked it outside every deadline the run has, and
             # an abandoned write is not a finished one.
-            $writeRun = Invoke-WacStepBounded -Component $component -Label 'write' -Mutating `
+            $writeRun = Invoke-WacStepBounded -Component $component -Label 'write' -Mutating -MutationKind InProcess `
                 -TimeoutMs $script:VolumeCacheRegistryTimeoutMs `
                 -ArgumentList @($SageId, $Category, $keyPath, @(@($snapshot) | ForEach-Object { [string]$_.Name })) -ScriptBlock {
                     param($SageId, $Category, $KeyPath, $KnownHandler)
@@ -697,7 +691,7 @@ function Invoke-WacLegacyDiskCleanup {
         if ($mutated -and @($snapshot).Count -gt 0) {
             # -IgnoreRunBudget with its own explicit bound: the rollback still has to run when the
             # budget that stopped the work has already expired.
-            $restoreRun = Invoke-WacStepBounded -Component $component -Label 'restore' -TimeoutMs $script:VolumeCacheRegistryTimeoutMs -IgnoreRunBudget -Mutating `
+            $restoreRun = Invoke-WacStepBounded -Component $component -Label 'restore' -TimeoutMs $script:VolumeCacheRegistryTimeoutMs -IgnoreRunBudget -Mutating -MutationKind InProcess `
                 -ArgumentList @(, $snapshot) -ScriptBlock {
                     param($Snapshot)
                     Restore-WacDiskCleanupStateFlag -Snapshot $Snapshot
@@ -734,6 +728,8 @@ function Invoke-WacLegacyDiskCleanup {
                 # run or an operator - which is the whole reason they were written before the first
                 # value was touched.
                 if (-not (Remove-WacControlFile -Name $script:CleanMgrSnapshotName)) {
+                    $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
+
                     Write-WacLog -Level WARNING -Component $component -Message 'The cleanmgr profile was restored but its recovery copy could not be retired; it is harmless and can be removed by hand.' -Data @{
                         store = [string](Get-WacControlRoot); name = $script:CleanMgrSnapshotName
                     }
@@ -742,6 +738,12 @@ function Invoke-WacLegacyDiskCleanup {
         }
     }
 
+    if ($snapshotOwned -and -not $mutated) {
+        # A created record with provably zero profile writes belongs to this attempt alone.
+        if (-not (Remove-WacControlFile -Name $script:CleanMgrSnapshotName)) {
+            $outcome = Get-WacHigherOutcome -Current $outcome -Candidate 'Incomplete'
+        }
+    }
     $stopwatch.Stop()
     if ($durationMs -le 0) { $durationMs = [int]$stopwatch.Elapsed.TotalMilliseconds }
 

@@ -78,7 +78,8 @@ function Invoke-WacBounded {
         # one closes the door on every later mutation in the run instead of letting the next one
         # start on top of it. Reads are unaffected: abandoning a blocked CIM query costs threads,
         # not correctness.
-        [switch]$Mutating
+        [switch]$Mutating,
+        [ValidateSet('InProcess', 'External')][string]$MutationKind = 'External'
     )
 
     if ($Mutating -and -not (Test-WacMutationAllowed)) {
@@ -203,10 +204,9 @@ foreach ($module in @($WacModulePath)) {
             # process can ever observe it finishing. The run stops scheduling mutations rather than
             # racing one it cannot see.
             if ($Mutating) {
-                # InProcess, and this is the ONLY caller entitled to say so: the work is a
-                # scriptblock on a runspace inside this process, so it cannot outlive it. Every other
-                # abandonment hands work to something that can.
-                [void](Add-WacAbandonedMutator -Kind 'InProcess' `
+                # Only explicitly host-confined writes may use InProcess. A runspace can dispatch
+                # work to a service, which may continue after the PowerShell host exits.
+                [void](Add-WacAbandonedMutator -Kind $MutationKind `
                     -Reason ('{0} exceeded its {1} ms bound' -f $Component, $budgetMs))
                 Write-WacLog -Level CRITICAL -Component $Component -Message 'A mutating block was abandoned and cannot be proven stopped; no further mutation will be scheduled.' -Data @{
                     budgetMs = $budgetMs; waitMs = $waitMs

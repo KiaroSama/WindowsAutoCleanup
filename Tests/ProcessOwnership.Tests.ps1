@@ -193,19 +193,20 @@ Test-Case 'a child holding the inherited pipe after the root exits is reported, 
     # waits turned an unfinished read into the EMPTY STRING, which a caller parsing stdout reads as a
     # real answer ("pnputil listed no drivers") rather than as a missing one.
     #
-    # The fixture owns both processes: the root is this host, the grandchild is a bounded ping whose
-    # pid the root writes out, and the teardown kills it. The expired deadline plus a deliberately
-    # tiny recovery reserve is what clamps the read budget: past the deadline a drain draws from the
-    # reserve, so the reserve is the knob, and the case costs about a second instead of five.
+    # The fixture owns both processes: the root is this host, the grandchild is a bounded PowerShell child whose
+    # pid the root writes out, and the teardown kills it. Force the managed fallback: the owned
+    # path now correctly waits for and terminates descendants rather than returning this state.
+    # A live admission deadline lets the root run; the operation allowance bounds both pipe reads.
     $marker = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('wacpipe-{0}.txt' -f [guid]::NewGuid().ToString('N').Substring(0, 10))
     $grandchildId = 0
     try {
-        $payload = "`$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','ping -n 4 127.0.0.1 >nul' -NoNewWindow -PassThru; Set-Content -LiteralPath '$marker' -Value ([string]`$p.Id); exit 0"
-        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
+        $payload = "`$p = Start-Process -FilePath '$script:HostExe' -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 15' -NoNewWindow -PassThru; Set-Content -LiteralPath '$marker' -Value ([string]`$p.Id); exit 0"
+        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddHours(1))
+        Set-WacOwnedProcessLauncher -Launcher { param($FilePath, $ArgumentList); $null = $FilePath; $null = $ArgumentList; return $null }
         Reset-WacShutdownReserve -ReserveMs 250
 
         $held = Invoke-WacProcess -FilePath $script:HostExe `
-            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $payload) -TimeoutMs 20000
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $payload) -TimeoutMs 4000
 
         if (Test-Path -LiteralPath $marker) {
             $recorded = (Get-Content -LiteralPath $marker -Raw).Trim()
@@ -223,6 +224,7 @@ Test-Case 'a child holding the inherited pipe after the root exits is reported, 
     }
     finally {
         if ($grandchildId -gt 0) { Stop-Process -Id $grandchildId -Force -ErrorAction SilentlyContinue }
+        Set-WacOwnedProcessLauncher -Launcher $null
         Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
         Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
         Reset-WacShutdownReserve

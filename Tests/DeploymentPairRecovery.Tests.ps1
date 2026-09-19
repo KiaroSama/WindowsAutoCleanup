@@ -318,7 +318,7 @@ Test-Case 'An authorized uninstall ends the records, so a later install resurrec
     }
 }
 
-Test-Case 'A commit whose record outlives it reports INCOMPLETE, not success' {
+Test-Case 'A retry refuses to stage over recovery evidence it cannot retire' {
     # The removal results were discarded with [void], so an install that committed while its record
     # stayed on disk announced success - and the next run then read a settled deployment as an
     # unfinished transaction. The tree and the task really are in place, so this is not a rollback;
@@ -338,12 +338,9 @@ Test-Case 'A commit whose record outlives it reports INCOMPLETE, not success' {
 
         $run = Invoke-PairRun -Sandbox $sandbox -Fixture $fixture -Source (New-PairCheckout -Sandbox $sandbox -Name 'C')
         Assert-False $run.TimedOut 'the install never finished inside its bound'
-        Assert-Equal 6 $run.ExitCode ('an install whose transaction outlived it reported success: ' + ($run.Journal -join ' / '))
-        Assert-True (Test-PairJournalHas -Run $run -Pattern '^EVENT\|capture-ended\|False') ($run.Journal -join ' / ')
-
-        # And it really did install: incomplete is about the audit state, not about the work.
-        Assert-Equal '# C' ([System.IO.File]::ReadAllText((Join-Path -Path $fixture.Root -ChildPath 'Run.ps1'))) `
-            'the run reported incomplete because it had not actually deployed'
+        Assert-Equal 1 $run.ExitCode ('a retry staged over unresolved preceding evidence: ' + ($run.Journal -join ' / '))
+        Assert-True (Test-PairJournalHas -Run $run -Pattern '^EVENT\|reconcile\|ok=False') $run.JournalText
+        Assert-Equal $baseline.Inventory (Get-PairInventory -Path $fixture.Root) 'a failed reconciliation replaced the original files'
         Assert-Equal 1 @(Get-PairTask -Fixture $fixture).Count 'the run left more or fewer than one registration'
         Assert-Equal $baseline.Semantics (Get-PairTaskSemantics -Task @(Get-PairTask -Fixture $fixture)[0]) `
             'the registration this run installed is not the one it asked for'

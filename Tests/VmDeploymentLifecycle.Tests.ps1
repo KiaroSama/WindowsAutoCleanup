@@ -48,6 +48,40 @@ function New-LifecycleStep {
     return [PSCustomObject]@{ Step = $Step; Ok = $Ok; Detail = $Detail }
 }
 
+function Test-LifecycleScheduledCompletion {
+    <#
+    .SYNOPSIS
+        Accepts a witnessed completed application run, never a scheduler launch error.
+    #>
+    param(
+        [bool]$Launched,
+        [AllowEmptyString()][string]$State,
+        [AllowNull()]$LastTaskResult
+    )
+    $code = 0L
+    if (-not [long]::TryParse([string]$LastTaskResult, [ref]$code)) { return $false }
+    # Run.ps1 declares 0..7. HRESULTs, scheduler status codes and a missing task are not its exits.
+    return ($Launched -and $State -ceq 'Ready' -and $code -ge 0 -and $code -le 7)
+}
+
+function Get-LifecycleMarkerRelativePath { return 'src\VM_UPGRADE_MARKER.txt' }
+
+function Test-LifecycleUpgradeMarker {
+    <#
+    .SYNOPSIS
+        Checks the actual deployed payload, independently of a manifest timestamp changing.
+    #>
+    param([string]$SourceRoot, [string]$DeploymentRoot)
+    $relative = Get-LifecycleMarkerRelativePath
+    try {
+        $source = [System.IO.File]::ReadAllBytes((Join-Path $SourceRoot $relative))
+        $deployed = [System.IO.File]::ReadAllBytes((Join-Path $DeploymentRoot $relative))
+        return ($source.Length -gt 0 -and
+            [Convert]::ToBase64String($source) -ceq [Convert]::ToBase64String($deployed))
+    }
+    catch { return $false }
+}
+
 function Invoke-LifecycleScript {
     <#
     .SYNOPSIS
@@ -136,48 +170,44 @@ function Get-WacVmDeploymentOutcome {
         # the machine from.
         $action = ''
         if ($task) { $action = [string]@($task.Actions)[0].Arguments }
-        [void]$steps.Add((New-LifecycleStep -Step 'ResetBase stays disabled' -Ok ($action -notmatch '(?i)-ResetWindowsUpdateBase:\$true') `
+        [void]$steps.Add((New-LifecycleStep -Step 'ResetBase stays disabled' -Ok ($action -match '(?i)-ResetWindowsUpdateBase:\$false' -and $action -notmatch '(?i)-ResetWindowsUpdateBase:\$true') `
             -Detail $action))
 
         # 2. SCHEDULED RUN. Started for real through the scheduler, under SYSTEM.
         if ($task) {
+            $beforeStart = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop
             Start-ScheduledTask -InputObject $task -ErrorAction Stop
 
-            # WAIT FOR THE LAUNCH BEFORE WAITING FOR THE FINISH. Start-ScheduledTask ASKS the
-            # scheduler and returns; for a moment afterwards the task is still Ready. Sampling the
-            # state once therefore read "not Running" before the task had ever started, broke out of
-            # the finish loop immediately, and then reported 267011 - SCHED_S_TASK_HAS_NOT_RUN -
-            # which is exactly what a task that never ran looks like. Measured on a github-hosted
-            # runner; the product was fine and the lane said otherwise.
+            # A stale LastTaskResult does not witness THIS start. Observe Running or a new run time.
             $launched = $false
-            $launchDeadline = [datetime]::UtcNow.AddMinutes(2)
-            while ([datetime]::UtcNow -lt $launchDeadline) {
+            $launchWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($launchWatch.Elapsed.TotalMinutes -lt 2) {
                 $current = @((Get-WacInstalledTask).Task)[0]
                 if (-not $current) { break }
-                $probe = Get-ScheduledTaskInfo -InputObject $task -ErrorAction SilentlyContinue
+                $probe = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop
                 if (([string]$current.State -ceq 'Running') -or
-                    ($probe -and [int]$probe.LastTaskResult -ne 267011)) { $launched = $true; break }
+                    ($probe.LastRunTime -gt $beforeStart.LastRunTime)) { $launched = $true; break }
                 Start-Sleep -Milliseconds 250
             }
+            $launchWatch.Stop()
 
-            $deadline = [datetime]::UtcNow.AddMinutes(6)
+            $finishWatch = [System.Diagnostics.Stopwatch]::StartNew()
             $state = 'Running'
-            while ([datetime]::UtcNow -lt $deadline) {
-                # The TASK's state, not the lookup's: the lookup answers Found either way.
+            while ($finishWatch.Elapsed.TotalMinutes -lt 6) {
                 $current = @((Get-WacInstalledTask).Task)[0]
                 if (-not $current) { $state = 'Gone'; break }
                 $state = [string]$current.State
                 if ($state -ne 'Running') { break }
                 Start-Sleep -Milliseconds 500
             }
+            $finishWatch.Stop()
             $info = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop
-            # A clean exit OR a documented non-clean outcome both count as "it ran": what must not
-            # happen is the task never finishing, or failing to start at all (0x8007010B and friends).
-            [void]$steps.Add((New-LifecycleStep -Step 'scheduled run finishes' -Ok ($state -ne 'Running') `
+            # Application exits are 0..7; 267011 and HRESULTs are not proof that Run.ps1 executed.
+            [void]$steps.Add((New-LifecycleStep -Step 'scheduled run finishes' -Ok ($state -ceq 'Ready') `
                 -Detail ('state={0} lastResult={1}' -f $state, [string]$info.LastTaskResult)))
-            [void]$steps.Add((New-LifecycleStep -Step 'scheduled run actually launched' `
-                -Ok ($launched -and [int]$info.LastTaskResult -ne 267011) `
-                -Detail ('launched={0} lastResult={1} (267011 = never run)' -f $launched, [string]$info.LastTaskResult)))
+            $completed = Test-LifecycleScheduledCompletion -Launched $launched -State $state -LastTaskResult $info.LastTaskResult
+            [void]$steps.Add((New-LifecycleStep -Step 'scheduled run actually launched' -Ok $completed `
+                -Detail ('launched={0} lastResult={1} (application exit required)' -f $launched, [string]$info.LastTaskResult)))
         }
 
         # 3. SECOND INSTALL - idempotence. A healthy reinstall must stay healthy and must not leave a
@@ -195,20 +225,24 @@ function Get-WacVmDeploymentOutcome {
 
         # 4. UPGRADE. The source is changed so the staged tree really differs, which is what makes
         #    the swap a swap rather than a copy over itself.
-        $marker = Join-Path -Path $script:RepoRoot -ChildPath 'VM_UPGRADE_MARKER.txt'
+        $marker = Join-Path -Path $script:RepoRoot -ChildPath (Get-LifecycleMarkerRelativePath)
+        $markerCreated = $false
         $upgraded = $false
         try {
+            if (Test-Path -LiteralPath $marker) { throw 'The upgrade probe name already exists; it was not overwritten.' }
+            $markerCreated = $true
             Set-Content -LiteralPath $marker -Value ('vm upgrade probe {0}' -f ([guid]::NewGuid())) -Encoding ASCII
             $upgrade = Invoke-LifecycleScript -ScriptPath $installer -BooleanSwitch $safeBoolean -PresentSwitch $safePresent
             $upgraded = ([int]$upgrade.ExitCode -eq 0)
             $secondPrint = Get-WacDeploymentFingerprint -DeploymentRoot $root
             $ownedUpgrade = Get-WacDeploymentOwnership -DeploymentRoot $root
+            $markerMatches = Test-LifecycleUpgradeMarker -SourceRoot $script:RepoRoot -DeploymentRoot $root
             [void]$steps.Add((New-LifecycleStep -Step 'upgrade replaces the deployment and stays healthy' `
-                -Ok ($upgraded -and [bool]$ownedUpgrade.IsHealthy -and ([string]$secondPrint.Fingerprint -ne [string]$firstPrint.Fingerprint)) `
-                -Detail ('exit={0} before={1} after={2} health={3}' -f [string]$upgrade.ExitCode, [string]$firstPrint.Fingerprint, [string]$secondPrint.Fingerprint, [string]$ownedUpgrade.Reason)))
+                -Ok ($markerMatches -and $upgraded -and [bool]$ownedUpgrade.IsHealthy -and ([string]$secondPrint.Fingerprint -ne [string]$firstPrint.Fingerprint)) `
+                -Detail ('exit={0} before={1} after={2} health={3} payloadMatches={4}' -f [string]$upgrade.ExitCode, [string]$firstPrint.Fingerprint, [string]$secondPrint.Fingerprint, [string]$ownedUpgrade.Reason, $markerMatches)))
         }
         finally {
-            if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+            if ($markerCreated -and (Test-Path -LiteralPath $marker)) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
         }
 
         # 5. FAILURE ROLLBACK, against the real root rather than a fixture. A tampered live

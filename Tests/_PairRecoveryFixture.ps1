@@ -300,7 +300,7 @@ catch {
 
 # The decision first, while the recovery copy is still there to roll back to, and neither half
 # retired until it is on disk.
-$decision = Set-WacDeploymentCommitted
+$decision = Set-WacDeploymentCommitted -Task @($lookup.Task)
 Add-PairEvent ('decision|' + [bool]$decision.Recorded)
 Stop-AtPoint -Name 'after-decision'
 

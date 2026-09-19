@@ -139,7 +139,7 @@ Test-Case 'an ordinary tool is owned from creation and reports a complete, empty
     Assert-True ([bool]$result.OutputComplete) 'a finished tool was reported as having incomplete output'
 }
 
-Test-Case 'a grandchild whose parent already exited keeps the tree unproven, and dies with the job' {
+Test-Case 'a grandchild whose parent already exited is terminated when the tree deadline expires' {
     # THE regression, and the exact shape a snapshot cannot answer: when the verdict is taken, B is
     # gone, so C has no path back to A. The old proof bound A alone, found nothing else, and called
     # the tree stopped. The job holds C regardless of B, so it cannot.
@@ -151,7 +151,16 @@ Test-Case 'a grandchild whose parent already exited keeps the tree unproven, and
         # reserve clamps that budget without touching the tool's own timeout, which is passed
         # explicitly: past the deadline a drain draws from the reserve, so both knobs are needed.
         # It also makes the incomplete-output witness part of what this case exercises.
-        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
+        Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddHours(1))
+        Set-WacOwnedProcessLauncher -Launcher {
+            param($FilePath, $ArgumentList)
+            Set-WacOwnedProcessLauncher -Launcher $null
+            $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList
+            # Establish root exit before advancing the run deadline; the grandchild stays alive.
+            [void][WacOwnedProcess]::WaitForExit($launch.Process, 10000)
+            Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
+            return $launch
+        }
         Reset-WacShutdownReserve -ReserveMs 250
 
         $marker = Join-Path -Path $sandbox -ChildPath 'grandchild.pid'
@@ -162,25 +171,25 @@ Test-Case 'a grandchild whose parent already exited keeps the tree unproven, and
         Assert-True ($childId -gt 0) 'the fixture never recorded the grandchild, so nothing was proved'
 
         Assert-True ([bool]$result.Started) 'the root did not start'
-        Assert-True (-not $result.TimedOut) 'the root did not exit on its own, so this is not the shape under test'
-        Assert-Equal 0 ([int]$result.ExitCode) 'the root did not exit cleanly - its clean exit is the reassuring half'
+        Assert-True ([bool]$result.TimedOut) 'a live descendant exceeded the tree deadline without a timeout verdict'
+        Assert-Equal $null $result.ExitCode 'the root exit code concealed the unfinished descendant'
         Assert-True ([bool]$result.Owned) 'the tool was not owned, so the job verdict below proves nothing'
 
-        Assert-Equal 'Alive' ([string]$result.OwnedTreeState) `
-            'a job still holding a live grandchild was reported as an empty tree'
-        Assert-True (-not $result.TerminationProven) `
-            'a clean root exit was reported as proof the whole tree had stopped while a grandchild ran'
-
-        # The backstop, asserted rather than assumed: Invoke-WacProcess has returned, so the job
-        # handle is closed, so KILL_ON_JOB_CLOSE has fired on everything still inside it.
-        Assert-True (-not $result.OutputComplete) `
-            'a pipe still held open by the grandchild was handed over as the whole output'
+        # A completed tree now requires confirmation after termination, not the root's exit.
+        if ($result.TerminationProven) {
+            Assert-Equal 'Complete' ([string]$result.OwnedTreeState) 'termination proof disagrees with job membership'
+        }
+        else {
+            Assert-True (@('Alive', 'Unknown') -ccontains [string]$result.OwnedTreeState) 'an unproven tree was labelled complete'
+        }
+        # Independent OS observation below is mandatory even when the confirmation budget ran out.
         Assert-True (Wait-ProcessGone -ProcessId $childId) `
             'the grandchild outlived the run - the kill-on-close backstop did not fire'
         $childId = 0
     }
     finally {
         if ($childId -gt 0) { Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue }
+        Set-WacOwnedProcessLauncher -Launcher $null
         Set-WacDeadline -DeadlineUtc ((Get-Date).ToUniversalTime().AddHours(1))
         Reset-WacShutdownReserve
         Remove-TestSandbox -Path $sandbox

@@ -232,7 +232,7 @@ Test-Case 'The ancestor walk is Core''s, not a second copy living in Deploy' {
     $package = @('WindowsAutoCleanup.Deploy.psm1', 'WindowsAutoCleanup.DeploymentTree.ps1',
         'WindowsAutoCleanup.DeploymentProof.ps1', 'WindowsAutoCleanup.DeploymentJournal.ps1',
         'WindowsAutoCleanup.DeploymentRecovery.ps1', 'WindowsAutoCleanup.DeploymentCommit.ps1',
-        'WindowsAutoCleanup.TaskMatch.ps1',
+        'WindowsAutoCleanup.TaskMatch.ps1', 'WindowsAutoCleanup.UninstallIntent.ps1',
         'WindowsAutoCleanup.ScheduledTask.ps1', 'WindowsAutoCleanup.TaskRemoval.ps1')
 
     $module = [System.IO.File]::ReadAllText((Join-Path -Path $script:RepoRoot -ChildPath 'src\WindowsAutoCleanup.Deploy.psm1'))

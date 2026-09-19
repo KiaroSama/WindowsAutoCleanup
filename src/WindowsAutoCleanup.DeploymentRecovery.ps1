@@ -197,6 +197,13 @@ function Get-WacDeploymentRecoveryPlan {
     }
     if (-not $slots) { return $plan }
 
+    # An authorized uninstall must finish before an older upgrade may restore any registration.
+    $uninstall = Read-WacDeploymentJournal -DeploymentRoot $slots.Root -Kind Uninstall
+    if ([string]$uninstall.State -cne 'Absent') {
+        $plan.Reason = 'An uninstall intent is outstanding or unreadable. Resume the uninstaller; no task or deployment was resurrected.'
+        return $plan
+    }
+
     $swap = Read-WacDeploymentJournal -DeploymentRoot $slots.Root
     $capture = Read-WacTaskCaptureRecord -DeploymentRoot $slots.Root
     $plan.Swap = $swap
@@ -213,6 +220,13 @@ function Get-WacDeploymentRecoveryPlan {
     }
     if ([string]$capture.State -ceq 'Unreadable') {
         $plan.Reason = ('A task-capture record from an earlier run is present but could not be read, so whether this machine is missing a scheduled task is unknown: {0}' -f [string]$capture.Reason)
+        return $plan
+    }
+
+    if ([string]$swap.State -ceq 'Valid' -and [string]$capture.State -ceq 'Valid' -and
+        -not [string]::IsNullOrWhiteSpace([string]$swap.Generation) -and
+        -not [string]::IsNullOrWhiteSpace([string]$capture.Generation) -and -not $plan.Linked) {
+        $plan.Reason = 'The swap and task capture belong to different generations; neither was changed.'
         return $plan
     }
 
@@ -264,6 +278,11 @@ function Resolve-WacPlanWithoutSlot {
     $journal = $Plan.Swap.Record
 
     if (Test-WacDeploymentGenerationCommitted -Record $journal) {
+        if (-not $Plan.Live.IsHealthy -or
+            -not (Test-WacDeploymentIsRecordedReplacement -Root $root -Record $journal)) {
+            $Plan.Reason = 'The committed replacement is no longer healthy or no longer matches its recorded identity; no recovery evidence was retired.'
+            return $Plan
+        }
         $Plan.Verdict = 'CommitReplacement'
         $Plan.Reason = 'An earlier run recorded that its generation committed and left no recovery copy, so nothing but its own record is outstanding.'
         return $Plan
@@ -297,8 +316,15 @@ function Resolve-WacPlanWithoutSlot {
     # The record names nothing that was moved aside, so no copy is missing. If the root is empty or
     # gone the swap never got its replacement in, and there is nothing left of that attempt.
     if ((-not $Plan.Live.Exists) -or ($Plan.Live.IsOurs -and $Plan.Live.IsEmpty)) {
-        $Plan.Verdict = 'CommitReplacement'
-        $Plan.Reason = 'An earlier first install moved nothing aside and never got its own tree in place, so there is nothing of it left to reconcile.'
+        # No committed generation exists here. This is the original no-install state, including
+        # the crash interval after rollback removed its replacement but before records retired.
+        if (-not $Plan.Live.Exists -and [string](Get-WacPathPresence -Path $root) -cne 'Absent') {
+            $Plan.Reason = 'The original absence could not be established; no recovery evidence was retired.'
+            return $Plan
+        }
+        $Plan.Verdict = 'RestoreOriginal'
+        $Plan.Corroboration = [PSCustomObject]@{ Corroborated = $true; Matches = $true }
+        $Plan.Reason = 'The first install left no deployed content; its original task state and records still require rollback reconciliation.'
         return $Plan
     }
 
@@ -352,7 +378,10 @@ function Resolve-WacPlanWithSlot {
     # ONE comparison, read by BOTH promotion branches. It used to be computed only for the
     # "interrupted" determination, so the branch below promoted whatever stood in the slot with no
     # content check at all.
-    $interrupted = ($promotable.Promotable -and [bool]$corroboration.Corroborated)
+    $emptyOriginal = [string]::Equals(
+        [string](Get-WacJournalField -Record $journal -Name 'OriginalState'),
+        'Empty', [System.StringComparison]::Ordinal)
+    $interrupted = (($promotable.Promotable -or $emptyOriginal) -and [bool]$corroboration.Corroborated)
 
     # OPEN is a valid record that does not say it committed. A slot with NO record beside it is not
     # open - it is a superseded copy an earlier commit failed to delete - so the commit gate covers
@@ -363,12 +392,12 @@ function Resolve-WacPlanWithSlot {
     if ((-not $live.Exists) -or ($live.IsOurs -and $live.IsEmpty)) {
         # The slot holds the only installation left on the machine.
         if (-not $promotable.Promotable) {
-            # An empty original is the one shape that is legitimately not promotable: there is no
-            # Run.ps1 in it because there never was one. Nothing is lost by discarding it.
+            # An empty original has no Run.ps1 by design. Corroborate its emptiness and restore
+            # that directory, rather than turning an unfinished transaction into a commit.
             if ([bool]$corroboration.Corroborated -and
                 [string]::Equals([string](Get-WacJournalField -Record $journal -Name 'OriginalState'), 'Empty', [System.StringComparison]::Ordinal)) {
-                $Plan.Verdict = 'CommitReplacement'
-                $Plan.Reason = 'The recovery slot holds the empty directory an earlier run moved aside, which is nothing to put back.'
+                $Plan.Verdict = 'RestoreOriginal'
+                $Plan.Reason = 'The corroborated empty original must be promoted back before its task and swap records are retired.'
                 return $Plan
             }
 
@@ -408,7 +437,8 @@ function Resolve-WacPlanWithSlot {
         return $Plan
     }
 
-    if ($live.IsHealthy) {
+    if ($live.IsHealthy -and ([string]$Plan.Swap.State -cne 'Valid' -or
+        (Test-WacDeploymentIsRecordedReplacement -Root $slots.Root -Record $journal))) {
         $Plan.Verdict = 'CommitReplacement'
         $Plan.Reason = 'The recovery slot holds a superseded copy while a verified deployment of ours is live, so it is discarded.'
         return $Plan
@@ -455,6 +485,15 @@ function Resolve-WacDeploymentRecoverySlot {
     if ([string]$plan.Verdict -ceq 'None') {
         $result.Reason = 'There was no recovery slot to reconcile.'
         return $result
+    }
+
+    $ackRecord = $plan.Swap.Record
+    if ([string]$plan.Swap.State -ceq 'Absent' -and [string]$plan.Capture.State -ceq 'Valid') {
+        $ackRecord = (Read-WacDeploymentJournal -DeploymentRoot $Slots.Root -Kind TaskCapture).Record
+    }
+    if ([string]$plan.Capture.State -ceq 'Valid' -and
+        ([string](Get-WacJournalField -Record $ackRecord -Name 'TaskReconciledVerdict')) -cne [string]$plan.Verdict) {
+        throw 'The task half has not been durably reconciled to this recovery decision; no files were changed.'
     }
 
     if ([string]$plan.Verdict -ceq 'RestoreOriginal') {
@@ -517,11 +556,27 @@ function Resolve-WacDeploymentRecoverySlot {
         $result.Action = 'Discarded'
     }
 
-    # The transaction is over either way, so its record goes - and a record that could not be
-    # deleted is reported, never swallowed: the next run would read a settled state as unfinished.
-    if (-not (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)) {
-        Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'A reconciled deployment transaction record could not be deleted; a later run may read a settled state as unfinished. Delete it by hand.' -Data @{
-            path = [string](Get-WacDeploymentJournalPath -DeploymentRoot $Slots.Root)
+    # Retirement order depends on the decision. Rollback has restored the original pair: retire
+    # the swap FIRST, retaining its original task capture on any failure. A crash after that delete
+    # is safely reconciled as a capture-only transaction against the restored original task.
+    # Commit keeps the replacement pair: retire the original capture FIRST, or a capture-only
+    # retry could resurrect task A over committed files B. The surviving swap carries task B proof.
+    if ([string]$plan.Verdict -ceq 'RestoreOriginal') {
+        if (-not (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)) {
+            throw 'The rollback journal could not be retired; the original task capture was kept for retry.'
+        }
+        if ([string]$plan.Capture.State -ceq 'Valid' -and
+            -not (Remove-WacTaskCaptureRecord -DeploymentRoot $Slots.Root)) {
+            throw 'The original pair is restored but its task capture could not be retired; retry will reconcile that capture.'
+        }
+    }
+    else {
+        if ([string]$plan.Capture.State -ceq 'Valid' -and
+            -not (Remove-WacTaskCaptureRecord -DeploymentRoot $Slots.Root)) {
+            throw 'The recovered task capture could not be retired; its authoritative swap record was kept.'
+        }
+        if (-not (Remove-WacDeploymentJournal -DeploymentRoot $Slots.Root)) {
+            throw 'The committed replacement is verified but its journal could not be retired; its replacement task proof was kept for retry.'
         }
     }
 
