@@ -141,6 +141,27 @@ function Invoke-CampaignPowerCut {
     return $true
 }
 
+function Get-CampaignGuestAccount {
+    <#
+    .SYNOPSIS
+        Whatever the guest managed to say about its own failure, appended to a host-side reason.
+    .DESCRIPTION
+        The agent publishes `AgentFault` and the tail of its own log when it stops, precisely because
+        the host has no credential-bearing way to read a file in there. Leaving those out of the
+        reason is how a campaign reports silence when the guest was not silent at all.
+    #>
+    param([hashtable]$Item)
+
+    $said = @()
+    foreach ($key in @('AgentBoot', 'AgentFault', 'AgentLog')) {
+        if ($null -ne $Item -and $Item.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace([string]$Item[$key])) {
+            $said += ('{0}={1}' -f $key, [string]$Item[$key])
+        }
+    }
+    if ($said.Count -eq 0) { return ' The guest said nothing at all, not even that it booted.' }
+    return (' The guest said: ' + ($said -join ' | '))
+}
+
 function Invoke-CampaignOneScenario {
     <#
     .SYNOPSIS
@@ -164,7 +185,8 @@ function Invoke-CampaignOneScenario {
     }
     if (-not $ready.Signalled) {
         throw ('The guest agent never reported in. Either this guest was never armed, or the agent is not running. ' +
-            'Arm it once with the procedure in Tests/Campaign/README.md. Detail: ' + $ready.Reason)
+            'Arm it once with the procedure in Tests/Campaign/README.md. Detail: ' + $ready.Reason +
+            (Get-CampaignGuestAccount -Item $ready.Item))
     }
     Write-CampaignLine ('  agent ready: {0}' -f [string]$ready.Item['AgentReady'])
 
@@ -183,7 +205,9 @@ function Invoke-CampaignOneScenario {
         }
 
         if (-not $signal.Signalled) {
-            return [PSCustomObject]@{ Status = 'blocked'; Reason = $signal.Reason; Item = $signal.Item; Report = $null }
+            return [PSCustomObject]@{ Status = 'blocked'
+                Reason = ($signal.Reason + (Get-CampaignGuestAccount -Item $signal.Item))
+                Item = $signal.Item; Report = $null }
         }
 
         $item = $signal.Item
@@ -201,7 +225,8 @@ function Invoke-CampaignOneScenario {
         $report = Join-WacCampaignParts -Item $item -Key 'Report'
         if ($null -eq $report) {
             return [PSCustomObject]@{ Status = 'blocked'
-                Reason = 'the guest declared itself finished but its report did not arrive whole; a partial verdict is not read as a short one'
+                Reason = ('the guest declared itself finished but its report did not arrive whole; a partial verdict is not read as a short one.' +
+                    (Get-CampaignGuestAccount -Item $item))
                 Item = $item; Report = $null }
         }
 
