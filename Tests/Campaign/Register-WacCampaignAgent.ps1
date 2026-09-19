@@ -82,7 +82,17 @@ foreach ($file in @('WacCampaignAgent.ps1', 'WacCampaignScenario.ps1')) {
         Write-ArmingLine ('REFUSED: {0} is missing beside the agent; arming half of it would be worse than not arming it.' -f $file)
         exit 1
     }
-    Copy-Item -LiteralPath $source -Destination (Join-Path -Path $agentHome -ChildPath $file) -Force
+    # A file is not copied onto itself. Arming can be run FROM the agent's own home - the agent does
+    # exactly that when it makes its own arming durable - and there the source and the destination
+    # are one file, which is open because it is the script currently running. Windows answers that
+    # with an IOException, and the whole arming then fails for a copy that had nothing to do.
+    $destination = Join-Path -Path $agentHome -ChildPath $file
+    if ([string]::Equals([System.IO.Path]::GetFullPath($source), [System.IO.Path]::GetFullPath($destination),
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-ArmingLine ('{0} is already in place.' -f $file)
+        continue
+    }
+    Copy-Item -LiteralPath $source -Destination $destination -Force
 }
 
 $installed = Join-Path -Path $agentHome -ChildPath 'WacCampaignAgent.ps1'
