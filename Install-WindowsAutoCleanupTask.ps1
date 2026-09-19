@@ -43,8 +43,10 @@
          holds the machine-wide lock
       4  elevation was cancelled or failed
       5  unsupported environment (the online system drive is not C:)
-      6  refused before any change, or the task and deployment landed, but either way this run's
-         audit log is not durable
+      6  refused before any change, or the task and deployment landed but this run left something
+         unfinished behind it: an undurable audit log, a transaction record that outlived the
+         install that committed it, or a commit decision that could not be written - in which case
+         the copy of the previous deployment is deliberately KEPT rather than retired
       7  refused: the machine state directory could not be proven machine-trusted, or something at
          the task path or the deployment path could not be proven ours. Nothing was changed
       8  the elevated installer outran its budget and could NOT be proven terminated. It may still

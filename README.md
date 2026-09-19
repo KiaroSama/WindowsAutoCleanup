@@ -210,11 +210,30 @@ the registered task instead is what the ownership proof and the exact action par
 | `4` | Elevation was cancelled or failed. |
 | `5` | Unsupported environment: the online system drive is not `C:`. |
 | `6` | Incomplete: the run did not finish what it was asked to do, or cannot prove it did. The budget expired, a step hit its deadline, an elevated child had to be terminated, the durable audit log could not be produced, or the run inherited an unfinished mutation and refused to change anything further (see below). |
-| `7` | Security refusal: a safety check refused to proceed on evidence. A cleanup path failed its identity or containment re-check, or the directory holding the run state and audit log is not machine-trusted. If no state directory passes verification, no run log is written and the refusal goes to the Windows event log or console; a directory created before a later trust refusal may remain. |
+| `7` | Security refusal: a safety check refused to proceed on evidence. A cleanup path failed its identity or containment re-check, the directory holding the run state and audit log is not machine-trusted, or an earlier installer left a deployment transaction outstanding beside this deployment (see below). If no state directory passes verification, no run log is written and the refusal goes to the Windows event log or console; a directory created before a later trust refusal may remain. |
 
 A run reports its **worst** outcome: a refusal outranks a failure, which outranks incomplete work. A benign skip does not affect the code — a reparse point left alone, a protected path stepped around, or an opt-in step that is switched off all keep the run at `0`.
 
 The installer and uninstaller use the same `6` and `7`, and add an `8` of their own: the elevated child outran its budget and could **not** be proven terminated, so it may still be running and holding the machine-wide lock — do not re-run until it exits. Their full tables are in each script's `.NOTES` block.
+
+### A run that refuses to clean from an unfinished installation
+
+An installation is two things: the tree at the deployment root, and the scheduled registration that
+runs it. Only the generation that put them there ever establishes that they belong to each other,
+and while that generation is in flight it keeps a record on disk beside the deployment root. A
+record still standing means the installer that wrote it did not finish.
+
+The scheduled task fires on its trigger whatever state the last installer left. So a run whose
+deployment still carries such a record refuses with `7` and changes nothing: the registration that
+started it and the tree it is running were last touched by a process that did not finish, and
+neither vouches for the other. Re-run the installer to close it — the installer reconciles both
+halves before it prepares anything of its own, and deletes the records when the new installation is
+verified and committed.
+
+The installer itself now records that commit **before** it retires the copy of the deployment it
+replaced. If that decision cannot be written, the installation is still in place and verified, but
+nothing is retired and the installer reports `6`: keeping both the copy and the record is
+recoverable, and discarding the copy without the decision beside it is not.
 
 ### A run that refuses to mutate anything
 
