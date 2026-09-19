@@ -95,25 +95,28 @@ The resume point is written to disk **before** the cut is requested. After the p
 
 ## Status
 
-**The campaign has run for real**, on a Hyper-V Windows 11 guest, on 2026-09-19. Two of the four
-default scenarios passed, and they are the two this work exists for:
+**The campaign has run for real**, on a Hyper-V Windows 11 guest, most recently on 2026-09-19 with
+scenario isolation and deterministic cuts. Two of the four default scenarios pass:
 
 | scenario | verdict | what it showed |
 | --- | --- | --- |
-| `service-dispatched-maintenance` | **passed** | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 entries and 13.4 MB actually removed, read from the run's own `.summary.json` |
-| `power-loss-during-install` | **passed** | a real power cut at the instant the guest reported reaching the transaction; after restart, recovery left the files, the registration and the records agreeing |
-| `power-loss-during-uninstall` | failed | **a defect in this campaign, not in the product** — a short uninstall can finish between the guest asking for the cut and the host taking it, so nothing was interrupted |
-| `reboot-recovery` | failed | **a defect in this campaign** — it inherited the previous scenario's half-removed state and was refused before it began |
+| `service-dispatched-maintenance` | **passed** | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 204 entries and 14.8 MB actually removed, read from the run's own `.summary.json` |
+| `reboot-recovery` | **passed** | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
+| `power-loss-during-install` | failed | the guest published nothing for 900 s after the cut |
+| `power-loss-during-uninstall` | failed | the same |
 
-Both failures are worth reading for what they show about the product: the installer met an
-outstanding uninstall intent, refused, named the condition, said which manual step clears it, and
-confirmed that nothing was staged, swapped or registered. That sentence came off a real machine.
+The two power-cut scenarios fail on the guest, not on the product: after a cut taken at the frozen
+instant, the machine ran for 15 minutes with no heartbeat - a repair pass or a stuck boot - and the
+driver's idle bound correctly declared it blocked rather than waiting for ever. **Until that is
+understood they prove nothing either way**, and the campaign says so rather than reporting a verdict.
 
-Known limitations, in this order:
+Known limitation, with its investigation order:
 
-1. **The cut is not instantaneous.** It is armed by the guest and taken by the host on its next poll,
-   so an operation that finishes inside that window is not interrupted at all.
-2. **Scenarios are not isolated from one another.** They run in sequence on an accumulating guest, so
-   one that leaves the machine in a refused state blocks the next.
+1. Find out whether the guest returns at all given more than 15 minutes. One cut, then watch the
+   heartbeat for an hour, **before** any budget is changed.
+2. If it returns, raise only the post-cut ready wait - a scenario that is genuinely stuck should
+   still fail fast.
+3. If it does not, the freeze has to flush before it holds: suspend once the record's write has
+   settled rather than the instant the path appears.
 
-Until those are closed, `power-loss-during-uninstall` and `reboot-recovery` prove nothing either way.
+Raising a timeout first is how a hang becomes a long hang.
