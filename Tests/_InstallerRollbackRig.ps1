@@ -149,6 +149,13 @@ function New-RollbackSandbox {
         # The commit point's two record deletions, as RESULTS rather than gestures. WAC_RB_COMMIT
         # fails one of them while the install itself still lands, which is the only way a durable
         # record outlives the commit that was supposed to end it.
+        # The durable commit decision, which the installer writes BEFORE it retires either recovery
+        # copy (ledger WAC-02R). WAC_RB_COMMIT=decision-fails is the shape where the install is good
+        # and the decision did not land, and nothing may then be retired.
+        'function Set-WacDeploymentCommitted {',
+        '    Add-Journal ''Set-WacDeploymentCommitted''',
+        '    return ([PSCustomObject]@{ Recorded = ($env:WAC_RB_COMMIT -ne ''decision-fails''); Reason = ''stub'' })',
+        '}',
         'function Remove-WacDeploymentPrevious { Add-Journal ''Remove-WacDeploymentPrevious''; return ($env:WAC_RB_COMMIT -ne ''swap-stays'') }',
         'function Remove-WacDeployment { param([string]$Path, [string]$DeploymentRoot) Add-Journal (''Remove-WacDeployment|'' + $Path); return ([PSCustomObject]@{ Path = $Path; Removed = $true; Reason = $null }) }',
         # The durable capture record, as REAL file I/O rather than a flag: the conflict phase
@@ -171,9 +178,10 @@ function New-RollbackSandbox {
         '    return ([PSCustomObject]@{ State = ''Valid''; Schema = 2; Capture = @($items); Reason = ''stub'' })',
         '}',
         # The ONE commit decision the generation gets (ledger WAC-02R). The installer asks for it
-        # before anything is staged and hands it to the task half; the file half derives the same
-        # one inside New-WacDeploymentStage, which this sandbox stubs out. WAC_RB_PLAN is the
-        # verdict a scenario wants; the capture it carries is the real record on disk.
+        # before anything is staged and hands it to BOTH halves - the task half below, and the file
+        # half the installer now runs straight after it rather than inside New-WacDeploymentStage.
+        # WAC_RB_PLAN is the verdict a scenario wants; the capture it carries is the real record on
+        # disk.
         'function Get-WacDeploymentRecoveryPlan {',
         '    param([string]$DeploymentRoot)',
         '    $verdict = $env:WAC_RB_PLAN',
@@ -184,6 +192,19 @@ function New-RollbackSandbox {
         '        Swap = $null; Capture = (Read-WacTaskCaptureRecord); Linked = ($env:WAC_RB_LINKED -eq ''yes'')',
         '        SlotState = ''Absent''; Promotable = $null; Corroboration = $null; Live = $null',
         '    })',
+        '}',
+        # The FILE half, journalled like every other call so a scenario can see WHERE it ran. It is
+        # stubbed rather than executed because this sandbox has no real slots to move; what these
+        # scenarios are about is what the installer does around it. WAC_RB_RECOVER=throw is the
+        # refusal shape, which must stop the install before anything is staged.
+        'function Resolve-WacDeploymentRecoverySlot {',
+        '    param($Slots)',
+        '    $null = $Slots',
+        '    $action = $env:WAC_RB_RECOVER',
+        '    if (-not $action) { $action = ''None'' }',
+        '    Add-Journal (''Resolve-WacDeploymentRecoverySlot|'' + $action)',
+        '    if ($action -eq ''throw'') { throw ''stub: the recovery slot could not be reconciled'' }',
+        '    return ([PSCustomObject]@{ Action = $action; Reason = ''stub''; Plan = $null })',
         '}',
         # Whether a task standing at a captured name IS that capture. 'differ' is a task that wears
         # the name and is not the task - the shape the name-only comparison could not see.
@@ -307,7 +328,7 @@ function Invoke-RollbackScenario {
         # Whether the two record deletions at the commit point SUCCEED. The install itself still
         # lands either way: 'swap-stays' and 'capture-stays' are a durable record outliving the
         # commit that ended it, which leaves a later run reconciling a state that is already settled.
-        [ValidateSet('clean', 'swap-stays', 'capture-stays')][string]$Commit = 'clean',
+        [ValidateSet('clean', 'swap-stays', 'capture-stays', 'decision-fails')][string]$Commit = 'clean',
         # Zero-based index of the first budget check that finds the deadline gone; -1 never expires.
         [ValidateRange(-1, 32)][int]$Budget = -1,
         [ValidateRange(10, 300)][int]$TimeoutSeconds = 90

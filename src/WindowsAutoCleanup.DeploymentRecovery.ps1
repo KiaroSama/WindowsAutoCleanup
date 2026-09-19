@@ -27,6 +27,13 @@
     The plan is derived rather than passed between the two halves, because deriving it twice over an
     unchanged filesystem is deterministic and passing it would let a caller hand the file half a
     verdict the disk no longer supports. Registering a task changes nothing either half reads.
+
+    What the verdict may be derived FROM is the second half of the same ledger. Commitment is READ
+    off the record (Test-WacDeploymentGenerationCommitted), never inferred from a manifest that
+    matches or a tree that looks healthy, because a generation can leave both behind and still have
+    died before it registered the task that went with them - and it is commitment that authorises
+    retiring a recovery copy. A record that does not say it describes a transaction still open, and
+    an open transaction is either rolled back to something corroborated or refused whole.
 #>
 
 function Get-WacDeploymentRecoveryPathState {
@@ -117,6 +124,30 @@ function Test-WacDeploymentIsRecordedReplacement {
     return [string]::Equals($live, $recorded, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Test-WacDeploymentGenerationCommitted {
+    <#
+    .SYNOPSIS
+        Whether the generation that wrote a swap record recorded that it FINISHED.
+    .DESCRIPTION
+        Ledger WAC-02R. Commitment used to be INFERRED by the next process, from a manifest hash
+        that matched the record or from a healthy tree beside an original it could not promote, and
+        neither of those is the same claim. A tree can be healthy, be exactly the one the record
+        names, and still belong to a run that died before it registered the task that goes with it;
+        retiring the recovery copy on that reading discards the only installation that ever worked.
+
+        Absence is "not committed" - the only thing a record written before schema 4 can honestly
+        support, and the safe direction for every other one too. The value is COMPARED rather than
+        cast, because [bool]'False' is $true in PowerShell and a record that has been through a hand
+        edit or a foreign serialiser can carry the word where the boolean was.
+    #>
+    param([AllowNull()]$Record)
+
+    $value = Get-WacJournalField -Record $Record -Name 'Committed'
+    if ($null -eq $value) { return $false }
+    if ($value -is [bool]) { return [bool]$value }
+    return [string]::Equals([string]$value, 'True', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Get-WacDeploymentRecoveryPlan {
     <#
     .SYNOPSIS
@@ -141,6 +172,10 @@ function Get-WacDeploymentRecoveryPlan {
         the only place where believing two separate files describe one transaction can destroy
         evidence. A record written before generation ids existed carries none and is never linked,
         so an old pair is reconciled conservatively rather than assumed.
+
+        Corroboration is the record's own inventory compared against a tree on disk: the recovery
+        slot when there is one, and the DEPLOYMENT ROOT when there is not - the same question asked
+        of the only place the tree that was moved aside can still be standing.
     .OUTPUTS
         Verdict, Reason, Slots, Swap, Capture, Linked, SlotState, Promotable, Corroboration, Live.
     #>
@@ -208,6 +243,14 @@ function Resolve-WacPlanWithoutSlot {
         whether the tree standing at the root ever committed, and a first install that got as far as
         moving its tree in and no further left exactly this shape: no recovery slot, because there
         was nothing to move aside, and an open transaction that deleting the record would bury.
+
+        A matching replacement manifest then took that job over, which is the same mistake one step
+        on: it says WHICH TREE is standing there and nothing at all about whether the run that put
+        it there finished. What decides now is the commit the generation wrote, and after that the
+        IDENTITY of the tree at the root - because a rollback killed between its move and its record
+        deletion leaves the ORIGINAL standing here with no slot beside it, which is the state that
+        rollback was aiming for, and which used to read as a transaction nobody could account for,
+        for ever.
     #>
     param([Parameter(Mandatory = $true)]$Plan)
 
@@ -218,19 +261,36 @@ function Resolve-WacPlanWithoutSlot {
     }
 
     $root = [string]$Plan.Slots.Root
-    if (Test-WacDeploymentIsRecordedReplacement -Root $root -Record $Plan.Swap.Record) {
-        # The swap reached the point where its replacement went live, and there is no copy of what
-        # it replaced. What stands at the root IS this generation's deployment, so the transaction
-        # is over in substance and the leftovers may be retired.
+    $journal = $Plan.Swap.Record
+
+    if (Test-WacDeploymentGenerationCommitted -Record $journal) {
         $Plan.Verdict = 'CommitReplacement'
-        $Plan.Reason = 'An earlier run put its replacement live and left no recovery copy, so the deployment at the root is that replacement and its transaction is over.'
+        $Plan.Reason = 'An earlier run recorded that its generation committed and left no recovery copy, so nothing but its own record is outstanding.'
         return $Plan
     }
 
-    $state = [string](Get-WacJournalField -Record $Plan.Swap.Record -Name 'OriginalState')
+    # Against the DEPLOYMENT ROOT, through the one comparison the slot gets, because the question is
+    # the same one: is this tree what the record says was moved aside? Derived from what is standing
+    # there rather than from the missing slot, so reconciling the same disk twice reaches the same
+    # answer, and a tree altered since reaches none.
+    $corroboration = Test-WacRecoverySlotMatchesRecord -Path $root -Record $journal
+    $Plan.Corroboration = $corroboration
+
+    if ([bool]$corroboration.Corroborated) {
+        $Plan.Verdict = 'RestoreOriginal'
+        $Plan.Reason = ('An earlier rollback had already put back the deployment it moved aside and did not live to end its transaction: {0}' -f
+            [string]$corroboration.Reason)
+        return $Plan
+    }
+
+    $state = [string](Get-WacJournalField -Record $journal -Name 'OriginalState')
     $movedAside = -not ([string]::Equals($state, 'Absent', [System.StringComparison]::Ordinal))
     if ($movedAside) {
-        $Plan.Reason = ('A deployment transaction record describes a swap whose recovery copy is no longer where it was put, and what stands at the deployment root is not the replacement that record names: {0}' -f $root)
+        # Something was moved aside; it is not in the slot and it is not at the root. There is
+        # nothing corroborated to go back to and nothing that says the run which replaced it
+        # finished, so both halves stay exactly as found and the missing one is named.
+        $Plan.Reason = ('A deployment transaction record describes a swap whose recovery copy is no longer where it was put, and nothing it records says the run that replaced it finished: {0} ({1})' -f
+            $root, [string]$corroboration.Reason)
         return $Plan
     }
 
@@ -239,6 +299,15 @@ function Resolve-WacPlanWithoutSlot {
     if ((-not $Plan.Live.Exists) -or ($Plan.Live.IsOurs -and $Plan.Live.IsEmpty)) {
         $Plan.Verdict = 'CommitReplacement'
         $Plan.Reason = 'An earlier first install moved nothing aside and never got its own tree in place, so there is nothing of it left to reconcile.'
+        return $Plan
+    }
+
+    # A first install that did get its tree in and never recorded finishing. Nothing was taken away
+    # and there is no original to go back to, so undoing it removes only what that run added - and
+    # only once the bytes at the root are proven to be exactly the tree its record says it staged.
+    if (Test-WacDeploymentIsRecordedReplacement -Root $root -Record $journal) {
+        $Plan.Verdict = 'RestoreOriginal'
+        $Plan.Reason = 'An earlier first install put its own tree in place and never recorded that it finished; it moved nothing aside, so the only thing to undo is what it added.'
         return $Plan
     }
 
@@ -256,6 +325,13 @@ function Resolve-WacPlanWithSlot {
         deliberately adopted as ours, and so is a managed tree three of whose files no longer match
         the manifest, so an interrupted or broken install could talk this into deleting the last
         good copy on the machine.
+
+        Neither is "healthy and not interrupted", which replaced it (ledger WAC-02R). That reads a
+        healthy live tree beside an original this build could neither promote nor corroborate as
+        proof that the run which installed it finished, and those are the two states it is least
+        entitled to conclude that from: an original nothing can vouch for is exactly when the copy
+        has to be kept. While the record is open the slot stays; what retires it is the commit the
+        generation WROTE.
 
         Promotion is never a bare Directory.Move either: what comes out of the slot becomes what
         SYSTEM executes, so it is proven ours, substantive and trusted first - and then corroborated
@@ -277,6 +353,12 @@ function Resolve-WacPlanWithSlot {
     # "interrupted" determination, so the branch below promoted whatever stood in the slot with no
     # content check at all.
     $interrupted = ($promotable.Promotable -and [bool]$corroboration.Corroborated)
+
+    # OPEN is a valid record that does not say it committed. A slot with NO record beside it is not
+    # open - it is a superseded copy an earlier commit failed to delete - so the commit gate covers
+    # the recorded case alone and reclaiming that debris still works.
+    $open = ([string]$Plan.Swap.State -ceq 'Valid') -and
+        (-not (Test-WacDeploymentGenerationCommitted -Record $journal))
 
     if ((-not $live.Exists) -or ($live.IsOurs -and $live.IsEmpty)) {
         # The slot holds the only installation left on the machine.
@@ -309,13 +391,24 @@ function Resolve-WacPlanWithSlot {
         return $Plan
     }
 
-    if ($interrupted -and (Test-WacDeploymentIsRecordedReplacement -Root $slots.Root -Record $journal)) {
-        $Plan.Verdict = 'RestoreOriginal'
-        $Plan.Reason = 'An earlier run was interrupted after the swap and before it committed, so its replacement is discarded and the deployment it replaced is put back.'
+    if ($open) {
+        if ($interrupted -and (Test-WacDeploymentIsRecordedReplacement -Root $slots.Root -Record $journal)) {
+            $Plan.Verdict = 'RestoreOriginal'
+            $Plan.Reason = 'An earlier run was interrupted after the swap and before it committed, so its replacement is discarded and the deployment it replaced is put back.'
+            return $Plan
+        }
+
+        # Nothing corroborated to roll back TO, and nothing saying the run that filled the slot ever
+        # finished. A copy this build cannot vouch for is the reason to keep it, never a licence to
+        # delete it, so both halves are preserved and the one that is missing is named.
+        $blocker = [string]$corroboration.Reason
+        if (-not $promotable.Promotable) { $blocker = [string]$promotable.Reason }
+        $Plan.Reason = ('A recovery slot from an earlier run is still present and its durable record does not say the run that filled it ever finished, so neither was touched: {0} ({1})' -f
+            $slots.Previous, $blocker)
         return $Plan
     }
 
-    if ($live.IsHealthy -and -not $interrupted) {
+    if ($live.IsHealthy) {
         $Plan.Verdict = 'CommitReplacement'
         $Plan.Reason = 'The recovery slot holds a superseded copy while a verified deployment of ours is live, so it is discarded.'
         return $Plan
@@ -345,6 +438,10 @@ function Resolve-WacDeploymentRecoverySlot {
         The task half has already run by the time this is reached (the installer reconciles
         registrations before it stages), so a restore here puts the tree back under a registration
         that is already pointing at it rather than the other way round.
+
+        Every branch is idempotent over its own outcome, because each one of them ends with a
+        record deletion that can fail or be interrupted: running this twice over the disk one run
+        left behind reaches the same verdict and changes nothing the second time.
     .OUTPUTS
         Action (None, Restored or Discarded), Reason and Plan.
     #>
@@ -361,22 +458,53 @@ function Resolve-WacDeploymentRecoverySlot {
     }
 
     if ([string]$plan.Verdict -ceq 'RestoreOriginal') {
-        if ($plan.Live.Exists) {
-            # Proven promotable BEFORE the delete, never after it: removing what is at the root
-            # first and only then finding nothing may take its place is how a recovery leaves a
-            # machine bare. The plan has already proven the slot promotable and corroborated.
-            $emptied = Remove-WacDeployment -Path $Slots.Root
-            if (-not $emptied.Removed) {
-                throw ("What stands at the deployment root could not be cleared, so the recovery slot was left where it is: {0} ({1})" -f
-                    $Slots.Root, [string]$emptied.Reason)
+        # NO SLOT TO PROMOTE is not a contradiction here, it is the crash window of this very
+        # function (ledger WAC-02R). The move below lands before the record deletion two blocks
+        # down, so a process killed between them leaves the original at the root, no slot, and a
+        # record still naming the replacement - a state that IS the intended outcome and that used
+        # to refuse for ever, because the root was not the replacement the record named. Which of
+        # the two shapes it is comes off the record, never off the missing slot: an original the
+        # plan corroborated at the root is a restore already carried out, and a first install that
+        # moved nothing aside leaves only the tree it added.
+        if ([string]$plan.SlotState -cne 'Directory') {
+            $result.Action = 'Restored'
+
+            if (-not (Test-WacPlanCorroborated -Plan $plan)) {
+                # Proven again immediately before the delete, never on the plan's word alone: this
+                # is the one branch that removes what is standing at the deployment root, and the
+                # manifest hash is what tells that run's own tree from anything else at that path.
+                if (-not (Test-WacDeploymentIsRecordedReplacement -Root $Slots.Root -Record $plan.Swap.Record)) {
+                    throw ("What stands at the deployment root is neither the deployment an earlier run moved aside nor the replacement it recorded, so nothing was removed: {0}" -f $Slots.Root)
+                }
+
+                $removed = Remove-WacDeployment -Path $Slots.Root
+                if (-not $removed.Removed) {
+                    throw ("An interrupted first install could not be removed, so its transaction was left open: {0} ({1})" -f
+                        $Slots.Root, [string]$removed.Reason)
+                }
+                Write-WacLog -Level WARNING -Component 'Deploy' -Message 'An interrupted first install had recorded no commit and moved nothing aside, so only the tree it added was removed.' -Data @{
+                    root = $Slots.Root; reason = [string]$plan.Reason
+                }
             }
         }
+        else {
+            if ($plan.Live.Exists) {
+                # Proven promotable BEFORE the delete, never after it: removing what is at the root
+                # first and only then finding nothing may take its place is how a recovery leaves a
+                # machine bare. The plan has already proven the slot promotable and corroborated.
+                $emptied = Remove-WacDeployment -Path $Slots.Root
+                if (-not $emptied.Removed) {
+                    throw ("What stands at the deployment root could not be cleared, so the recovery slot was left where it is: {0} ({1})" -f
+                        $Slots.Root, [string]$emptied.Reason)
+                }
+            }
 
-        Move-WacDeploymentSlot -From $Slots.Previous -To $Slots.Root
-        $result.Action = 'Restored'
-        Write-WacLog -Level WARNING -Component 'Deploy' -Message 'An interrupted run left a deployment in the recovery slot; it was restored before staging.' -Data @{
-            previous = $Slots.Previous; root = $Slots.Root; reason = [string]$plan.Reason
-            corroborated = [bool](Test-WacPlanCorroborated -Plan $plan)
+            Move-WacDeploymentSlot -From $Slots.Previous -To $Slots.Root
+            $result.Action = 'Restored'
+            Write-WacLog -Level WARNING -Component 'Deploy' -Message 'An interrupted run left a deployment in the recovery slot; it was restored before staging.' -Data @{
+                previous = $Slots.Previous; root = $Slots.Root; reason = [string]$plan.Reason
+                corroborated = [bool](Test-WacPlanCorroborated -Plan $plan)
+            }
         }
     }
     else {

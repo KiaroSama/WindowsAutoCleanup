@@ -44,6 +44,7 @@ $script:CoreModulePath      = $PSCommandPath
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Process.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Environment.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Trust.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentFence.ps1')
 
 Export-ModuleMember -Function @(
     'Initialize-WacNative',
@@ -84,6 +85,7 @@ Export-ModuleMember -Function @(
     'Invoke-WacProcess', 'Set-WacProcessInvoker', 'Get-WacProcessInvoker', 'Invoke-WacBounded',
     'Enter-WacSingleInstance', 'Exit-WacSingleInstance',
     'Test-WacIsAdministrator', 'Test-WacIsWindowsServer', 'Test-WacSystemDriveSupported',
+    'Test-WacDeploymentGenerationSettled',
     'Get-WacCanonicalPowerShellHost', 'Get-WacPathPresence', 'Get-WacUserProfilePath', 'Test-WacIsRealUserProfilePath', 'Get-WacFreeBytes', 'Format-WacBytes',
     'Test-WacPathIsMachineTrusted', 'Test-WacSidIsAdministrator', 'Test-WacStatePathIsTrusted'
 )

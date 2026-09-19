@@ -41,6 +41,7 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanu
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentProof.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentJournal.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentRecovery.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DeploymentCommit.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ScheduledTask.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TaskMatch.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TaskRemoval.ps1')
@@ -120,6 +121,7 @@ function Save-WacDeploymentJournal {
         OriginalFingerprint = [string]$Transaction.OriginalFingerprint
         OriginalFileCount = [int]$Transaction.OriginalFileCount
         ReplacementManifestHash = [string]$Transaction.ReplacementManifestHash
+        Committed = [bool]$Transaction.Committed
     }))
 }
 
@@ -157,12 +159,16 @@ function New-WacDeploymentStage {
     if (-not (Test-Path -LiteralPath $sourceRun -PathType Leaf)) { throw ("Run.ps1 was not found in {0}." -f $source) }
     if (-not (Test-Path -LiteralPath $sourceSrc -PathType Container)) { throw ("The src directory was not found in {0}." -f $source) }
 
-    # The recovery slot is reconciled BEFORE anything is cleared or copied: it can hold the only
-    # installation this machine has left, and preparing another attempt must never be what destroys
-    # it. The staging slot carries no such risk - it only ever holds a build in progress - so it is
+    # The recovery slot is NOT reconciled here any more (ledger WAC-02R). It used to be, which put
+    # the file half of a recovery behind every prerequisite of the NEW installation: the checks
+    # above reject a source that is missing, malformed or overlapping, and the caller's own host and
+    # budget checks sit in front of this function entirely. A run that had already restored the task
+    # half and then failed one of those returned with task A standing over files B - an unfinished
+    # pair, exposed, with no further attempt scheduled to close it. Both halves now run back to back
+    # in the caller, before anything about the new install is asked.
+    #
+    # The staging slot carries no such risk - it only ever holds a build in progress - so it is
     # still cleared unconditionally.
-    [void](Resolve-WacDeploymentRecoverySlot -Slots $slots)
-
     $cleared = Remove-WacDeployment -Path $slots.Staging
     if (-not $cleared.Removed) {
         throw ("A leftover deployment slot could not be cleared: {0} ({1})" -f $slots.Staging, $cleared.Reason)
@@ -256,8 +262,23 @@ function Switch-WacDeploymentStage {
         OriginalMovedAside = $false
         ReplacementLive = $false
         ReplacementManifestHash = $null
+        Committed = $false
         OriginalRestored = $false
         RestoreVerdict = $null
+    }
+
+    # THE REPLACEMENT'S IDENTITY, TAKEN BEFORE ANYTHING IRREVERSIBLE (ledger WAC-02R). The manifest
+    # is hashed at the STAGING path, whose bytes are the ones that will stand at the root: a
+    # Directory.Move moves the file, it does not rewrite it. Taking it here rather than after the
+    # swap is the whole point - the record that says which tree this generation put live is durable
+    # BEFORE the move that puts it there, so a process killed in that window leaves evidence of
+    # what it was doing instead of a tree nobody can attribute.
+    #
+    # Refusing here is free: nothing has moved, so the cost is the staged copy.
+    $transaction.ReplacementManifestHash = [string](Get-WacDeploymentFileHash `
+            -Path (Get-WacDeploymentManifestPath -DeploymentRoot $slots.Staging))
+    if ([string]::IsNullOrWhiteSpace($transaction.ReplacementManifestHash)) {
+        throw ("The staged deployment's manifest could not be hashed, so the swap could not record what it was about to put live: {0}" -f $slots.Staging)
     }
 
     if ($transaction.HadOriginal) {
@@ -303,17 +324,12 @@ function Switch-WacDeploymentStage {
         Move-WacDeploymentSlot -From $slots.Staging -To $slots.Root
         $transaction.ReplacementLive = $true
 
-        # What proves a tree at the deployment root is the one THIS transaction put there. Its name,
-        # its layout and its project id do not: the original carries all three. The manifest hashes
-        # every staged file and the moment it was written, so it identifies one particular build.
-        $transaction.ReplacementManifestHash = Get-WacDeploymentFileHash -Path (Get-WacDeploymentManifestPath -DeploymentRoot $slots.Root)
-
-        # The ONE write that carries the replacement's identity, so its failure is reported rather
-        # than discarded: without it a later process cannot tell this tree from the one it replaced,
-        # and refuses to reconcile either. Not fatal - the swap has happened and the caller is inside
-        # its rollback try, so throwing here would undo a good swap over a failed log line.
+        # A stage update, no longer the write that carries the identity - that one landed before the
+        # move. So its failure costs the reader a detail rather than the ability to attribute the
+        # tree, and it stays non-fatal: the caller is inside its rollback try, and throwing here
+        # would undo a good swap over a failed log line.
         if (-not (Save-WacDeploymentJournal -Transaction $transaction -Stage 'ReplacementLive')) {
-            Write-WacLog -Level CRITICAL -Component 'Deploy' -Message 'The deployment transaction record could not be updated with the identity of the tree that went live; a later run will refuse to reconcile this deployment until the record beside it is deleted by hand.' -Data @{
+            Write-WacLog -Level WARNING -Component 'Deploy' -Message 'The deployment transaction record could not be updated to say the replacement is live; the identity it recorded before the move still stands.' -Data @{
                 path = [string](Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root)
             }
         }
@@ -616,6 +632,11 @@ function Install-WacDeployment {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$SourceRoot)
 
+    # The file half of any outstanding recovery, first - the same order the installer performs it in
+    # since ledger WAC-02R, and the reason this one call still equals the two phases the installer
+    # runs separately. It used to be New-WacDeploymentStage's own first act.
+    [void](Resolve-WacDeploymentRecoverySlot -Slots (Get-WacDeploymentSlotPath))
+
     [void](New-WacDeploymentStage -SourceRoot $SourceRoot)
     $switched = Switch-WacDeploymentStage
 
@@ -636,7 +657,8 @@ Export-ModuleMember -Function @(
     'Write-WacTaskCaptureRecord', 'Read-WacTaskCaptureRecord', 'Remove-WacTaskCaptureRecord',
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
-    'New-WacDeploymentStage', 'Switch-WacDeploymentStage',
+    'New-WacDeploymentStage', 'Switch-WacDeploymentStage', 'Resolve-WacDeploymentRecoverySlot',
+    'Set-WacDeploymentCommitted',
     'Restore-WacDeploymentPrevious', 'Remove-WacDeploymentPrevious',
     'Test-WacDeploymentTrusted',
     'Get-WacTaskScriptPath', 'Get-WacLegacyTaskScriptPath', 'Test-WacTaskExecuteIsCanonicalHost',
