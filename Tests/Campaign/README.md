@@ -28,6 +28,15 @@ Because neither channel can run code in the guest, a campaign requires a guest t
 
 ## Arming a guest (once, inside the VM, elevated)
 
+**This step cannot be done from the host, and that is not a gap in the tooling.** Every credential-free
+route from outside the guest is a technique in its own right: reaching into the offline disk to write
+a startup entry in the registry is how credentials are extracted offline, and writing a boot-time
+script into the guest's local Group Policy is persistence. Both were tried from the host here and both
+were refused by the platform, correctly. The one remaining route, PowerShell Direct, requires guest
+credentials by design. So arming is a deliberate act performed by the person who owns the machine —
+which is exactly the property that makes a campaign opt-in.
+
+
 1. Copy this `Tests/Campaign` folder into the guest.
 2. Run, elevated, in the guest:
 
