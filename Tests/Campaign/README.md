@@ -114,14 +114,15 @@ The resume point is written to disk **before** the cut is requested. After the p
 | --- | --- | --- |
 | `service-dispatched-maintenance` | **passed** (twice) | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 and 204 entries / 13.4 and 14.8 MB actually removed, read from the run's own `.summary.json` |
 | `reboot-recovery` | **passed** (twice) | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
-| `power-loss-during-install` | blocked | the agent does not start after the cut - see below |
-| `power-loss-during-uninstall` | blocked | the same |
+| `power-loss-during-install` | no verdict | see below: on a GP-armed guest nothing starts after the cut; the task-armed retry was confounded by the host |
+| `power-loss-during-uninstall` | no verdict | the same |
 
-### Why the two power-cut scenarios are blocked, and what it is not
+### Why the two power-cut scenarios have no verdict, and what that is not
 
 The agent publishes `AgentBoot` as its first act, before anything else can throw. On every clean
-boot it appears within seconds. **After a hard power cut it never appears at all**, on a guest that
-is Running with its memory assigned. Nothing starts, so nothing reports.
+boot it appears within seconds. **On a GP-armed guest it never appears at all after a hard power
+cut**, on a guest that is Running, with memory assigned and its heartbeat back. Nothing starts, so
+nothing reports.
 
 That pattern fits the results exactly: both passing scenarios boot cleanly - `reboot-recovery` uses
 `Restart-Computer`, which is a clean, flushing restart - and only the cut scenarios are silent.
@@ -129,14 +130,23 @@ That pattern fits the results exactly: both passing scenarios boot cleanly - `re
 **The suspect is how the guest was armed, not the product and not the campaign.** A guest armed from
 the HOST can only be armed with a local Group Policy machine startup script, whose registration the
 Group Policy service keeps in the registry; a dirty shutdown can roll that back, leaving nothing for
-`gpscript.exe /startup` to run. The scheduled task that `Register-WacCampaignAgent.ps1` registers -
-the procedure above, run by the machine's owner from inside - goes through Task Scheduler's own
-transactional store, which is the mechanism designed to survive exactly this.
+`gpscript.exe /startup` to run. The scheduled task the agent now registers for itself goes through
+Task Scheduler's own transactional store, which is the mechanism designed to survive exactly this.
 
-**This is not yet proven**: nobody has run a cut against a task-armed guest. That is the next test,
-and it needs one command run inside the VM. Until then the two scenarios prove nothing about the
-product either way, and the campaign reports them rather than issuing a verdict.
+**The task-armed retry did not settle it.** A cut was taken against a guest carrying the scheduled
+task, and it was silent too - but that run says nothing either way, because the guest never got its
+heartbeat back and sat pinned at its dynamic-memory floor for the whole watch. The host had nothing
+left to give it. Read the two silences apart before concluding anything:
+
+| what the host sees after the cut | what it means |
+| --- | --- |
+| heartbeat never returns, `MemoryAssigned` stuck at the floor | the HOST starved the guest. No evidence about the product, the campaign or the arming. |
+| heartbeat OK, memory assigned, no `AgentBoot` | nothing started inside the guest. That is a real finding about the arming. |
+
+**What the next attempt needs is a host, not a code change**: nothing else of size running, and an
+allocation the host can hold for the entire run. Until then the two scenarios prove nothing about
+the product either way, and the campaign reports them rather than issuing a verdict.
 
 Two earlier readings of these failures were wrong and are retracted here: they were not a guest that
-could not come back (it returns in **12 seconds**, measured), and not memory starvation (a 2 GB
-dynamic floor stopped the squeezing and the silence continued).
+could not come back (it returns in **12 seconds**, measured), and the GP-armed silence was not
+starvation - there the heartbeat was healthy and only the agent was missing.
