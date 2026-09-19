@@ -110,6 +110,8 @@ $env:WAC_VM_DEPLOYMENT_LIFECYCLE = '1'; pwsh.exe -NoProfile -ExecutionPolicy Byp
 
 Arm it only in a disposable guest with a checkpoint taken first: it installs to the real deployment root and registers a real SYSTEM task. ResetBase stays disabled and the lane asserts that from the registered action.
 
+CI runs this lane armed, in its own `deployment-lifecycle` job on both Windows images. A GitHub-hosted runner is the disposable guest the lane asks for - an ephemeral VM, elevated, destroyed when the job ends - and the job refuses outright on a self-hosted runner, which is somebody's machine. Because the lane owns exclusive machine state (one deployment root, one registration, one machine-wide lock) it runs single-worker: the two PowerShell hosts go one after the other, not together. The job also fails when the lane reports *refused*, since a refusal is a pass that has validated nothing.
+
 ### Before you open a pull request
 
 CI enforces four gates. All four are runnable locally, and running them first is faster than
