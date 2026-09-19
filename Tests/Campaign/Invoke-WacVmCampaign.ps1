@@ -75,6 +75,10 @@ function New-CampaignPayload {
         [bool]$Destructive
     )
 
+    # Its own directory, because each scenario now stages into a subdirectory of its own and
+    # `git archive --output` fails on a path whose parent does not exist.
+    [void](New-Item -ItemType Directory -Path $StageRoot -Force)
+
     $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     Push-Location -LiteralPath $repoRoot
     try {
@@ -137,18 +141,18 @@ function Invoke-CampaignPowerCut {
     return $true
 }
 
-function Invoke-CampaignRun {
+function Invoke-CampaignOneScenario {
     <#
     .SYNOPSIS
-        The whole campaign, from checkpoint to verified-off, returning its report.
+        One scenario, start to verdict, on a guest that is already at the base state.
     #>
     param(
         [Parameter(Mandatory = $true)]$Vm,
         [Parameter(Mandatory = $true)]$Payload,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+        [Parameter(Mandatory = $true)][datetime]$Deadline
     )
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $deadline = $Deadline
 
     Write-CampaignLine '  starting the guest'
     Start-VM -VM $Vm -ErrorAction Stop
@@ -205,6 +209,101 @@ function Invoke-CampaignRun {
     }
 }
 
+function Invoke-CampaignRun {
+    <#
+    .SYNOPSIS
+        Every requested scenario, each on a guest returned to the same base state first.
+    .DESCRIPTION
+        ISOLATION IS THE POINT. Running them in one sequence on an accumulating machine is how the
+        first real campaign lost `reboot-recovery`: the scenario before it left an uninstall intent
+        standing, so the installer refused and the scenario was over before it began - a result that
+        says nothing about reboots. A scenario that starts anywhere other than the base state is
+        measuring the scenario before it.
+
+        The cost is a boot per scenario, which is the cheapest part of a campaign.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$Vm,
+        [Parameter(Mandatory = $true)][string[]]$ScenarioList,
+        [Parameter(Mandatory = $true)][string]$CampaignId,
+        [Parameter(Mandatory = $true)][string]$StageRoot,
+        [Parameter(Mandatory = $true)][string]$BaseCheckpoint,
+        [bool]$Destructive,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    $notRun = New-Object 'System.Collections.Generic.List[string]'
+    $commit = ''
+    $index = 0
+
+    foreach ($scenario in @($ScenarioList)) {
+        $index++
+        Write-CampaignLine ''
+        Write-CampaignLine ('[{0}/{1}] {2}' -f $index, @($ScenarioList).Count, $scenario)
+
+        if ((Get-Date) -ge $deadline) {
+            [void]$notRun.Add($scenario)
+            continue
+        }
+
+        if ($index -gt 1) {
+            $stopped = Stop-WacCampaignVm -Vm $Vm
+            if (-not $stopped.Off) { throw ('the guest could not be stopped between scenarios; it is {0}.' -f $stopped.State) }
+            $base = @(Get-VMSnapshot -VMName $Vm.Name -Name $BaseCheckpoint -ErrorAction SilentlyContinue)
+            if ($base.Count -ne 1) { throw ('the base checkpoint {0} is gone, so the next scenario has no known state to start from.' -f $BaseCheckpoint) }
+            Restore-VMSnapshot -VMSnapshot $base[0] -Confirm:$false -ErrorAction Stop
+            Write-CampaignLine ('  guest returned to {0}' -f $BaseCheckpoint)
+        }
+
+        $payload = New-CampaignPayload -StageRoot (Join-Path $StageRoot ('s{0}' -f $index)) `
+            -Scenario @($scenario) -CampaignId $CampaignId -Destructive $Destructive
+        $commit = $payload.Commit
+
+        $one = Invoke-CampaignOneScenario -Vm $Vm -Payload $payload -Deadline $deadline
+        if ($null -eq $one.Report) {
+            [void]$results.Add([PSCustomObject]@{ Scenario = $scenario; Verdict = 'failed'
+                    Detail = ('the guest returned no whole report: ' + [string]$one.Reason) })
+            continue
+        }
+
+        $parsed = $null
+        try { $parsed = $one.Report | ConvertFrom-Json } catch { $parsed = $null }
+        if ($null -eq $parsed) {
+            [void]$results.Add([PSCustomObject]@{ Scenario = $scenario; Verdict = 'failed'
+                    Detail = 'the guest returned a report that did not parse' })
+            continue
+        }
+
+        foreach ($entry in @($parsed.results)) { [void]$results.Add($entry) }
+        foreach ($missed in @($parsed.notRun)) { if ($missed) { [void]$notRun.Add([string]$missed) } }
+    }
+
+    $status = 'complete'
+    if ($notRun.Count -gt 0) { $status = 'failed' }
+    foreach ($entry in @($results.ToArray())) {
+        if ([string]$entry.Verdict -cne 'passed') { $status = 'failed' }
+    }
+
+    $report = [PSCustomObject]@{
+        schema = 1
+        campaignId = $CampaignId
+        commit = $commit
+        finishedUtc = ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture))
+        requested = @($ScenarioList)
+        # Kept separate so a reader never subtracts one list from another to find what did not
+        # happen. A scenario missing from `results` is not a scenario that passed.
+        notRun = @($notRun.ToArray())
+        isolated = $true
+        results = @($results.ToArray())
+        status = $status
+    }
+
+    return [PSCustomObject]@{ Status = $status; Reason = ''; Item = @{}
+        Report = (ConvertTo-Json -InputObject $report -Depth 8) }
+}
+
 # ---------------------------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------------------------
@@ -235,9 +334,13 @@ try {
     Write-CampaignLine ''
 
     [void](New-Item -ItemType Directory -Path $stageRoot -Force)
-    $payload = New-CampaignPayload -StageRoot $stageRoot -Scenario $Scenario -CampaignId $campaignId -Destructive $arming.Destructive
-    if ($payload.UncommittedFiles -gt 0) {
-        Write-CampaignLine ('  note: {0} uncommitted file(s) in the working tree are NOT in this payload' -f $payload.UncommittedFiles)
+
+    # Staged once here only to report what the payload will and will not contain; each scenario gets
+    # its own package, because each is delivered to a guest that was just put back to the base state.
+    $preview = New-CampaignPayload -StageRoot (Join-Path $stageRoot 'preview') -Scenario $Scenario `
+        -CampaignId $campaignId -Destructive $arming.Destructive
+    if ($preview.UncommittedFiles -gt 0) {
+        Write-CampaignLine ('  note: {0} uncommitted file(s) in the working tree are NOT in this payload' -f $preview.UncommittedFiles)
     }
 
     if ($vm.State -cne 'Off') {
@@ -250,7 +353,9 @@ try {
     $checkpointTaken = $true
     Write-CampaignLine ('  checkpoint taken: {0}' -f $checkpointName)
 
-    $outcome = Invoke-CampaignRun -Vm $vm -Payload $payload -TimeoutSeconds ($TimeoutMinutes * 60)
+    $outcome = Invoke-CampaignRun -Vm $vm -ScenarioList @($Scenario) -CampaignId $campaignId `
+        -StageRoot $stageRoot -BaseCheckpoint $checkpointName -Destructive $arming.Destructive `
+        -TimeoutSeconds ($TimeoutMinutes * 60)
 }
 catch {
     $outcome = [PSCustomObject]@{ Status = 'blocked'; Reason = $_.Exception.Message; Item = @{}; Report = $null }
