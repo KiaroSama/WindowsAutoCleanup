@@ -39,6 +39,24 @@ function Get-WacCampaignSummary {
     catch { return $null }
 }
 
+function Get-WacCampaignTail {
+    <#
+    .SYNOPSIS
+        The last useful part of a captured stream, flattened to one line and bounded.
+    .DESCRIPTION
+        Bounded because it travels to the host through a key-value exchange that chunks by length,
+        and the TAIL rather than the head because a refusal is the last thing an entry point says
+        before it exits.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Text, [int]$Max = 600)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '(it printed nothing)' }
+
+    $flat = ($Text -replace '[\r\n\t ]+', ' ').Trim()
+    if ($flat.Length -le $Max) { return $flat }
+    return ('...' + $flat.Substring($flat.Length - $Max))
+}
+
 function Wait-WacCampaignFile {
     <#
     .SYNOPSIS
@@ -142,7 +160,7 @@ function Invoke-WacCampaignMaintenance {
     param([Parameter(Mandatory = $true)][string]$ProjectRoot)
 
     $install = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') `
-        -ArgumentList @('-Force')
+        -ArgumentList @('-NoPause')
     if ($install.ExitCode -ne 0) {
         return [PSCustomObject]@{ Scenario = 'service-dispatched-maintenance'; Verdict = 'failed'
             Detail = ('the installer exited {0}; nothing downstream of it was tested. {1}' -f $install.ExitCode, $install.Output) }
@@ -150,8 +168,12 @@ function Invoke-WacCampaignMaintenance {
 
     $task = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
     if ($task.Count -ne 1) {
+        # An exit code of 0 with nothing registered is a REFUSAL, and the refusal is in the output.
+        # Reporting only the count leaves the one sentence that explains it on the floor - which is
+        # exactly what the first real campaign run did.
         return [PSCustomObject]@{ Scenario = 'service-dispatched-maintenance'; Verdict = 'failed'
-            Detail = ('the installer reported success but {0} task(s) are registered.' -f $task.Count) }
+            Detail = ('the installer exited 0 but {0} task(s) are registered. It said: {1}' -f
+                $task.Count, (Get-WacCampaignTail -Text $install.Output)) }
     }
 
     $before = Get-WacCampaignSummary
@@ -189,7 +211,7 @@ function Invoke-WacCampaignMaintenance {
     }
 
     $uninstall = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Uninstall-WindowsAutoCleanupTask.ps1') `
-        -ArgumentList @('-Force')
+        -ArgumentList @('-NoPause')
 
     $verdict = if ([int]$info.LastTaskResult -eq 0 -and [string]$after.outcome -ceq 'Succeeded') { 'passed' } else { 'failed' }
     return [PSCustomObject]@{
@@ -224,8 +246,19 @@ function Start-WacCampaignInterruption {
     $started = Invoke-WacCampaignHost -ScriptPath $ScriptPath -ArgumentList $ArgumentList -PassThruProcess
     if (-not (Wait-WacCampaignFile -Path $RecordPath -TimeoutSeconds 240)) {
         $killed = Stop-WacCampaignTree -Process $started.Process
+
+        # WHICH record was missing, and what the operation said while not writing it. The first real
+        # run reported only that no record appeared, which named neither the paths being watched nor
+        # the refusal that explained them.
+        $said = ''
+        foreach ($capture in @($started.OutFile, $started.ErrFile)) {
+            try { $said += [System.IO.File]::ReadAllText($capture) } catch { $said += '' }
+        }
+
         return [PSCustomObject]@{ Scenario = $Scenario; Verdict = 'failed'
-            Detail = ('the operation never wrote the record that marks the transaction, so there was no defined instant to interrupt. ' + $killed) }
+            Detail = ('the operation wrote none of [{0}], so there was no defined instant to interrupt. It said: {1} ({2})' -f
+                ((@($RecordPath) | ForEach-Object { Split-Path -Leaf $_ }) -join ', '),
+                (Get-WacCampaignTail -Text $said), $killed) }
     }
 
     $State.phase = 'awaiting-power-cut'
@@ -259,11 +292,11 @@ function Invoke-WacCampaignRecoveryCheck {
     if ($scenario -ceq 'power-loss-during-uninstall') {
         # FIRST, before anything resolves the interrupted removal: an installer must refuse while
         # the intent stands, and FR-015 requires it to name the file that is blocking it.
-        $premature = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') -ArgumentList @('-Force')
+        $premature = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
         $refused = $premature.ExitCode -ne 0
         $named = $premature.Output -match '(?i)\.json|record|intent'
 
-        $finish = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Uninstall-WindowsAutoCleanupTask.ps1') -ArgumentList @('-Force')
+        $finish = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Uninstall-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
         $tasks = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
 
         $verdict = if ($refused -and $named -and $finish.ExitCode -eq 0 -and $tasks.Count -eq 0) { 'passed' } else { 'failed' }
@@ -272,7 +305,7 @@ function Invoke-WacCampaignRecoveryCheck {
                 $refused, $named, $finish.ExitCode, $tasks.Count) }
     }
 
-    $recovery = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') -ArgumentList @('-Force')
+    $recovery = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
     $tasks = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
     $deploymentRoot = Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup'
     $runPresent = Test-Path -LiteralPath (Join-Path $deploymentRoot 'Run.ps1') -PathType Leaf
@@ -325,29 +358,29 @@ function Invoke-WacCampaignScenario {
         'service-dispatched-maintenance' { return (Invoke-WacCampaignMaintenance -ProjectRoot $projectRoot) }
 
         'power-loss-during-install' {
-            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-Force') `
+            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-NoPause') `
                 -RecordPath @($swapRecord, $captureRecord) `
                 -State $State -StatePath $StatePath -Save $Save)
         }
 
         'power-loss-during-uninstall' {
-            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-Force')
+            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-NoPause')
             if ($prepare.ExitCode -ne 0) {
                 return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'
                     Detail = ('nothing was installed to interrupt the removal of; installer exited {0}.' -f $prepare.ExitCode) }
             }
-            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $uninstaller -ArgumentList @('-Force') `
+            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $uninstaller -ArgumentList @('-NoPause') `
                 -RecordPath @($uninstallRecord) `
                 -State $State -StatePath $StatePath -Save $Save)
         }
 
         'reboot-recovery' {
-            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-Force')
+            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-NoPause')
             if ($prepare.ExitCode -ne 0) {
                 return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'
                     Detail = ('nothing was installed to restart across; installer exited {0}.' -f $prepare.ExitCode) }
             }
-            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-Force') `
+            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-NoPause') `
                 -RecordPath @($swapRecord, $captureRecord) `
                 -State $State -StatePath $StatePath -Save $Save -ResumeKind 'reboot')
         }

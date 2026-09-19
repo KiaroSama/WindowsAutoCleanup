@@ -262,8 +262,17 @@ finally {
         Write-CampaignLine ('Guest stopped: {0} (state {1})' -f $final.Off, $final.State)
 
         if ($checkpointTaken) {
-            $restore = Restore-WacCampaignCheckpoint -Vm $vm -Name $checkpointName -Keep:$KeepCheckpoint
+            # A campaign that did NOT complete is the one whose guest is worth keeping. Rolling it
+            # back here deletes the logs, the records and the half-finished state that explain the
+            # failure - which is exactly what the first real run did to itself, leaving a report
+            # that said what failed and nothing that said why. A clean campaign is rolled back.
+            $keep = [bool]$KeepCheckpoint -or ([string]$outcome.Status -cne 'complete')
+            $restore = Restore-WacCampaignCheckpoint -Vm $vm -Name $checkpointName -Keep:$keep
             Write-CampaignLine ('Checkpoint: {0}' -f $restore.Detail)
+            if ($keep -and -not $KeepCheckpoint) {
+                Write-CampaignLine ('The guest was LEFT as the campaign left it, so the failure can be diagnosed.')
+                Write-CampaignLine ('Roll it back with: Restore-VMSnapshot -VMName "{0}" -Name "{1}" -Confirm:$false' -f $vm.Name, $checkpointName)
+            }
 
             # Restoring a checkpoint of a stopped machine leaves it stopped, but the state is read
             # back rather than assumed: this is the last line of defence against leaving somebody's
