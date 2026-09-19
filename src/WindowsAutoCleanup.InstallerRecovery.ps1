@@ -483,7 +483,14 @@ function Resolve-InterruptedTaskCapture {
     }
     elseif ([string]$Plan.Verdict -ceq 'CommitReplacement' -and [string]$Plan.Capture.State -ceq 'Valid') {
         # Legacy commit records do not identify the replacement task. A name alone is not proof.
-        return [PSCustomObject]@{ Ok = $false; Restored = 0; Accounted = 0; Recorded = @($Plan.Capture.Capture).Count; RecordEnded = $false; Reason = 'This legacy commit has no replacement task proof; retain both records for explicit recovery.' }
+        # NAME THE FILES THAT FENCE THE MACHINE. This shape is reachable on an upgrade: a machine
+        # whose previous build committed but could not retire its records arrives here, and the
+        # refusal is permanent until a person acts. An operator who is only told that "both records"
+        # are retained has to find out which two files those are before they can act at all.
+        return [PSCustomObject]@{ Ok = $false; Restored = 0; Accounted = 0; Recorded = @($Plan.Capture.Capture).Count; RecordEnded = $false
+            Reason = ('This commit was recorded by an older build that did not identify the replacement task, so neither record can be retired on evidence. Recover explicitly: inspect {0} and {1}, confirm which registration the deployment at the root belongs to, and remove both records once you have.' -f
+                [string](Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind 'Swap'),
+                [string](Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind 'TaskCapture')) }
     }
     else { $result = Resolve-WacInterruptedTaskCaptureCore -DeploymentRoot $DeploymentRoot -Lookup $Lookup -Plan $Plan }
 
