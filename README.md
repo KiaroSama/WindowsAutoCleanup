@@ -389,6 +389,7 @@ Each step carries one of three states, and the distinction is the point of the f
 | `executed` | The step ran. Whatever it concluded is in `outcome`. |
 | `refused` | The step did not start because the run refused it — a security refusal, or an unresolved mutation this run inherited. |
 | `unarmed` | The step did not start because it was not switched on. |
+| `unstated` | The step stated neither fact. Nobody can classify it, and it is recorded as such rather than folded into one of the other three. |
 
 A reader that sees only "0 files removed" cannot tell a quiet night from a refusal; these three can. `schema` changes only when a field changes meaning, never when one is added, so a reader that ignores unknown fields keeps working.
 

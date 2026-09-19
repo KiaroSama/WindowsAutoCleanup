@@ -51,10 +51,21 @@ function Get-WacStepExecutionState {
     #>
     param([Parameter(Mandatory = $true)]$Result)
 
-    if ([bool]$Result.Attempted) { return 'executed' }
-    if ([string]$Result.Outcome -ceq 'SecurityRefusal') { return 'refused' }
-    if ([string]$Result.Outcome -ceq 'Incomplete') { return 'refused' }
-    return 'unarmed'
+    # Read by NAME, not by access. Under StrictMode a property that is not there throws, and a step
+    # result that states nothing is exactly the shape this file has to survive - the run's verdict
+    # may never depend on whether its own report could be assembled.
+    $stated = @($Result.PSObject.Properties.Name)
+
+    if ($stated -ccontains 'Attempted' -and [bool]$Result.Attempted) { return 'executed' }
+    if ($stated -ccontains 'Outcome') {
+        if ([string]$Result.Outcome -ceq 'SecurityRefusal') { return 'refused' }
+        if ([string]$Result.Outcome -ceq 'Incomplete') { return 'refused' }
+        return 'unarmed'
+    }
+
+    # Neither fact is stated. That is not a step that ran quietly; it is a step nobody can classify,
+    # and it is recorded as such rather than folded into one of the three.
+    return 'unstated'
 }
 
 function Write-WacRunSummary {
@@ -76,6 +87,39 @@ function Write-WacRunSummary {
 
     $path = Get-WacRunSummaryPath
     if ([string]::IsNullOrWhiteSpace([string]$path)) { return $false }
+
+    try {
+        return (Write-WacRunSummaryDocument -Path $path -Outcome $Outcome -ExitCode $ExitCode `
+                -StepResult $StepResult -TargetResult $TargetResult -FreeBytesBefore $FreeBytesBefore `
+                -FreeBytesAfter $FreeBytesAfter -RebootRequired $RebootRequired)
+    }
+    catch {
+        # EVERYTHING, not just the write. Assembling the document reads whatever the steps and
+        # targets happen to state, and a run whose exit code changed because its report could not be
+        # built would be the report breaking the thing it reports on.
+        Write-WacLog -Level WARNING -Component 'Summary' -Message 'The machine-readable run summary could not be produced; the audit log and the exit code are unaffected.' -Data @{
+            path = [string]$path; error = $_.Exception.Message
+        }
+        return $false
+    }
+}
+
+function Write-WacRunSummaryDocument {
+    <#
+    .SYNOPSIS
+        Builds and writes the document. Every failure in here is caught by the caller.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Outcome,
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [object[]]$StepResult = @(),
+        [object[]]$TargetResult = @(),
+        [Nullable[long]]$FreeBytesBefore,
+        [Nullable[long]]$FreeBytesAfter,
+        [bool]$RebootRequired
+    )
 
     $steps = New-Object 'System.Collections.Generic.List[object]'
     foreach ($step in @($StepResult)) {
@@ -133,17 +177,9 @@ function Write-WacRunSummary {
         }
     }
 
-    try {
-        # Written whole, with the same encoding the log uses. A torn summary is worse than none:
-        # it looks like an answer.
-        [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $document -Depth 6),
-            (New-Object System.Text.UTF8Encoding($false)))
-        return $true
-    }
-    catch {
-        Write-WacLog -Level WARNING -Component 'Summary' -Message 'The machine-readable run summary could not be written; the audit log is unaffected.' -Data @{
-            path = [string]$path; error = $_.Exception.Message
-        }
-        return $false
-    }
+    # Written whole, with the same encoding the log uses. A torn summary is worse than none: it
+    # looks like an answer. A failure here throws to the caller, which owns the one catch.
+    [System.IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $document -Depth 6),
+        (New-Object System.Text.UTF8Encoding($false)))
+    return $true
 }
