@@ -124,6 +124,25 @@ function Set-WacCampaignDurableArming {
     $taskName = 'CampaignAgent'
 
     try {
+        # WAIT FOR WMI FIRST. The agent starts very early in the boot, and both the task query here
+        # and the arming script's own hardware check go through it. The first attempt returned
+        # "Cannot connect to CIM server. A system shutdown is in progress." and then
+        # "task-registration-failed" - the same thing said twice: the service was not ready, and
+        # giving up on the first try turned a wait into a failure.
+        $cimReady = $false
+        $waitUntil = (Get-Date).AddSeconds(180)
+        while ((Get-Date) -lt $waitUntil) {
+            try {
+                if ($null -ne (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop)) { $cimReady = $true; break }
+            }
+            catch { Start-Sleep -Milliseconds 3000 }
+        }
+        if (-not $cimReady) {
+            Write-WacCampaignAgentLog -Text 'WMI never became available, so durable arming was not even attempted'
+            return 'cim-unavailable'
+        }
+        Write-WacCampaignAgentLog -Text 'WMI is available; checking the scheduled task'
+
         $existing = @(Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue)
         if ($existing.Count -eq 0) {
             $register = Join-Path -Path $PSScriptRoot -ChildPath 'Register-WacCampaignAgent.ps1'
@@ -138,10 +157,19 @@ function Set-WacCampaignDurableArming {
                     '-ExecutionPolicy', 'Bypass', '-File', $register)
             [void]$process.WaitForExit(120000)
             Write-WacCampaignAgentLog -Text ('the arming script exited ' + [string]$process.ExitCode)
-            [System.IO.File]::Delete($out)
+
+            # What it SAID, carried home. A failure that names only itself is the shape this project
+            # keeps closing.
+            $said = '(no output)'
+            try { $said = ([System.IO.File]::ReadAllText($out) -replace '\s+', ' ').Trim() } catch { $null = $_ }
+            if ($said.Length -gt 300) { $said = '...' + $said.Substring($said.Length - 300) }
+            Write-WacCampaignAgentLog -Text ('the arming script said: ' + $said)
+            try { [System.IO.File]::Delete($out) } catch { $null = $_ }
 
             $existing = @(Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue)
-            if ($existing.Count -eq 0) { return 'task-registration-failed' }
+            if ($existing.Count -eq 0) {
+                return ('task-registration-failed: exit {0}; {1}' -f [string]$process.ExitCode, $said)
+            }
             $result = 'task-registered'
         }
         else { $result = 'task-already-present' }
