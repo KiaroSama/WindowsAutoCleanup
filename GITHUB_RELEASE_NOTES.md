@@ -109,6 +109,17 @@ refused. Losing that race produces a wrong **refusal**, never a wrong deletion.
   manifest and was trusted - all of which a tree REWRITTEN since it was set aside still satisfies.
   It must now also hash to the inventory the durable record took of it. Where no record names one,
   the log says so explicitly rather than implying a check that did not happen.
+- **An uninstall is a transaction too, and an interrupted one is never resurrected.** Removing the
+  registration and the files is not the end of an uninstall: the records an earlier install left
+  behind still describe an installation, and a later installer reading them as "an interrupted
+  upgrade" re-created exactly what the operator had asked to be removed. The uninstaller now records
+  a durable intent before it removes anything; while that record stands, installation and ordinary
+  cleanup both refuse, and the uninstaller retires it LAST, after the records that depend on it.
+  Re-running the uninstaller resumes and completes the removal.
+- **A refusal caused by a leftover record now names the record.** Every state in which an unretired
+  record fences the machine - an uninstall that could not finish, a commit recorded by an older build
+  that cannot be retired on evidence - says which file is doing it and what clears it, instead of
+  leaving the operator to work out which artifact stopped them.
 - **An installation is one transaction, and a run will not clean from an unfinished one.** A
   deployment is a tree plus the registration that runs it, and only the generation that put them
   there establishes that they belong to each other. While that generation is in flight it keeps a
