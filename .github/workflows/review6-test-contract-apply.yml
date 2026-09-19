@@ -1,0 +1,93 @@
+name: Apply reviewed test contract
+
+on:
+  push:
+    branches: [audit/review6-recovery-regressions]
+    paths: [.github/workflows/review6-test-contract-apply.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.repository == 'KiaroSama/WindowsAutoCleanup' && github.actor == 'KiaroSama' && github.ref == 'refs/heads/audit/review6-recovery-regressions'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Update the exact legacy assertion without weakening its safety checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 5f04026ace619e32d619148fe29fbad39946232e
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          p = Path('Tests/DeploymentGenerationCommit.Tests.ps1')
+          s = p.read_text()
+          assert hashlib.sha256(s.encode()).hexdigest() == '106e04fdf60007f20b23a5e916a3949a0a947f8c0f8967f6b2a8bbc8c508bf86'
+          changes = [(
+          """        $acted = Invoke-RecoveryHalf -Slots $slots
+                  Assert-Equal 'Restored' ([string]$acted.Action) ([string]$acted.Reason)
+                  Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'the tree the record described was not the one put back'
+          """,
+          """        # Restoring bytes is not a clean transaction close. The caller must receive the retirement
+                  # failure while the original remains restored and the unfinished record remains on disk.
+                  Assert-Throws -ScriptBlock { Invoke-RecoveryHalf -Slots $slots } -Pattern 'rollback journal could not be retired'
+                  Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'the tree the record described was not the one put back'
+          """), (
+          """        # And no other generation may write over what is still unfinished.
+                  [void](New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C')
+                  Assert-Throws -ScriptBlock { Switch-WacDeploymentStage -KeepPrevious } -Pattern 'transaction could not be recorded'
+                  Reset-CommitFixture
+          """,
+          """        # Staging now refuses EARLIER, before a later generation can create a replacement at all.
+                  # Preserve the original safety assertion instead of expecting the old clean-return shape.
+                  Assert-Throws -ScriptBlock {
+                      New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C'
+                  } -Pattern 'rollback journal could not be retired'
+                  Assert-False (Test-Path -LiteralPath $slots.Staging) 'a later generation staged over an unfinished rollback'
+                  Reset-CommitFixture
+          """), (
+          """        [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::Normal)
+              }
+          }
+
+          # ---------------------------------------------------------------------------------------------
+          # The two halves of one generation, and the two halves of two
+          """,
+          """        [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::Normal)
+                  [System.IO.Directory]::Delete($record + '.new')
+                  $retry = Invoke-RecoveryHalf -Slots $slots
+                  Assert-Equal 'Restored' ([string]$retry.Action) ([string]$retry.Reason)
+                  Assert-False (Test-Path -LiteralPath $record) 'recovery still could not retire its record after the obstruction was removed'
+                  Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'a successful retirement retry changed the original'
+              }
+          }
+
+          # ---------------------------------------------------------------------------------------------
+          # The two halves of one generation, and the two halves of two
+          """
+          )]
+          for old, new in changes:
+              assert s.count(old) == 1, 'The legacy assertion differs from the reviewed source'
+              s = s.replace(old, new)
+          assert hashlib.sha256(s.encode()).hexdigest() == '9364e12b656a19766489c21b1779e36b7b147e38060864257dbbdcf23152db39'
+          p.write_text(s, newline='\n')
+          PY
+          git add -- Tests/DeploymentGenerationCommit.Tests.ps1
+          git diff --cached --check
+          git config user.name 'WindowsAutoCleanup review'
+          git config user.email '106400900+KiaroSama@users.noreply.github.com'
+          git commit -m 'test: require failed retirement to block staging and allow a clean retry'
+      - name: Publish only to the existing review branch
+        shell: bash
+        env:
+          REVIEW_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          header=$(printf 'x-access-token:%s' "$REVIEW_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $header" push origin HEAD:refs/heads/audit/review6-recovery-regressions
