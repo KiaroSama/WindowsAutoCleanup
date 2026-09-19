@@ -156,6 +156,8 @@ Test-Case 'a grandchild whose parent already exited is terminated when the tree 
             param($FilePath, $ArgumentList)
             Set-WacOwnedProcessLauncher -Launcher $null
             $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList
+            # Establish root exit before advancing the run deadline; the grandchild stays alive.
+            [void][WacOwnedProcess]::WaitForExit($launch.Process, 10000)
             Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddMilliseconds(-1))
             return $launch
         }

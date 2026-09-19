@@ -13,12 +13,10 @@
     (ledger WAC-06R). PowerShell.Stop() cannot interrupt one and Thread.Abort does not exist on
     .NET Core, so the thread keeps running whatever it was doing while the caller moves on.
 
-    For a blocking READ - a CIM query, a registry snapshot, a Recycle Bin scan - that costs two or
-    three threads and nothing else, which is the trade this project accepts. For a block that
-    MUTATES it is a different fact entirely: the run would schedule the next mutation on top of one
-    that is still in progress. External mutators are not affected because every one of them is a
-    child process under job ownership, where a timeout is a proven TerminateJobObject rather than an
-    abandonment. The latch covers the remaining case - an in-process block that writes.
+    A blocking read can be abandoned without authorizing a mutation. For writing work, the latch
+    records uncertainty durably. Job membership establishes only the lifetime of actual members;
+    service-dispatched work needs a separate external classification and cannot be cleared solely
+    because the initiating WAC process or an initiating job exited.
 
     WHY IT HAD TO BECOME DURABLE (ledger WAC-05R). The latch was per-run and in-memory, so the
     uncertainty ended when the process did. But the machine-wide operation lock is released in
@@ -34,15 +32,10 @@
     name and no replace. WindowsAutoCleanup.ControlFile.ps1 carries that contract and the reasoning
     behind each of its three properties.
 
-    WHAT CLEARS IT. Evidence, never time and never a fresh start. The marker records the process
-    that raised it by id AND creation time, which is the same identity proof the termination path
-    uses, because an id on its own is recycled. The next run binds that identity:
-
-      still alive  - the abandoned thread may still be writing. The run starts quarantined.
-      gone         - a thread cannot outlive its process, so nothing that process started can begin
-                     a new write. The uncertainty is over; the marker is cleared and the event is
-                     logged, loudly, at the level an operator reads.
-      unreadable   - unknown is not absence. The run starts quarantined.
+    WHAT CLEARS IT. InProcess work may retire only on positive process identity/lifetime evidence.
+    External work requires conservative monotonic restart evidence; civil-clock age is never proof.
+    Missing or inconclusive evidence preserves the marker. A late observation after a real restart
+    may remain inconclusive rather than fabricating a reason to proceed.
 
     Within a run it is still not self-clearing: nothing in this process can observe its own
     abandoned thread finishing, so there is no evidence here that would justify clearing it.

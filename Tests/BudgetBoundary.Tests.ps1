@@ -49,6 +49,8 @@ function Set-BudgetExpiryAfterLaunch {
         param($FilePath, $ArgumentList)
         Set-WacOwnedProcessLauncher -Launcher $null
         $launch = Start-WacOwnedProcess -FilePath $FilePath -ArgumentList $ArgumentList
+        # The unowned fixture measures drains after root exit, not a pre-start timeout.
+        if (-not $launch.Owned) { [void][WacOwnedProcess]::WaitForExit($launch.Process, 10000) }
         Set-WacDeadline -DeadlineUtc ([datetime]::UtcNow.AddSeconds(-1))
         return $launch
     }
