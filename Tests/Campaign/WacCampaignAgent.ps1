@@ -101,6 +101,72 @@ catch {
 }
 Write-WacCampaignAgentLog -Text '--- agent started ---'
 
+function Set-WacCampaignDurableArming {
+    <#
+    .SYNOPSIS
+        Makes this guest's arming survive a power cut, by replacing whatever started the agent with
+        the scheduled task the arming script registers.
+    .DESCRIPTION
+        A guest armed from the HOST can only be armed with a local Group Policy machine startup
+        script, and that registration lives in the registry where a dirty shutdown can roll it back -
+        measured here: `AgentBoot` appears within seconds of every clean boot and never after a cut.
+        A scheduled task goes through Task Scheduler's own store instead.
+
+        The agent runs as SYSTEM, so it can register that task itself, which is the same act the
+        machine's owner performs with Register-WacCampaignAgent.ps1 - just reached from the one
+        place that is already inside the guest.
+
+        The Group Policy script is REMOVED once the task exists, because two start paths would run
+        two agents at the next boot, and two agents publishing to one exchange is worse than a
+        fragile one.
+    #>
+    $taskPath = '\WindowsAutoCleanupCampaign\'
+    $taskName = 'CampaignAgent'
+
+    try {
+        $existing = @(Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue)
+        if ($existing.Count -eq 0) {
+            $register = Join-Path -Path $PSScriptRoot -ChildPath 'Register-WacCampaignAgent.ps1'
+            if (-not (Test-Path -LiteralPath $register -PathType Leaf)) {
+                Write-WacCampaignAgentLog -Text 'the arming script is not beside the agent, so the task was not registered'
+                return 'no-arming-script'
+            }
+
+            $out = [System.IO.Path]::GetTempFileName()
+            $process = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden `
+                -RedirectStandardOutput $out -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive',
+                    '-ExecutionPolicy', 'Bypass', '-File', $register)
+            [void]$process.WaitForExit(120000)
+            Write-WacCampaignAgentLog -Text ('the arming script exited ' + [string]$process.ExitCode)
+            [System.IO.File]::Delete($out)
+
+            $existing = @(Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue)
+            if ($existing.Count -eq 0) { return 'task-registration-failed' }
+            $result = 'task-registered'
+        }
+        else { $result = 'task-already-present' }
+
+        # Only now, with a durable path proven to exist, is the fragile one taken away.
+        $gpScripts = Join-Path -Path $env:SystemRoot -ChildPath 'System32\GroupPolicy\Machine\Scripts'
+        $bootCmd = Join-Path -Path $gpScripts -ChildPath 'Startup\wac-campaign-boot.cmd'
+        if (Test-Path -LiteralPath $bootCmd -PathType Leaf) {
+            [System.IO.File]::Delete($bootCmd)
+            $ini = Join-Path -Path $gpScripts -ChildPath 'scripts.ini'
+            if (Test-Path -LiteralPath $ini -PathType Leaf) { [System.IO.File]::Delete($ini) }
+            Write-WacCampaignAgentLog -Text 'the Group Policy startup script was removed; the task is now the only start path'
+            $result += '+gp-removed'
+        }
+        return $result
+    }
+    catch {
+        Write-WacCampaignAgentLog -Text ('durable arming failed: ' + $_.Exception.Message)
+        return ('failed: ' + $_.Exception.Message)
+    }
+}
+
+$arming = Set-WacCampaignDurableArming
+try { Publish-WacCampaignValue -Name 'AgentArming' -Value $arming } catch { $null = $_ }
+
 function Publish-WacCampaignFault {
     <#
     .SYNOPSIS
