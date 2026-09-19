@@ -576,7 +576,7 @@ function Invoke-Main {
     # retired without the decision beside it leaves a machine that cannot tell this generation from
     # one that died mid-swap, and the next installer would then be free to overwrite state nothing
     # had settled. Keeping both is recoverable; discarding the copy is not.
-    $decision = Set-WacDeploymentCommitted
+    $decision = Set-WacDeploymentCommitted -Task @($registered)
     $decisionRecorded = [bool]$decision.Recorded
     if (-not $decisionRecorded) {
         Write-InstallerMessage -Level CRITICAL -Message 'This install is verified but its commit decision could not be recorded, so the copy of the previous deployment is being kept and nothing was retired; re-run the installer once the cause is fixed.' -Data @{

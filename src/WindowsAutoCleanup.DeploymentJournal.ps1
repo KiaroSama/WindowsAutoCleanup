@@ -482,9 +482,7 @@ function Write-WacTaskCaptureRecord {
         })
     }
 
-    # A record naming nothing is not a transaction, and writing one would leave the next run
-    # reconciling a capture that never happened.
-    if ($entries.Count -eq 0) { return $false }
+    # An explicitly empty array records the original absence of tasks on a first installation.
 
     return (Write-WacDeploymentJournal -DeploymentRoot $root -Kind 'TaskCapture' -Record ([PSCustomObject]@{
         Schema = $script:DeploymentJournalSchema

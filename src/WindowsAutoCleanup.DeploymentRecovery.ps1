@@ -216,6 +216,13 @@ function Get-WacDeploymentRecoveryPlan {
         return $plan
     }
 
+    if ([string]$swap.State -ceq 'Valid' -and [string]$capture.State -ceq 'Valid' -and
+        -not [string]::IsNullOrWhiteSpace([string]$swap.Generation) -and
+        -not [string]::IsNullOrWhiteSpace([string]$capture.Generation) -and -not $plan.Linked) {
+        $plan.Reason = 'The swap and task capture belong to different generations; neither was changed.'
+        return $plan
+    }
+
     $slotProbe = Get-WacDeploymentRecoveryPathState -Path $slots.Previous
     $plan.SlotState = [string]$slotProbe.State
     if ([string]$slotProbe.State -ceq 'Unreadable') {
@@ -416,7 +423,8 @@ function Resolve-WacPlanWithSlot {
         return $Plan
     }
 
-    if ($live.IsHealthy) {
+    if ($live.IsHealthy -and ([string]$Plan.Swap.State -cne 'Valid' -or
+        (Test-WacDeploymentIsRecordedReplacement -Root $slots.Root -Record $journal))) {
         $Plan.Verdict = 'CommitReplacement'
         $Plan.Reason = 'The recovery slot holds a superseded copy while a verified deployment of ours is live, so it is discarded.'
         return $Plan
@@ -463,6 +471,11 @@ function Resolve-WacDeploymentRecoverySlot {
     if ([string]$plan.Verdict -ceq 'None') {
         $result.Reason = 'There was no recovery slot to reconcile.'
         return $result
+    }
+
+    if ([string]$plan.Capture.State -ceq 'Valid' -and
+        ([string](Get-WacJournalField -Record $plan.Swap.Record -Name 'TaskReconciledVerdict')) -cne [string]$plan.Verdict) {
+        throw 'The task half has not been durably reconciled to this recovery decision; no files were changed.'
     }
 
     if ([string]$plan.Verdict -ceq 'RestoreOriginal') {

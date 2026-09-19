@@ -234,6 +234,12 @@ function Invoke-WacOwnedTool {
             }
         }
     }
+    if (-not $timedOut -and [string]$tree.State -ceq 'Alive' -and (& $remaining) -le 0) {
+        $timedOut = $true
+        $exitCode = $null
+        $killedJob = [bool][WacOwnedProcess]::TerminateJob($Launch.Job)
+        $tree = Wait-WacOwnedTreeQuiet -Launch $Launch -BudgetMs (Request-WacWaitMs -RequestedMs 5000)
+    }
     # ONE allowance, ONE deadline, BOTH pipes, and only now. Request-WacWaitMs CLAIMS what it grants
     # - that is the whole point of a reserve that cannot refill - so passing the same grant to two
     # waits spent the reservation once and consumed it twice, up to double what the run had set

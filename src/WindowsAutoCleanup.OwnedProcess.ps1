@@ -130,6 +130,7 @@ public sealed class WacOwnedLaunch
     public IntPtr Process = IntPtr.Zero;
     public IntPtr Thread = IntPtr.Zero;
     public int ProcessId;
+    public bool DeadlineExpired;
     // True only when the process was created suspended, assigned to a kill-on-close job, and then
     // resumed - in that order. Anything less is not ownership and must not be reported as any.
     public bool Owned;
@@ -390,17 +391,22 @@ public static class WacOwnedProcess
     public static void Close(WacOwnedLaunch launch)
     {
         if (launch == null) { return; }
+        // Stop remaining writers before disposing their redirected streams.
+        if (launch.Job != IntPtr.Zero) { CloseHandle(launch.Job); launch.Job = IntPtr.Zero; }
         if (launch.StandardOutput != null) { try { launch.StandardOutput.Dispose(); } catch { } }
         if (launch.StandardError != null) { try { launch.StandardError.Dispose(); } catch { } }
         if (launch.Thread != IntPtr.Zero) { CloseHandle(launch.Thread); launch.Thread = IntPtr.Zero; }
         if (launch.Process != IntPtr.Zero) { CloseHandle(launch.Process); launch.Process = IntPtr.Zero; }
-        // LAST, and deliberately: this is the kill-on-close backstop firing. Anything still alive in
-        // the job dies here, which is what makes an abandoned run safe.
-        if (launch.Job != IntPtr.Zero) { CloseHandle(launch.Job); launch.Job = IntPtr.Zero; }
     }
 
     public static WacOwnedLaunch Start(string applicationName, string commandLine, string workingDirectory,
         int terminateConfirmMs)
+    {
+        return Start(applicationName, commandLine, workingDirectory, terminateConfirmMs, long.MaxValue);
+    }
+
+    public static WacOwnedLaunch Start(string applicationName, string commandLine, string workingDirectory,
+        int terminateConfirmMs, long deadlineTick)
     {
         WacOwnedLaunch launch = new WacOwnedLaunch();
 
@@ -430,12 +436,14 @@ public static class WacOwnedProcess
 
             // The READ ends must not reach the child: an inherited read end keeps the pipe alive and
             // the parent's own ReadToEnd would never see EOF.
-            SetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0);
-            SetHandleInformation(errRead, HANDLE_FLAG_INHERIT, 0);
+            if (!SetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0) ||
+                !SetHandleInformation(errRead, HANDLE_FLAG_INHERIT, 0))
+            { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
 
             // Detached stdin. Automation must never be able to block on a console read, and handing
             // the child our own stdin would let it consume the caller's.
             nul = CreateFileW("NUL", 0x80000000, 3, ref sa, 3, 0, IntPtr.Zero);
+            if (nul == new IntPtr(-1)) { nul = IntPtr.Zero; throw new InvalidOperationException("Detached stdin could not be opened."); }
 
             STARTUPINFO si = new STARTUPINFO();
             si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
@@ -466,6 +474,8 @@ public static class WacOwnedProcess
             StringBuilder line = new StringBuilder(commandLine);
             uint flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
 
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTick)
+            { launch.DeadlineExpired = true; throw new TimeoutException("Launch deadline expired before process creation."); }
             if (!CreateProcessW(applicationName, line, IntPtr.Zero, IntPtr.Zero, true,
                     flags, IntPtr.Zero, workingDirectory, ref si, out pi))
             {
@@ -500,6 +510,8 @@ public static class WacOwnedProcess
 
             if (FaultBeforeResume != null) { throw new InvalidOperationException(FaultBeforeResume); }
 
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTick)
+            { launch.DeadlineExpired = true; throw new TimeoutException("Launch deadline expired before resume."); }
             if (ResumeThread(launch.Thread) == 0xFFFFFFFF)
             {
                 throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
@@ -595,14 +607,25 @@ function Start-WacOwnedProcess {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [AllowEmptyCollection()][string[]]$ArgumentList = @()
+        [AllowEmptyCollection()][string[]]$ArgumentList = @(),
+        [long]$DeadlineTick = [long]::MaxValue
     )
 
     if ($script:OwnedProcessLauncher) {
         return (& $script:OwnedProcessLauncher $FilePath $ArgumentList)
     }
 
+    if (-not ('WacOwnedProcess' -as [type]) -and $DeadlineTick -ne [long]::MaxValue) {
+        # Compilation runs inside the existing bounded worker; it can never launch a tool.
+        $left = [int][Math]::Max(0, [Math]::Min([int]::MaxValue,
+            ($DeadlineTick - [System.Diagnostics.Stopwatch]::GetTimestamp()) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency))
+        $compiled = Invoke-WacBounded -TimeoutMs $left -Component 'ProcessSetup' -ScriptBlock {
+            & (Get-Module WindowsAutoCleanup.Core) { Initialize-WacOwnedProcessNative }
+        }
+        if ($compiled.Outcome -cne 'Succeeded') { return $null }
+    }
     if (-not (Initialize-WacOwnedProcessNative)) { return $null }
+    if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $DeadlineTick) { return $null }
 
     # argv[0] by convention, even though lpApplicationName already fixes the image: a tool that reads
     # its own command line - and several Windows tools do - must see its name where it expects it.
@@ -625,7 +648,7 @@ function Start-WacOwnedProcess {
         # claiming it here would debit the reserve once per tool for a confirmation that does not
         # happen - which measurably starved the drain that does. Past the deadline it is 0, the
         # confirmation does not run, and Stopped stays false, which is the honest answer.
-        $launch = [WacOwnedProcess]::Start($FilePath, $commandLine, $directory, (Get-WacStepTimeoutMs -RequestedMs 5000))
+        $launch = [WacOwnedProcess]::Start($FilePath, $commandLine, $directory, (Get-WacStepTimeoutMs -RequestedMs 5000), $DeadlineTick)
     }
     catch {
         Write-WacLog -Level WARNING -Component 'Process' -Message 'The owned launcher failed before any process could be created; an unowned start is safe.' -Data @{

@@ -304,7 +304,6 @@ function Add-WacAbandonedMutator {
 
 # Absorbs ordinary clock skew and the record's own second-resolution stamp, so a restart has to be
 # clear of both before it settles anything.
-$script:RestartProofMarginMs = 120000
 
 function Get-WacMachineUptimeMs {
     <#

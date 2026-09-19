@@ -122,6 +122,8 @@ function Save-WacDeploymentJournal {
         OriginalFileCount = [int]$Transaction.OriginalFileCount
         ReplacementManifestHash = [string]$Transaction.ReplacementManifestHash
         Committed = [bool]$Transaction.Committed
+        ReplacementTask = @(Get-WacJournalField -Record $Transaction -Name 'ReplacementTask')
+        TaskDecision = [bool](Get-WacJournalField -Record $Transaction -Name 'TaskDecision')
     }))
 }
 
@@ -487,6 +489,10 @@ function Restore-WacDeploymentPrevious {
         return $result
     }
 
+    if ([bool]$transaction.Committed) {
+        $result.Reason = 'This generation is committed; a late rollback cannot remove it.'
+        return $result
+    }
     $result.HadPrevious = [bool]$transaction.HadOriginal
 
     # OriginalRestored means the tree is back where it belongs; RestoreVerdict carries the reason it
@@ -665,7 +671,7 @@ Export-ModuleMember -Function @(
     'Test-WacIsExcludedDeploymentName', 'Get-WacDeploymentItem', 'Copy-WacDeploymentTree',
     'Get-WacDeploymentSlotPath', 'Install-WacDeployment', 'Remove-WacDeployment',
     'New-WacDeploymentStage', 'Switch-WacDeploymentStage', 'Resolve-WacDeploymentRecoverySlot',
-    'Set-WacDeploymentCommitted',
+    'Set-WacDeploymentCommitted', 'Set-WacRecoveryTaskAcknowledgement', 'Get-WacJournalField',
     'Restore-WacDeploymentPrevious', 'Remove-WacDeploymentPrevious',
     'Test-WacDeploymentTrusted',
     'Get-WacTaskScriptPath', 'Get-WacLegacyTaskScriptPath', 'Test-WacTaskExecuteIsCanonicalHost',

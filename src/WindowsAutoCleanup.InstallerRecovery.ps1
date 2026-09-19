@@ -283,7 +283,7 @@ function Resolve-CapturedTaskAgainstPlan {
     return $result
 }
 
-function Resolve-InterruptedTaskCapture {
+function Resolve-WacInterruptedTaskCaptureCore {
     <#
     .SYNOPSIS
         Carries out the TASK half of the recovery plan, BEFORE this run stages anything. Ok is
@@ -424,6 +424,7 @@ function Resolve-InterruptedTaskCapture {
         # blocking the install over a file that will not delete would be worse than saying so - but
         # a caller that read this as a clean close would be wrong about what is on disk.
         if (-not $result.RecordEnded) {
+            $result.Ok = $false
             Write-InstallerMessage -Level CRITICAL -Message 'Every task an interrupted run recorded is accounted for, but its capture record could not be deleted; a later run will reconcile it again. Delete it by hand once this run finishes.' -Data @{
                 record = [string](Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind 'TaskCapture')
             }
@@ -434,6 +435,61 @@ function Resolve-InterruptedTaskCapture {
         Write-InstallerMessage -Level WARNING -Message 'A scheduled task lost to an interrupted run was put back before this run staged anything.' -Data @{
             root = $DeploymentRoot; restored = [int]$result.Restored; accounted = [int]$result.Accounted
         }
+    }
+    return $result
+}
+
+
+function Resolve-InterruptedTaskCapture {
+    <#
+    .SYNOPSIS
+        Reconciles the task half, then durably authorizes the matching file half.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$DeploymentRoot,
+        [Parameter(Mandatory = $true)]$Lookup,
+        [Parameter(Mandatory = $true)]$Plan
+    )
+    if ([string]$Plan.Verdict -ceq 'CommitReplacement' -and
+        [string]$Plan.Swap.State -ceq 'Valid' -and
+        [bool](Get-WacJournalField -Record $Plan.Swap.Record -Name 'TaskDecision')) {
+        $result = [PSCustomObject]@{ Ok = $false; Restored = 0; Accounted = 0; Recorded = 0; RecordEnded = $false; Reason = '' }
+        if ([string]$Lookup.State -ceq 'Failed') { $result.Reason = 'The committed task set could not be queried.'; return $result }
+        $expected = @($Plan.Swap.Record.ReplacementTask)
+        foreach ($wanted in $expected) {
+            $back = @($Lookup.Task | Where-Object { $_.TaskName -ieq $wanted.TaskName -and $_.TaskPath -ieq $wanted.TaskPath })
+            # Do not roll a committed generation back to its ORIGINAL registration. Restore the
+            # recorded replacement if absent; never overwrite a different standing task.
+            if ($back.Count -eq 0) {
+                if (-not (Restore-CapturedTask -Definition $wanted)) { $result.Reason = 'The committed replacement task could not be restored.'; return $result }
+                $result.Restored++
+            }
+            elseif ($back.Count -ne 1 -or -not (Test-WacCapturedTaskDefinition -Xml $wanted.Definition -Task $back[0]).Match) {
+                $result.Reason = 'The standing task does not match the committed replacement; all evidence was kept.'
+                return $result
+            }
+            $result.Accounted++
+        }
+        # Unexpected tasks, including a legacy registration, must not be silently certified.
+        foreach ($standing in @($Lookup.Task)) {
+            if (@($expected | Where-Object { $_.TaskName -ieq $standing.TaskName -and $_.TaskPath -ieq $standing.TaskPath }).Count -eq 0) {
+                $result.Reason = 'An unexpected registration remains beside the committed task set.'
+                return $result
+            }
+        }
+        $result.Recorded = $expected.Count
+        $result.Ok = $true
+        $result.Reason = 'The exact committed replacement task set is accounted for.'
+    }
+    elseif ([string]$Plan.Verdict -ceq 'CommitReplacement' -and [string]$Plan.Capture.State -ceq 'Valid') {
+        # Legacy commit records do not identify the replacement task. A name alone is not proof.
+        return [PSCustomObject]@{ Ok = $false; Restored = 0; Accounted = 0; Recorded = @($Plan.Capture.Capture).Count; RecordEnded = $false; Reason = 'This legacy commit has no replacement task proof; retain both records for explicit recovery.' }
+    }
+    else { $result = Resolve-WacInterruptedTaskCaptureCore -DeploymentRoot $DeploymentRoot -Lookup $Lookup -Plan $Plan }
+
+    if ($result.Ok -and $null -ne $Plan.Swap -and [string]$Plan.Swap.State -ceq 'Valid' -and [string]$Plan.Verdict -cne 'None') {
+        $result.Ok = [bool](Set-WacRecoveryTaskAcknowledgement -DeploymentRoot $DeploymentRoot -Verdict $Plan.Verdict)
+        if (-not $result.Ok) { $result.Reason = 'The task state was reconciled but its durable acknowledgement failed; no file recovery is authorized.' }
     }
     return $result
 }
