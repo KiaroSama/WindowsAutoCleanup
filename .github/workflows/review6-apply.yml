@@ -26,7 +26,8 @@ jobs:
           python3 - <<'PY'
           import hashlib, pathlib
           p = pathlib.Path('Tests/VmDeploymentLifecycle.Tests.ps1')
-          source = p.read_bytes()
+          # Git blobs are LF; .gitattributes checks PowerShell files out with CRLF on every OS.
+          source = p.read_bytes().replace(b'\r\n', b'\n')
           def blob(data):
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
           assert blob(source) == '45bd0763cd8ca7dde72afbbef7c072eaae1b414d'
@@ -45,7 +46,7 @@ jobs:
               text = text.replace(before, after)
           result = text.encode('ascii')
           assert blob(result) == '85ad611fbf9831d82ab99455c1d7eec32589af84'
-          p.write_bytes(result)
+          p.write_bytes(result.replace(b'\n', b'\r\n'))
           PY
           git add Tests/VmDeploymentLifecycle.Tests.ps1
           git diff --cached --check
