@@ -109,6 +109,25 @@ refused. Losing that race produces a wrong **refusal**, never a wrong deletion.
   manifest and was trusted - all of which a tree REWRITTEN since it was set aside still satisfies.
   It must now also hash to the inventory the durable record took of it. Where no record names one,
   the log says so explicitly rather than implying a check that did not happen.
+- **An installation is one transaction, and a run will not clean from an unfinished one.** A
+  deployment is a tree plus the registration that runs it, and only the generation that put them
+  there establishes that they belong to each other. While that generation is in flight it keeps a
+  record beside the deployment root, and the scheduled task used to fire on its trigger regardless -
+  so an upgrade killed between its two halves was followed, unattended, by a SYSTEM-privileged run
+  deleting files under an authority nobody had reconciled. A run whose deployment still carries such
+  a record now refuses with `7` and changes nothing; re-running the installer closes it.
+- **The installer writes down that it committed, instead of letting the next run infer it.** The
+  decision is recorded after the replacement task AND the replacement files verify, and BEFORE
+  either recovery copy is retired. Commitment used to be guessed from what was lying on disk - a
+  manifest hash that matched, or a healthy tree beside a copy that could not be promoted - and
+  neither carries that claim: a tree can be intact, be exactly the one the record names, and still
+  belong to a run that died before registering the task that goes with it. If the decision cannot be
+  written the installation stays in place, nothing is retired, and the run reports `6`.
+- **A recovery finishes before the new installation is even considered.** Restoring the registration
+  and restoring the tree used to sit on opposite sides of the new install's own checks - its source,
+  its host, its budget - so a run that failed one of those returned leaving the old task standing
+  over the new tree, with nothing scheduled to close it. Both halves now complete back to back under
+  the one lock, ahead of every question about what is being installed.
 - **Driver deletion and its backup are one commit.** A marker is written before `pnputil` is asked to
   remove anything and cleared only once the backup record is durable on disk, so an interrupted
   deletion can never leave an export that a later run mistakes for residue and reclaims.
