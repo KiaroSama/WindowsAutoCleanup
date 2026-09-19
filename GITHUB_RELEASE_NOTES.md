@@ -426,6 +426,32 @@ all fixed:
   unelevated, derives every child's budget from its own wall timeout so it can never terminate a
   live DISM servicing operation from outside, and never passes `/ResetBase`.
 
+## New in this release: a preview, and a verdict a machine can read
+
+**`-Preview`** prints what a run would sweep and exits without touching anything: the destructive
+options as the invocation sets them, the `-SkipCategory` exclusions, and every allow-list target.
+The list comes from the same builder the real run uses, so it cannot drift from what would happen.
+It is deliberately **not** a dry run of the whole run: the maintenance steps cannot enumerate what
+they would remove without doing it, so they are reported as on or off rather than pretended at. The
+switch is carried into the elevated relaunch, and `-Preview` with `-Scheduled` is refused - a trigger
+that only previews is a machine nobody is cleaning, reporting success every night.
+
+**A `.summary.json` beside every run's log**, same base name, versioned by a `schema` field. The log
+is written for a person, one line per event; this answers "did last night's run clean, or did it
+refuse?" without parsing prose. Every step carries one of four states - `executed`, `refused`,
+`unarmed` or `unstated` - because a step that was switched off and a step the run refused look
+identical in any count of deleted files, and only one of them means the machine is fine. It holds
+outcomes, categories, counts and durations: no command line, no environment, no per-path inventory
+and no credential. A summary that cannot be written is a warning and never changes the run's verdict.
+
+**A disposable-VM campaign** (`Tests/Campaign/`) for the scenarios continuous integration
+structurally cannot run: a real power cut mid-transaction, a real restart, and service-dispatched
+maintenance where the cleanup itself runs to completion under the Task Scheduler as `SYSTEM`. It is
+opt-in in a way no flag can be: the host can deliver files to a guest and read what the guest
+publishes, but it cannot start anything in there, so a machine runs campaigns only after its owner
+armed it once. Destructive driver and `/ResetBase` scenarios need their own separate authorization,
+on the host and again inside the guest. Its own README states what it has and has not yet proved.
+
 ## Documentation
 
 README and these notes now describe the shipped behaviour. Removed the false claims about a
