@@ -401,17 +401,21 @@ Test-Case 'A record that cannot be deleted keeps the transaction open, and no la
         [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::ReadOnly)
         [void][System.IO.Directory]::CreateDirectory($record + '.new')
 
-        $acted = Invoke-RecoveryHalf -Slots $slots
-        Assert-Equal 'Restored' ([string]$acted.Action) ([string]$acted.Reason)
+        # Restoring bytes is not a clean transaction close. The caller must receive the retirement
+        # failure while the original remains restored and the unfinished record remains on disk.
+        Assert-Throws -ScriptBlock { Invoke-RecoveryHalf -Slots $slots } -Pattern 'rollback journal could not be retired'
         Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'the tree the record described was not the one put back'
         Assert-True (Test-Path -LiteralPath $record -PathType Leaf) `
             'a record that could not be deleted vanished anyway, so the failure this case is about did not happen'
         Assert-False (Remove-WacDeploymentJournal -DeploymentRoot $slots.Root) `
             'a removal that cannot finish reported the transaction closed'
 
-        # And no other generation may write over what is still unfinished.
-        [void](New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C')
-        Assert-Throws -ScriptBlock { Switch-WacDeploymentStage -KeepPrevious } -Pattern 'transaction could not be recorded'
+        # Staging now refuses EARLIER, before a later generation can create a replacement at all.
+        # Preserve the original safety assertion instead of expecting the old clean-return shape.
+        Assert-Throws -ScriptBlock {
+            New-CommitStage -Sandbox $sandbox -Name 'C' -RunContent '# replacement C'
+        } -Pattern 'rollback journal could not be retired'
+        Assert-False (Test-Path -LiteralPath $slots.Staging) 'a later generation staged over an unfinished rollback'
         Reset-CommitFixture
 
         Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'a swap that could not record itself moved the deployment anyway'
@@ -419,6 +423,11 @@ Test-Case 'A record that cannot be deleted keeps the transaction open, and no la
             'a later generation overwrote the record of the unfinished one'
 
         [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::Normal)
+        [System.IO.Directory]::Delete($record + '.new')
+        $retry = Invoke-RecoveryHalf -Slots $slots
+        Assert-Equal 'Restored' ([string]$retry.Action) ([string]$retry.Reason)
+        Assert-False (Test-Path -LiteralPath $record) 'recovery still could not retire its record after the obstruction was removed'
+        Assert-Equal $fixture.Original (Get-CommitInventory -Path $slots.Root) 'a successful retirement retry changed the original'
     }
 }
 
