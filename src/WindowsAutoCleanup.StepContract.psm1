@@ -170,6 +170,7 @@ function Invoke-WacStepBounded {
         [string]$Component = 'Steps',
         [switch]$IgnoreRunBudget,
         [switch]$Mutating,
+        [ValidateSet('InProcess', 'External')][string]$MutationKind = 'External',
         # A STABLE name for this particular bounded call. It never reaches a log line - Component
         # still does that - and exists so a fixture can select one call by what it IS rather than by
         # its position. Selecting by ordinal coupled five suites to the ORDER of bounded calls, which
@@ -182,7 +183,7 @@ function Invoke-WacStepBounded {
     }
 
     return (Invoke-WacBounded -ScriptBlock $ScriptBlock -TimeoutMs $TimeoutMs -ArgumentList $ArgumentList `
-        -ImportModule @($script:StepsModulePath) -Component $Component -IgnoreRunBudget:$IgnoreRunBudget -Mutating:$Mutating)
+        -ImportModule @($script:StepsModulePath) -Component $Component -IgnoreRunBudget:$IgnoreRunBudget -Mutating:$Mutating -MutationKind $MutationKind)
 }
 
 # ------------------------------------------------------------------------------------------------
@@ -319,7 +320,8 @@ function Test-WacToolLifetimeSettled {
     # complete, which is exactly what a suspended process nobody could confirm terminating does NOT
     # say.
     if (-not [bool]$Run.Started) {
-        if (([string]$Run.OwnedTreeState) -ceq 'Complete') {
+        if (([string]$Run.OwnedTreeState) -ceq 'Complete' -and
+            [bool]$Run.TerminationProven -and [bool]$Run.OutputComplete) {
             $result.Settled = $true
             $result.OutputTrustworthy = $true
             return $result

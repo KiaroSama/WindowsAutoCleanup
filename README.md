@@ -220,60 +220,49 @@ The installer and uninstaller use the same `6` and `7`, and add an `8` of their 
 
 ### A run that refuses to clean from an unfinished installation
 
-An installation is two things: the tree at the deployment root, and the scheduled registration that
-runs it. Only the generation that put them there ever establishes that they belong to each other,
-and while that generation is in flight it keeps a record on disk beside the deployment root. A
-record still standing means the installer that wrote it did not finish.
+The runtime tree and scheduled registration are one recovery transaction. A record beside the
+deployment root can describe either an unfinished generation or committed cleanup still pending.
+The runtime refuses while either half is unresolved. Re-run the installer only when installation,
+not removal, is the intended operation; it reconciles task definitions and file identities before
+staging a new generation.
 
-The scheduled task fires on its trigger whatever state the last installer left. So a run whose
-deployment still carries such a record refuses with `7` and changes nothing: the registration that
-started it and the tree it is running were last touched by a process that did not finish, and
-neither vouches for the other. Re-run the installer to close it — the installer reconciles both
-halves before it prepares anything of its own, and deletes the records when the new installation is
-verified and committed.
+The durable commit includes the verified replacement task definition. Recovery restores the
+original pair before commit, or the exact replacement pair after commit. An empty original task
+set or deployment directory is explicit evidence, not a missing capture. Different generation IDs,
+corrupted replacement contents and incomplete inspections refuse recovery without deleting evidence.
+A locked capture keeps its authoritative commit record and recovery copy; an incomplete retirement
+is not a successful installation.
 
-The installer itself now records that commit **before** it retires the copy of the deployment it
-replaced. If that decision cannot be written, the installation is still in place and verified, but
-nothing is retired and the installer reports `6`: keeping both the copy and the record is
-recoverable, and discarding the copy without the decision beside it is not.
+An authorized uninstall first writes `<deployment-root>.uninstall.json`. While it remains, runtime
+and install admission refuse rather than resurrecting a task from an older upgrade capture. Resume
+the uninstaller to complete removal. It retires task captures, then the swap record, and the uninstall
+intent last. Do not delete transaction records merely to clear a warning.
 
 ### A run that refuses to mutate anything
 
-Work this tool runs inside its own process is given a wall-clock bound. Almost all of it is
-reading; the few blocks that write say so. When a *writing* block misses its bound inside a
-blocking Windows call there is no way to stop it - the thread keeps going - so the run stops
-scheduling any further change and reports `6`. That much was already true within a single run.
+A timed-out mutator can leave work outside the thread or process that started it. The run records
+`abandoned-mutation.json` in `%SystemRoot%\Logs\WindowsAutoCleanup\Control` and stops conflicting
+mutations. Cleanup, installation and removal all honor this gate.
 
-What is new is that the fact now survives the process. A marker named `abandoned-mutation.json`,
-written in the state root beside `Logs`, records the abandonment and the identity of the process
-that raised it. The next run - or an installer taking the same machine-wide lock - reads it before
-doing anything, and:
+Only explicitly host-confined work is classified `InProcess`; its recorded process ID and creation
+time can establish that the host is gone. Other mutating bounded blocks default to `External`,
+including service-dispatching cmdlets. An external marker cannot retire just because the WAC host
+exited, its pipes closed, or civil time advanced. A recorded monotonic system uptime followed by a
+lower current uptime supplies conservative restart evidence. Missing evidence, a failed probe or a
+current counter not lower than the recorded one keeps the marker. A late check after a genuine
+restart may therefore still require operator verification; changing the wall clock is not a remedy.
 
-- retires it and proceeds normally once that process is **proven** gone, which is what the recorded
-  creation time is for: a process id on its own is recycled;
-- starts quarantined if that process is still running, or if the marker cannot be read at all.
+A quarantined run still writes its diagnostic report but starts no conflicting cleanup step.
+Job ownership proves completion only for job members, not arbitrary service/WMI-dispatched work.
+Old markers under `%ProgramData%\WindowsAutoCleanup` remain untrusted and are neither followed nor
+silently removed. Inspect unresolved work and recovery data before manually retiring any evidence.
 
-A quarantined run still produces its log and its report. It simply starts none of the steps that
-change the machine - the allow-list sweep, DISM, `pnpclean`, `pnputil`, `cleanmgr`, the Recycle Bin
-and the Delivery Optimization purge - and records each of them as not attempted. **The installer and
-the uninstaller refuse for the same reason and at the same point**, before they stage a tree or
-unregister a task: they change the machine too, and they share one gate so neither can forget.
-
-An EXTERNAL tool that cannot be proven finished arms the same quarantine. A clean exit code is what
-a tool believes about itself; it says nothing about a child it started or about output that never
-arrived, so a DISM, `pnpclean` or `cleanmgr` whose whole tree cannot be shown to have stopped now
-stops the run from starting anything else rather than only marking the report.
-
-Where the record lives: a small file in `%SystemRoot%\Logs\WindowsAutoCleanup\Control`, a
-directory only administrators can create names in. A marker written by a version before 1.2 sits in
-`%ProgramData%\WindowsAutoCleanup` instead; that one is reported and left exactly as it is - its
-contents are not believed, because anyone could have created that name, and it is not deleted
-either, because that would throw away a real uncertainty. Clearing it is an operator's decision.
-
-The same store also holds a recovery copy of anything this tool BORROWS. `cleanmgr` switches handlers
-on in somebody else's sage profile and puts the originals back afterwards; those originals are now
-written to the control store before the first value is touched, and a store that cannot take them is
-a reason to change nothing at all.
+The same strict control store protects the originals of a borrowed cleanmgr profile. Only a snapshot
+created by the current attempt belongs to that attempt. A pre-existing snapshot blocks another
+legacy-cleanmgr invocation with `Incomplete` and remains intact for controlled recovery. Verified
+restoration retires the owned snapshot; a zero-write attempt retires only its own unnecessary copy.
+A failed retirement remains `Incomplete`. Never overwrite or delete an earlier original to make a
+later run appear clean.
 
 ## Concurrency
 
@@ -491,7 +480,7 @@ unlocked scratch files, so do not run it during work that depends on those files
 | `src/WindowsAutoCleanup.Core.psm1` | Package entry point over `Native`, `Path`, `TrustedStore`, `Locations`, `Budget`, `ControlFile`, `Quarantine`, `RunState`, `Process`, `Environment` and `Trust`: the P/Invoke surface, path safety, pinned-handle directory creation, the fixed machine locations, the run deadline and recovery reserve, the audit log, bounded execution, machine facts, and the owner/DACL rules. |
 | `src/WindowsAutoCleanup.Budget.ps1` | The run's two time budgets: the deadline ordinary work is held to, and the single reserve that recovery work draws from after that deadline is gone, so a rollback still runs but twenty of them cannot add up to an unbounded shutdown. Every shutdown-critical wait draws from the same two numbers - a termination wait, a pipe drain and a tree kill each used to take a fixed allowance charged to nothing, once per tool. The remaining budget is the smaller of the civil deadline and a stopwatch armed with it, so an NTP or DST correction cannot hand the run time it never earned. |
 | `src/WindowsAutoCleanup.ControlFile.ps1` | The small CONTROL files that decide what a later run may do, in a store where nobody but an administrator can create a name. Under `%SystemRoot%\Logs`, not the state root - the state root's own trust rule permits a standard user to create new names there, which for a file that decides whether the next run may change the machine is the decision itself. A write is ONE collision-failing create bound to the directory handle: there is no temporary name and no replace, so a link or a file preplanted at either name is refused rather than written through. A read is judged from the open - a reparse point and an extra hard link are refused, and only the open's own "not there" counts as absence. |
-| `src/WindowsAutoCleanup.Quarantine.ps1` | The abandoned-mutator quarantine. A block that misses its bound inside a blocking native call is abandoned, not stopped, so the run refuses every later mutation - and that refusal is now written to a durable marker under the state root, because the latch used to die with the process while the abandoned thread's uncertainty did not. The next run retires the marker only on proof that the process which raised it is gone, identified by process id **and** creation time; a marker that is unreadable, or names a process still running, starts the new run quarantined. |
+| `src/WindowsAutoCleanup.Quarantine.ps1` | Durable mutation admission in the strict control store. In-process and external lifetimes are distinct; only positive process or monotonic restart evidence can retire uncertainty. |
 | `src/WindowsAutoCleanup.OwnedProcess.ps1` | Ownership at creation: every external tool is launched suspended, bound to a kill-on-close Job Object before its first instruction, then resumed. Termination is one call over the whole tree, and "did everything this run started finish?" is answered from the job rather than from a process snapshot. The launch also reports how far it got — nothing created, created but never resumed, or resumed — because only the first of those makes starting the same command again safe. |
 | `src/WindowsAutoCleanup.OwnedRun.ps1` | The policy that consumes that mechanism: waiting for the owned work rather than just its root, draining output inside the run budget, terminating only on a deadline or an error, and turning root exit, owned-tree state and output completeness into one result the steps can read. |
 | `src/WindowsAutoCleanup.BoundedWork.ps1` | In-process work under a real wall-clock bound, in its own runspace - including the rule that a block declaring itself a mutator, once abandoned, stops every later mutation in the run and records that fact where the next process will find it. |

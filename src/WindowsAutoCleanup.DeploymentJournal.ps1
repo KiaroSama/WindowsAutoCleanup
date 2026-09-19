@@ -228,13 +228,14 @@ function Get-WacDeploymentJournalPath {
     #>
     param(
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     if ([string]::IsNullOrWhiteSpace($DeploymentRoot)) { $DeploymentRoot = Get-WacDeploymentRoot }
     $root = Get-WacNormalizedPath -Path $DeploymentRoot
     if (-not $root) { return $null }
 
+    if ($Kind -ceq 'Uninstall') { return ($root + '.uninstall.json') }
     if ($Kind -ceq 'TaskCapture') { return ($root + $script:TaskCaptureJournalSuffix) }
     return ($root + $script:DeploymentJournalSuffix)
 }
@@ -248,7 +249,7 @@ function Write-WacDeploymentJournal {
     param(
         [Parameter(Mandatory = $true)]$Record,
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind $Kind
@@ -314,7 +315,7 @@ function Read-WacDeploymentJournal {
     #>
     param(
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     $result = [PSCustomObject]@{ State = 'Absent'; Record = $null; Schema = 0; Generation = ''; Reason = '' }
@@ -405,7 +406,7 @@ function Remove-WacDeploymentJournal {
     #>
     param(
         [string]$DeploymentRoot,
-        [ValidateSet('Swap', 'TaskCapture')][string]$Kind = 'Swap'
+        [ValidateSet('Swap', 'TaskCapture', 'Uninstall')][string]$Kind = 'Swap'
     )
 
     $path = Get-WacDeploymentJournalPath -DeploymentRoot $DeploymentRoot -Kind $Kind
@@ -482,9 +483,7 @@ function Write-WacTaskCaptureRecord {
         })
     }
 
-    # A record naming nothing is not a transaction, and writing one would leave the next run
-    # reconciling a capture that never happened.
-    if ($entries.Count -eq 0) { return $false }
+    # An explicitly empty array records the original absence of tasks on a first installation.
 
     return (Write-WacDeploymentJournal -DeploymentRoot $root -Kind 'TaskCapture' -Record ([PSCustomObject]@{
         Schema = $script:DeploymentJournalSchema
@@ -529,7 +528,15 @@ function Read-WacTaskCaptureRecord {
     if ([string]$read.State -cne 'Valid') { return $result }
 
     $entries = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($item in @(Get-WacJournalField -Record $read.Record -Name 'CapturedTask')) {
+    # Read the array property directly. Returning an empty array through a PowerShell function
+    # collapses it to $null; @($null) then looks like one malformed capture rather than zero.
+    if (@($read.Record.PSObject.Properties.Name) -cnotcontains 'CapturedTask' -or
+        $null -eq $read.Record.CapturedTask) {
+        $result.State = 'Unreadable'
+        $result.Reason = 'the task-capture record does not declare the original task set'
+        return $result
+    }
+    foreach ($item in @($read.Record.CapturedTask)) {
         $definition = [string](Get-WacJournalField -Record $item -Name 'Definition')
         $taskName = [string](Get-WacJournalField -Record $item -Name 'TaskName')
         if (-not $item -or [string]::IsNullOrWhiteSpace($definition) -or [string]::IsNullOrWhiteSpace($taskName)) {

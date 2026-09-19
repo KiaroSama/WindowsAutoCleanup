@@ -36,7 +36,7 @@ function Set-WacDeploymentCommitted {
         Recorded and Reason.
     #>
     [CmdletBinding()]
-    param()
+    param([AllowEmptyCollection()][object[]]$Task)
 
     $result = [PSCustomObject]@{ Recorded = $false; Reason = '' }
 
@@ -46,6 +46,24 @@ function Set-WacDeploymentCommitted {
         return $result
     }
 
+    if ($PSBoundParameters.ContainsKey('Task')) {
+        $proof = New-Object 'System.Collections.Generic.List[object]'
+        try {
+            foreach ($item in @($Task)) {
+                $xml = [string](Export-ScheduledTask -TaskName $item.TaskName -TaskPath $item.TaskPath -ErrorAction Stop)
+                if (-not (Test-WacCapturedTaskDefinition -Xml $xml -Task $item).Match) {
+                    throw 'The replacement task export did not match the verified registration.'
+                }
+                [void]$proof.Add([PSCustomObject]@{
+                    TaskName = [string]$item.TaskName; TaskPath = [string]$item.TaskPath
+                    Definition = $xml; Captured = $true
+                })
+            }
+        }
+        catch { $result.Reason = $_.Exception.Message; return $result }
+        $script:DeploymentTransaction | Add-Member -NotePropertyName ReplacementTask -NotePropertyValue @($proof.ToArray()) -Force
+        $script:DeploymentTransaction | Add-Member -NotePropertyName TaskDecision -NotePropertyValue $true -Force
+    }
     $script:DeploymentTransaction.Committed = $true
     if (-not (Save-WacDeploymentJournal -Transaction $script:DeploymentTransaction -Stage 'Committed')) {
         # Put the in-memory flag back. It is what a rollback in this same process would otherwise
@@ -60,4 +78,21 @@ function Set-WacDeploymentCommitted {
     $result.Recorded = $true
     $result.Reason = 'the generation is recorded as committed.'
     return $result
+}
+
+function Set-WacRecoveryTaskAcknowledgement {
+    <#
+    .SYNOPSIS
+        Records completion of the task half before any recovery file is removed.
+    #>
+    param([string]$DeploymentRoot, [ValidateSet('RestoreOriginal', 'CommitReplacement')][string]$Verdict)
+    $kind = 'Swap'
+    $read = Read-WacDeploymentJournal -DeploymentRoot $DeploymentRoot
+    if ([string]$read.State -ceq 'Absent') {
+        $kind = 'TaskCapture'
+        $read = Read-WacDeploymentJournal -DeploymentRoot $DeploymentRoot -Kind $kind
+    }
+    if ([string]$read.State -cne 'Valid') { return $false }
+    $read.Record | Add-Member -NotePropertyName TaskReconciledVerdict -NotePropertyValue $Verdict -Force
+    return (Write-WacDeploymentJournal -DeploymentRoot $DeploymentRoot -Kind $kind -Record $read.Record)
 }
