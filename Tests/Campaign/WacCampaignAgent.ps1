@@ -37,8 +37,28 @@ $ErrorActionPreference = 'Stop'
 $script:KvpKey = 'HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest'
 $script:Prefix = 'WacCampaign.'
 $script:Chunk = 900
+$script:LogPath = Join-Path -Path $Root -ChildPath 'agent.log'
 
-. (Join-Path -Path $PSScriptRoot -ChildPath 'WacCampaignScenario.ps1')
+function Write-WacCampaignAgentLog {
+    <#
+    .SYNOPSIS
+        Appends one line to the guest-side log, and never throws.
+    .DESCRIPTION
+        It runs before anything in this file is known to work, so it cannot be allowed to become the
+        thing that fails. The log survives reboots and power cuts, which is what makes it the record
+        of a boot the host could not see - and its tail is published on any fault, because a log
+        nobody can retrieve is a log nobody has.
+    #>
+    param([AllowEmptyString()][string]$Text)
+
+    try {
+        $stamp = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $directory = Split-Path -Parent $script:LogPath
+        if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory -Force) }
+        [System.IO.File]::AppendAllText($script:LogPath, ('[{0}] {1}{2}' -f $stamp, $Text, [Environment]::NewLine))
+    }
+    catch { $null = $_ }
+}
 
 function Publish-WacCampaignValue {
     <#
@@ -55,6 +75,67 @@ function Publish-WacCampaignValue {
         [void](New-Item -Path $script:KvpKey -Force)
     }
     Set-ItemProperty -LiteralPath $script:KvpKey -Name ($script:Prefix + $Name) -Value $Value -Type String -Force
+}
+
+# ---------------------------------------------------------------------------------------------
+# THE FIRST ACT, before anything else can throw
+# ---------------------------------------------------------------------------------------------
+#
+# The scenario library used to be dot-sourced above, ahead of every publish. Under StrictMode with
+# $ErrorActionPreference = 'Stop', a load that fails - "the system cannot find the file specified" is
+# what a missing or unreadable file gives - killed the agent having published NOTHING. From the host
+# that is indistinguishable from a guest that never booted: a running machine with an empty exchange
+# and no way to tell which. A campaign then waits out its whole idle bound learning nothing.
+#
+# So the beacon goes out first, and the load is guarded and reports its own failure.
+
+try {
+    Publish-WacCampaignValue -Name 'AgentBoot' -Value ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture))
+    Publish-WacCampaignValue -Name 'AgentFault' -Value ''
+}
+catch {
+    # No channel at all. The log is the only place left to say so, and the host will report a guest
+    # that never reported in - which is exactly what happened.
+    Write-WacCampaignAgentLog -Text ('the key-value channel is unavailable: ' + $_.Exception.Message)
+    exit 1
+}
+Write-WacCampaignAgentLog -Text '--- agent started ---'
+
+function Publish-WacCampaignFault {
+    <#
+    .SYNOPSIS
+        Publishes why the agent is stopping, with the tail of its own log behind it.
+    .DESCRIPTION
+        The tail travels because the host has no credential-bearing way to read a file in here. A
+        failure the host can see only as silence is a failure nobody can act on.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    Write-WacCampaignAgentLog -Text ('FAULT: ' + $Reason)
+    $tail = ''
+    try {
+        $text = [System.IO.File]::ReadAllText($script:LogPath)
+        $flat = ($text -replace '[
+	 ]+', ' ').Trim()
+        $tail = $(if ($flat.Length -le 700) { $flat } else { '...' + $flat.Substring($flat.Length - 700) })
+    }
+    catch { $tail = '(the agent log could not be read)' }
+
+    try {
+        Publish-WacCampaignValue -Name 'AgentFault' -Value $Reason
+        Publish-WacCampaignValue -Name 'AgentLog' -Value $tail
+        Publish-WacCampaignValue -Name 'Status' -Value 'failed'
+    }
+    catch { $null = $_ }
+}
+
+try {
+    . (Join-Path -Path $PSScriptRoot -ChildPath 'WacCampaignScenario.ps1')
+    Write-WacCampaignAgentLog -Text 'scenario library loaded'
+}
+catch {
+    Publish-WacCampaignFault -Reason ('the scenario library did not load: ' + $_.Exception.Message)
+    exit 1
 }
 
 function Publish-WacCampaignReport {
@@ -186,10 +267,11 @@ try {
     Publish-WacCampaignValue -Name 'Await' -Value ''
 }
 catch {
-    # No channel, no campaign. Exiting is correct: the host will report a guest that never reported
-    # in, which is exactly what happened.
+    # The beacon already went out, so the channel worked a moment ago and this is a NEW failure.
+    Publish-WacCampaignFault -Reason ('the agent could not announce itself: ' + $_.Exception.Message)
     exit 1
 }
+Write-WacCampaignAgentLog -Text 'announced; reading the resume state'
 
 $state = Get-WacCampaignState -Path $statePath
 
@@ -199,6 +281,7 @@ if ($null -ne $state -and [string]$state.phase -ceq 'awaiting-power-cut') {
     Publish-WacCampaignValue -Name 'Status' -Value 'resuming'
     Publish-WacCampaignValue -Name 'Step' -Value ('verifying recovery after: ' + [string]$state.cutStep)
 
+    Write-WacCampaignAgentLog -Text ('resuming after an interruption at: ' + [string]$state.cutStep)
     $result = Invoke-WacCampaignRecoveryCheck -State $state -ProjectRoot ([string]$state.projectRoot)
 
     # THE SCENARIO IS NOW FINISHED. Recording only its result and not its completion is what made the
@@ -248,6 +331,7 @@ try {
     foreach ($scenario in @($state.scenarios)) {
         if (@($state.completed) -ccontains $scenario) { continue }
 
+        Write-WacCampaignAgentLog -Text ('starting scenario: ' + $scenario)
         Publish-WacCampaignValue -Name 'Status' -Value 'running'
         Publish-WacCampaignValue -Name 'Step' -Value $scenario
 
@@ -273,6 +357,7 @@ catch {
     # while the loop is working - produced a report whose first line named a scenario that does not
     # exist and left the real one in `notRun`, so the reader had to guess which one died.
     $status = 'failed'
+    Write-WacCampaignAgentLog -Text ('the scenario loop threw: ' + $_.Exception.Message)
     $failed = @(@($state.scenarios) | Where-Object { @($state.completed) -cnotcontains $_ })
     $state.results = @(@($state.results) + [PSCustomObject]@{
             Scenario = [string]$(if ($failed.Count -gt 0) { $failed[0] } else { 'the agent itself' })
@@ -295,7 +380,18 @@ $report = [PSCustomObject]@{
     status = $status
 }
 
+Write-WacCampaignAgentLog -Text ('--- agent finished: ' + $status + ' ---')
 Publish-WacCampaignValue -Name 'Await' -Value ''
 Publish-WacCampaignReport -Json (ConvertTo-Json -InputObject $report -Depth 8 -Compress)
+if ($status -cne 'complete') {
+    # The guest's own account travels with a failure, because the host cannot go and read it.
+    try {
+        $text = [System.IO.File]::ReadAllText($script:LogPath)
+        $flat = ($text -replace '[
+	 ]+', ' ').Trim()
+        Publish-WacCampaignValue -Name 'AgentLog' -Value $(if ($flat.Length -le 700) { $flat } else { '...' + $flat.Substring($flat.Length - 700) })
+    }
+    catch { $null = $_ }
+}
 Publish-WacCampaignValue -Name 'Status' -Value $status
 exit 0
