@@ -329,4 +329,53 @@ Test-Case 'R06-3 the termination floor is granted once for a call, not once per 
     }
 }
 
+Test-Case 'R06-4 the termination floor is spent ONCE for a call, not once for every pass' {
+    # The limit this closes, stated in an earlier round: the three-pass loop breaks the moment the
+    # tree clears, so a real tree kills in pass one and the passes that would show a re-granted floor
+    # never run. A tree that keeps spawning through a kill is not safely constructible either.
+    #
+    # What makes it measurable is the ENUMERATION, which is the loop's own continue condition and the
+    # only step in it that a test can hold still. Shimmed to answer "one more id" every time, the
+    # loop runs its full three passes; shimmed to take 150 ms doing so, the caller's bound is really
+    # being spent, which is the only condition under which the floor is visible at all - a floor of
+    # min(1000, TimeoutMs) is invisible while the remaining budget is still larger than it.
+    #
+    # The id it answers with is owned by nothing, so it binds nothing, terminates nothing and leaves
+    # the verdict alone: this case measures the ACCOUNTING, and GrantedWaitMs is what the call says
+    # it handed out. A 200 ms bound plus one floor is ~250 ms of grant; a floor re-granted per pass
+    # is three of them.
+    $realEnum = Get-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId'
+    $child = $null
+    try {
+        $child = Start-Process -FilePath $script:HostExe -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30')
+
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId' -Body {
+            param([Parameter(Mandatory = $true)][int]$ProcessId)
+            $null = $ProcessId
+            # Real elapsed time, so the remaining budget actually shrinks between passes. Nothing
+            # owns id 0xFFFFFFC, so binding it fails with ERROR_INVALID_PARAMETER and the loop keeps
+            # going without acquiring a handle to anything.
+            Start-Sleep -Milliseconds 150
+            return @(268435452)
+        }
+
+        $result = Stop-WacProcessTree -ProcessId $child.Id -TimeoutMs 200
+
+        Assert-True ($null -ne $result.GrantedWaitMs) 'the termination result no longer states what it granted, so nothing here is measurable'
+        Assert-True ([int]$result.GrantedWaitMs -le 400) `
+            ('a 200 ms bound handed out {0} ms of termination grant, so the floor was granted again on every pass' -f [int]$result.GrantedWaitMs)
+        # A lower bound only, and it is not the floor's proof: at the first pass the remaining budget
+        # is still the whole bound, so min(1000, TimeoutMs) never binds there. What this catches is a
+        # call that granted nothing at all - the shape in which the ceiling above would pass
+        # vacuously.
+        Assert-True ([int]$result.GrantedWaitMs -ge 150) `
+            ('the call granted {0} ms, so the loop this measures did not run and the ceiling above proves nothing' -f [int]$result.GrantedWaitMs)
+    }
+    finally {
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId' -Body $realEnum
+        if ($child) { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Complete-TestRun
