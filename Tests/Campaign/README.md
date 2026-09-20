@@ -148,11 +148,17 @@ Full list and evidence: `.ai/BUGS.md`.
 ### What is still open
 
 Isolation between SCENARIOS works: one guest boot each, base checkpoint restored between them.
-Isolation between CAMPAIGNS does not - the driver takes its base checkpoint at campaign start, so
-residue the previous campaign left is inside the baseline. The guest now carries an outstanding
-uninstall intent, and `power-loss-during-uninstall` fails in its prepare step because the product
-correctly refuses to install over it. Until a clean base is guaranteed, neither cut scenario has a
-verdict worth quoting.
+Isolation between CAMPAIGNS is now handled in code but **not yet proven on the guest**. The driver
+takes its base checkpoint at campaign start, so residue from a previous run sat inside the baseline
+every scenario was returned to. The agent now brings the machine back to a clean state before any
+scenario runs - using the product's own uninstaller, which is the documented way to resolve an
+outstanding intent - then reads the machine AGAIN and **refuses the entire campaign** if it still is
+not clean. The verdict comes from looking, never from an exit code, and the post-cut resume path
+never resets, because there the machine's state is the evidence. It publishes
+`Baseline = clean | polluted` so the host can see which happened.
+
+Unit-tested and mutation-proved; the live run to confirm it has not completed. Until it has, neither
+cut scenario has a verdict worth quoting.
 
 ### Reading a silent guest, so the next run is not wasted
 
