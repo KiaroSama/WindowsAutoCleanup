@@ -114,55 +114,57 @@ The resume point is written to disk **before** the cut is requested. After the p
 | --- | --- | --- |
 | `service-dispatched-maintenance` | **passed** (twice) | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 and 204 entries / 13.4 and 14.8 MB actually removed, read from the run's own `.summary.json` |
 | `reboot-recovery` | **passed** (twice) | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
-| `power-loss-during-install` | **failed** | the recovery path exited 0 and left `Run.ps1` deployed with NO task registered |
-| `power-loss-during-uninstall` | **failed** | a later install ran to exit 0 instead of being fenced by the interrupted removal's intent |
+| `power-loss-during-install` | no trustworthy verdict | the harness between the cut and the verdict had to be repaired six times; campaign-to-campaign isolation is still open |
+| `power-loss-during-uninstall` | the same | the product's FR-015 fence WAS seen working after a real cut - see below |
 
-### The two cut scenarios report now, and what they report is a product defect
+### Two product findings were filed from these scenarios and both were RETRACTED
 
-Both ran end to end for the first time on 2026-09-20, against commit `075ddf1`, each on its own
-guest boot with the base checkpoint restored between them. The guest came back 14 s and 13 s after
-its cuts. Neither is blocked any more, and neither passes:
+On 2026-09-20 the first complete run produced `recoveryExit=0 tasksRegistered=0` and
+`installerRefused=False`, and those were published as two product defects. Both were wrong:
+
+- The "recovery that succeeded without registering" was a **crash**, on
+  `src/WindowsAutoCleanup.TrustedStore.ps1:1 char:1` - a file whose first bytes never reached the
+  disk, because the campaign extracts the project and the very next thing the scenario does is cut
+  the power. The product was running from a half-written copy of itself.
+- The "fence that did not engage" **did** engage, word for word as FR-015 requires: *Refusing to
+  install: An uninstall intent is outstanding or unreadable. Resume the uninstaller; no task or
+  deployment was resurrected.* It returned 1; the campaign read 0.
+
+Both misreadings share one cause. `Invoke-WacCampaignHost` never touched the child's `.Handle`
+before it exited, and under Windows PowerShell 5.1 - which is what the guest agent runs - that
+returns an empty exit code. Measured here with a child that definitely exits 1:
 
 ```text
-power-loss-during-install     recoveryExit=0 tasksRegistered=0 deployedRunPresent=True
-power-loss-during-uninstall   installerRefused=False uninstallExit=0 tasksRemaining=0
+Windows PowerShell 5.1   no handle read -> ExitCode=(empty)    handle touched -> ExitCode=1
+PowerShell 7             both shapes    -> ExitCode=1
 ```
 
-Re-running the installer IS the documented recovery, and after a cut it reported success while
-leaving files without a registration - half a transaction, declared whole. After a cut during
-uninstall, the durable intent that is supposed to fence the next install did not fence it. Detail,
-the single hypothesis that fits both, and why it is recorded rather than patched in the same
-session: `.ai/BUGS.md`.
+**The standing lesson: a red test is a claim about the system under test only once the harness
+between them is known good.** Six harness defects were removed before these scenarios said anything
+about the product at all - a sticky beacon read as a fresh signal (twice), two files documented as
+flushed that were not, the exit code above, and a killed run's state inherited by the next campaign.
+Full list and evidence: `.ai/BUGS.md`.
 
-**This is the campaign paying for itself.** Continuous integration cannot lose power, so neither
-finding was reachable from it, and both are about what the machine looks like AFTERWARDS rather than
-about which code path ran.
+### What is still open
+
+Isolation between SCENARIOS works: one guest boot each, base checkpoint restored between them.
+Isolation between CAMPAIGNS does not - the driver takes its base checkpoint at campaign start, so
+residue the previous campaign left is inside the baseline. The guest now carries an outstanding
+uninstall intent, and `power-loss-during-uninstall` fails in its prepare step because the product
+correctly refuses to install over it. Until a clean base is guaranteed, neither cut scenario has a
+verdict worth quoting.
 
 ### Reading a silent guest, so the next run is not wasted
-
-Earlier readings of these scenarios were wrong twice and are retracted: the guest was not unable to
-come back (it returns in **13-20 seconds**, measured repeatedly), and the Group Policy silence was
-not starvation - there the heartbeat was healthy and only the agent was missing. A silence has to be
-split before it means anything:
 
 | what the host sees after the cut | what it means |
 | --- | --- |
 | heartbeat never returns, `MemoryAssigned` stuck at the floor | the HOST starved the guest. No evidence about the product, the campaign or the arming. |
 | heartbeat OK, memory assigned, no `AgentBoot` | nothing started inside the guest. That is a real finding about the arming. |
 
-The way to stop producing the first kind is not to wait for an idle host, which is a condition
-nobody can prove. Give the guest **static** memory for the run: Hyper-V must then commit the whole
-allocation at start, so either the guest holds all of it or `Start-VM` fails immediately and says
-so. An honest refusal beats a guest that starves in silence for fifteen minutes.
+Do not wait for an idle host, which is a condition nobody can prove. Give the guest **static** memory
+for the run: Hyper-V must then commit the whole allocation at start, so either the guest holds all of
+it or `Start-VM` fails immediately and says so. Note that restoring a checkpoint also restores the
+memory configuration recorded in it.
 
-### A beacon is judged by its timestamp, never by being present
-
-Key-Value Pair Exchange is sticky - the guest's registry keeps the last value written until
-something overwrites it - so "a beacon is there" says nothing about this boot. Three separate
-readers in this campaign got that wrong and each produced a confident wrong answer: one accepted an
-`AgentReady` from an hour earlier, one re-cut the power on an `Await` the powered-off guest never
-got to clear, and a probe declared a recovery on a value that predated the cut. Compare the
-beacon's OWN timestamp against the instant of the event; a stale read then fails by arithmetic.
-
-The same class bit the agent's own resume file, which documented itself as flushed and was not.
-A harness that measures crash durability has to be crash durable first.
+A task-armed guest does come back from a hard cut - **13 to 20 seconds**, measured repeatedly - and
+the Group Policy arming it replaced did not. That much is settled.
