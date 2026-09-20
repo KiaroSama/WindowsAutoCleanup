@@ -180,6 +180,16 @@ function Invoke-WacCampaignHost {
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -PassThru `
         -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
 
+    # Touch Handle while the child is still alive, or every exit code below is a LIE. Windows
+    # PowerShell 5.1 returns 0 from `Start-Process -PassThru`'s ExitCode unless the handle was
+    # cached before the process went away - this project measured that across three shapes and
+    # wrote it down, and the product's own elevation path does exactly this at
+    # Install-WindowsAutoCleanupTask.ps1. The campaign did not, and so read a correct FR-015
+    # refusal (exit 1, message and all) as a successful install, and a recovery run that crashed on
+    # a damaged source file as a clean exit 0. Two verdicts about the product that were really
+    # verdicts about this line.
+    try { $null = $process.Handle } catch { $null = $_ }
+
     if ($PassThruProcess) {
         return [PSCustomObject]@{ Process = $process; OutFile = $outFile; ErrFile = $errFile; ExitCode = $null; Output = '' }
     }
@@ -370,22 +380,38 @@ function Invoke-WacCampaignRecoveryCheck {
         $tasks = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
 
         $verdict = if ($refused -and $named -and $finish.ExitCode -eq 0 -and $tasks.Count -eq 0) { 'passed' } else { 'failed' }
+        $intent = (Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup') + '.uninstall.json'
         return [PSCustomObject]@{ Scenario = $scenario; Verdict = $verdict
-            Detail = ('installerRefused={0} refusalNamedTheRecord={1} uninstallExit={2} tasksRemaining={3}' -f
-                $refused, $named, $finish.ExitCode, $tasks.Count) }
+            Detail = ('installerRefused={0} refusalNamedTheRecord={1} uninstallExit={2} tasksRemaining={3} || intentPresent={4} || the install said: {5}' -f
+                $refused, $named, $finish.ExitCode, $tasks.Count,
+                (Test-Path -LiteralPath $intent -PathType Leaf),
+                (Get-WacCampaignTail -Text ([string]$premature.Output))) }
     }
+
+    # What the interrupted run LEFT, read BEFORE the recovery is allowed to consume it. A bare
+    # "no task registered" names a symptom and no cause; which records survived the cut separates
+    # "the journal never reached the disk" from "the journal was read and the recovery did not
+    # finish the job it described".
+    $deploymentRoot = Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup'
+    $suffixes = @('.transaction.json', '.taskcapture.json', '.uninstall.json')
+    $before = @($suffixes | Where-Object { Test-Path -LiteralPath ($deploymentRoot + $_) -PathType Leaf })
+    $tasksBefore = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
+    $runBefore = Test-Path -LiteralPath (Join-Path $deploymentRoot 'Run.ps1') -PathType Leaf
 
     $recovery = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
     $tasks = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
-    $deploymentRoot = Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup'
     $runPresent = Test-Path -LiteralPath (Join-Path $deploymentRoot 'Run.ps1') -PathType Leaf
+    $after = @($suffixes | Where-Object { Test-Path -LiteralPath ($deploymentRoot + $_) -PathType Leaf })
 
     # The pair is the claim: one generation's files under that same generation's registration. A
     # registered task pointing at files that are not there is the defect this scenario hunts.
     $coherent = ($recovery.ExitCode -eq 0) -and ($tasks.Count -eq 1) -and $runPresent
     return [PSCustomObject]@{ Scenario = $scenario; Verdict = $(if ($coherent) { 'passed' } else { 'failed' })
-        Detail = ('recoveryExit={0} tasksRegistered={1} deployedRunPresent={2} resumeKind={3}' -f
-            $recovery.ExitCode, $tasks.Count, $runPresent, [string]$State.resumeKind) }
+        Detail = ('recoveryExit={0} tasksRegistered={1} deployedRunPresent={2} resumeKind={3} || after the cut records=[{4}] tasks={5} run={6} || after recovery records=[{7}] || it said: {8}' -f
+            $recovery.ExitCode, $tasks.Count, $runPresent, [string]$State.resumeKind,
+            (($before | ForEach-Object { $_.Trim('.') }) -join ','), $tasksBefore.Count, $runBefore,
+            (($after | ForEach-Object { $_.Trim('.') }) -join ','),
+            (Get-WacCampaignTail -Text ([string]$recovery.Output))) }
 }
 
 function Invoke-WacCampaignScenario {
