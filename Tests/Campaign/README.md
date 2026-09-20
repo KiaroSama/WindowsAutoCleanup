@@ -114,39 +114,35 @@ The resume point is written to disk **before** the cut is requested. After the p
 | --- | --- | --- |
 | `service-dispatched-maintenance` | **passed** (twice) | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 and 204 entries / 13.4 and 14.8 MB actually removed, read from the run's own `.summary.json` |
 | `reboot-recovery` | **passed** (twice) | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
-| `power-loss-during-install` | unblocked, no scenario verdict yet | the agent's return after a cut is now proven (below); the scenario's own pass/fail needs a full campaign run |
-| `power-loss-during-uninstall` | the same | the same |
+| `power-loss-during-install` | **failed** | the recovery path exited 0 and left `Run.ps1` deployed with NO task registered |
+| `power-loss-during-uninstall` | **failed** | a later install ran to exit 0 instead of being fenced by the interrupted removal's intent |
 
-### The power-cut blocker is closed: a task-armed guest DOES come back
+### The two cut scenarios report now, and what they report is a product defect
 
-The agent publishes `AgentBoot` as its first act, before anything else can throw. On a **GP-armed**
-guest it never appeared at all after a hard cut, on a guest that was Running with memory assigned
-and its heartbeat back - nothing started, so nothing reported. That is a defect of the arming, and
-it is now demonstrated as such: with the machine carrying the **scheduled task instead**, and the
-Group Policy startup script removed so the task was the only start path left, a deliberate cut taken
-at the instant the guest asked for it was answered by a fresh beacon **13 seconds later**.
+Both ran end to end for the first time on 2026-09-20, against commit `075ddf1`, each on its own
+guest boot with the base checkpoint restored between them. The guest came back 14 s and 13 s after
+its cuts. Neither is blocked any more, and neither passes:
 
 ```text
-cut at  2026-09-20T00:45:38Z
-beacon  2026-09-20T00:45:52Z   (+13 s, agent log: "--- agent started ---")
+power-loss-during-install     recoveryExit=0 tasksRegistered=0 deployedRunPresent=True
+power-loss-during-uninstall   installerRefused=False uninstallExit=0 tasksRemaining=0
 ```
 
-A guest armed from the HOST can only be armed with a local Group Policy machine startup script,
-whose registration the Group Policy service keeps in the registry, and a dirty shutdown can roll
-that back leaving nothing for `gpscript.exe /startup` to run. The scheduled task goes through Task
-Scheduler's own transactional store, which is the mechanism designed to survive exactly this. The
-measurement above is what turns that from a plausible story into the answer.
+Re-running the installer IS the documented recovery, and after a cut it reported success while
+leaving files without a registration - half a transaction, declared whole. After a cut during
+uninstall, the durable intent that is supposed to fence the next install did not fence it. Detail,
+the single hypothesis that fits both, and why it is recorded rather than patched in the same
+session: `.ai/BUGS.md`.
 
-**What this does NOT say.** It does not say the two scenarios pass. The recovered agent resumed its
-interrupted work (`Status=running`, `Step=power-loss-during-install`) and the probe stopped watching
-before the scenario reached its own verdict, because the question being answered was whether
-anything came back at all. Both scenarios now need one ordinary campaign run to report themselves.
+**This is the campaign paying for itself.** Continuous integration cannot lose power, so neither
+finding was reachable from it, and both are about what the machine looks like AFTERWARDS rather than
+about which code path ran.
 
 ### Reading a silent guest, so the next run is not wasted
 
-Two earlier readings of these failures were wrong and are retracted: they were not a guest that
-could not come back (it returns in **13 seconds**, measured twice), and the GP-armed silence was not
-starvation - there the heartbeat was healthy and only the agent was missing. A silence has to be
+Earlier readings of these scenarios were wrong twice and are retracted: the guest was not unable to
+come back (it returns in **13-20 seconds**, measured repeatedly), and the Group Policy silence was
+not starvation - there the heartbeat was healthy and only the agent was missing. A silence has to be
 split before it means anything:
 
 | what the host sees after the cut | what it means |
@@ -155,11 +151,18 @@ split before it means anything:
 | heartbeat OK, memory assigned, no `AgentBoot` | nothing started inside the guest. That is a real finding about the arming. |
 
 The way to stop producing the first kind is not to wait for an idle host, which is a condition
-nobody can prove. It is to give the guest **static** memory for the run: Hyper-V must then commit
-the whole allocation at start, so either the guest holds all of it or `Start-VM` fails immediately
-and says so. An honest refusal beats a guest that starves in silence for fifteen minutes.
+nobody can prove. Give the guest **static** memory for the run: Hyper-V must then commit the whole
+allocation at start, so either the guest holds all of it or `Start-VM` fails immediately and says
+so. An honest refusal beats a guest that starves in silence for fifteen minutes.
 
-And `AgentBoot` is a sticky value - the guest's registry keeps the previous boot's timestamp until
-something overwrites it - so "a beacon is present" proves nothing. Compare the beacon's OWN
-timestamp against the instant of the cut. A stale read during the reboot window then fails by
-arithmetic instead of being mistaken for a recovery.
+### A beacon is judged by its timestamp, never by being present
+
+Key-Value Pair Exchange is sticky - the guest's registry keeps the last value written until
+something overwrites it - so "a beacon is there" says nothing about this boot. Three separate
+readers in this campaign got that wrong and each produced a confident wrong answer: one accepted an
+`AgentReady` from an hour earlier, one re-cut the power on an `Await` the powered-off guest never
+got to clear, and a probe declared a recovery on a value that predated the cut. Compare the
+beacon's OWN timestamp against the instant of the event; a stale read then fails by arithmetic.
+
+The same class bit the agent's own resume file, which documented itself as flushed and was not.
+A harness that measures crash durability has to be crash durable first.
