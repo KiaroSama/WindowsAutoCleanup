@@ -325,4 +325,62 @@ Test-Case 'The resume point is on the DISK before the cut, not merely in the wri
     finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
 }
 
+Test-Case 'Every exit code the campaign reads is cached before the child exits' {
+    # Windows PowerShell 5.1 returns 0 from `Start-Process -PassThru`'s ExitCode unless the handle
+    # was touched while the child was still alive. This project measured that across three shapes
+    # and wrote it down, and the product's own elevation path applies it - the campaign did not.
+    # The cost, on 2026-09-20: a correct FR-015 refusal that exited 1 with its message printed was
+    # read as a successful install, and a recovery run that crashed on a damaged source file was
+    # read as a clean exit 0. Two verdicts about the PRODUCT that were verdicts about one line.
+    $scenarioPath = Join-Path -Path $script:CampaignRoot -ChildPath 'WacCampaignScenario.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($scenarioPath, [ref]$null, [ref]$null)
+    $fn = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Invoke-WacCampaignHost'
+            }, $true))
+    Assert-Equal 1 $fn.Count 'the campaign no longer defines exactly one Invoke-WacCampaignHost'
+
+    # ADJACENCY, not just order. "Somewhere before the wait" is too weak twice over: a fast child
+    # can exit inside any gap left before the read, and this function returns EARLY on
+    # -PassThruProcess, so a read placed after that branch never happens at all on the path the
+    # interruption scenarios use. The property is that the handle is taken in the very next
+    # statement after the child is started.
+    $statements = @($fn[0].Body.EndBlock.Statements | ForEach-Object { [string]$_.Extent.Text })
+    $start = -1
+    for ($i = 0; $i -lt $statements.Count; $i++) {
+        if ($statements[$i].IndexOf('Start-Process', [System.StringComparison]::Ordinal) -ge 0) { $start = $i; break }
+    }
+    Assert-True ($start -ge 0) 'the campaign no longer starts the child with Start-Process'
+    Assert-True (($start + 1) -lt $statements.Count) 'nothing follows the Start-Process call at all'
+    Assert-True ($statements[$start + 1].IndexOf('.Handle', [System.StringComparison]::Ordinal) -ge 0) `
+        ('the statement right after Start-Process does not read the child handle, so an ExitCode this campaign reports can be a false 0 on 5.1; it is: ' + $statements[$start + 1])
+}
+
+Test-Case 'The extracted project is on the disk before a scenario can cut the power' {
+    # The guest unpacks the project and the very next thing a power-cut scenario does is cut the
+    # power. `ExtractToDirectory` returns with the files in the write cache, so without this the
+    # recovery boot runs the product from a half-written copy of ITSELF. Measured 2026-09-20: the
+    # resumed installer died on `src\WindowsAutoCleanup.TrustedStore.ps1:1 char:1` with "the term
+    # ' ' is not recognized" - a file whose first bytes never landed - and the scenario reported
+    # that as a product defect.
+    $agentPath = Join-Path -Path $script:CampaignRoot -ChildPath 'WacCampaignAgent.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($agentPath, [ref]$null, [ref]$null)
+    $fn = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Expand-WacCampaignProject'
+            }, $true))
+    Assert-Equal 1 $fn.Count 'the agent no longer defines exactly one Expand-WacCampaignProject'
+
+    $calls = @($fn[0].FindAll({
+                param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+            }, $true))
+    $flush = @($calls | Where-Object {
+            [string]$_.Member.Extent.Text -ceq 'Flush' -and
+            ([string]$_.Extent.Text).Replace(' ', '').EndsWith('.Flush($true)', [System.StringComparison]::Ordinal)
+        })
+    Assert-Equal 1 $flush.Count 'the extracted tree is not flushed to the device, so a cut can leave the product half-written'
+}
+
 Complete-TestRun

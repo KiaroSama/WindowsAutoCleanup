@@ -346,6 +346,26 @@ function Expand-WacCampaignProject {
     if (-not (Test-Path -LiteralPath $run -PathType Leaf)) {
         throw ('The delivered package does not contain Run.ps1 at {0}.' -f $run)
     }
+
+    # Force the whole tree onto the DEVICE before anything runs against it. `ExtractToDirectory`
+    # returns with the files in the operating system's write cache, and the very next thing a
+    # power-cut scenario does is cut the power - so the recovery boot runs the product from a
+    # half-written copy of itself. Measured on 2026-09-20: the resumed installer died on
+    # `src\WindowsAutoCleanup.TrustedStore.ps1:1 char:1` with "the term ' ' is not recognized",
+    # which is a file whose first bytes never landed, and the scenario reported that as a product
+    # defect. Re-opening each file and flushing is a second or two on a tree this size and it is
+    # the difference between testing the product and testing the cache.
+    foreach ($file in @(Get-ChildItem -LiteralPath $Destination -Recurse -File -ErrorAction SilentlyContinue)) {
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open($file.FullName, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            $stream.Flush($true)
+        }
+        catch { $null = $_ }
+        finally { if ($null -ne $stream) { $stream.Dispose() } }
+    }
+
     return $Destination
 }
 
@@ -402,6 +422,19 @@ catch {
 Write-WacCampaignAgentLog -Text 'announced; reading the resume state'
 
 $state = Get-WacCampaignState -Path $statePath
+
+# ONLY a run standing at a cut point may be resumed. A state in any other phase is business the
+# previous campaign did not finish - it was killed, or it ended - and carrying it into the next
+# request makes the guest replay somebody else's plan: measured 2026-09-20, a campaign inherited a
+# killed run's `completed` list, skipped the scenario it had been asked for, and filed the OTHER
+# scenario's verdict twice under both names. The host cannot clear this file (it can deliver files
+# and read what the guest publishes, and nothing else), so the guest has to refuse to inherit it.
+if ($null -ne $state -and [string]$state.phase -cne 'awaiting-power-cut') {
+    Write-WacCampaignAgentLog -Text ('discarding a stale campaign state: phase=' + [string]$state.phase +
+        ' campaign=' + [string]$state.campaignId + '; only a run stopped at a cut point is resumable')
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+    $state = $null
+}
 
 if ($null -ne $state -and [string]$state.phase -ceq 'awaiting-power-cut') {
     # THIS IS THE POST-CRASH BOOT. The machine really did lose power between the previous line of
