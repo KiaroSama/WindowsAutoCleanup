@@ -101,6 +101,75 @@ catch {
 }
 Write-WacCampaignAgentLog -Text '--- agent started ---'
 
+function Reset-WacCampaignMachine {
+    <#
+    .SYNOPSIS
+        Brings this guest to the baseline a campaign assumes - nothing installed, no records
+        outstanding - and PROVES it, or refuses to let the campaign start.
+    .DESCRIPTION
+        Isolation between SCENARIOS already worked: the host restores its base checkpoint between
+        them. Isolation between CAMPAIGNS did not, because that checkpoint is taken at campaign
+        START, so whatever the previous campaign left is inside the baseline every scenario is
+        returned to. Measured 2026-09-20: a killed run left an outstanding uninstall intent in
+        Program Files, and every later `power-loss-during-uninstall` then failed in its prepare
+        step - the product correctly refusing to install over residue the campaign had left itself.
+        A verdict from that machine is a verdict about the previous campaign.
+
+        The host cannot clean this up: it can deliver files and read what the guest publishes, and
+        nothing else. So the guest does it, using the product's OWN uninstaller - the documented way
+        to resolve an outstanding intent is to resume it, which is exactly what running the
+        uninstaller does - and then verifies the result rather than assuming it.
+
+        Fail-closed by design. The return value is the evidence, not the attempt: if a task, a
+        deployment root or a transaction record is still there afterwards, the caller refuses to run
+        a campaign at all. A polluted machine that produces verdicts is worse than one that says so.
+    #>
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+    $deploymentRoot = Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup'
+    $records = @('.transaction.json', '.taskcapture.json', '.uninstall.json')
+
+    $describe = {
+        $found = @()
+        foreach ($suffix in $records) {
+            if (Test-Path -LiteralPath ($deploymentRoot + $suffix) -PathType Leaf) { $found += $suffix.Trim('.') }
+        }
+        $tasks = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
+        return [PSCustomObject]@{
+            Records = $found
+            Tasks = $tasks.Count
+            Root = (Test-Path -LiteralPath $deploymentRoot)
+            Clean = ($found.Count -eq 0 -and $tasks.Count -eq 0 -and -not (Test-Path -LiteralPath $deploymentRoot))
+        }
+    }
+
+    $before = & $describe
+    if ($before.Clean) {
+        Write-WacCampaignAgentLog -Text 'machine baseline: already clean'
+        return [PSCustomObject]@{ Clean = $true; Detail = 'already clean'; Attempted = $false }
+    }
+
+    Write-WacCampaignAgentLog -Text ('machine baseline: residue found - records=[{0}] tasks={1} root={2}; resuming the uninstaller' -f
+        ($before.Records -join ','), $before.Tasks, $before.Root)
+
+    $uninstaller = Join-Path -Path $ProjectRoot -ChildPath 'Uninstall-WindowsAutoCleanupTask.ps1'
+    $ran = Invoke-WacCampaignHost -ScriptPath $uninstaller -ArgumentList @('-NoPause')
+
+    $after = & $describe
+    $detail = ('before: records=[{0}] tasks={1} root={2} | uninstaller exit={3} | after: records=[{4}] tasks={5} root={6}' -f
+        ($before.Records -join ','), $before.Tasks, $before.Root, $ran.ExitCode,
+        ($after.Records -join ','), $after.Tasks, $after.Root)
+
+    if ($after.Clean) {
+        Write-WacCampaignAgentLog -Text ('machine baseline: restored. ' + $detail)
+    }
+    else {
+        Write-WacCampaignAgentLog -Text ('machine baseline: NOT restored. ' + $detail + ' | it said: ' +
+            (Get-WacCampaignTail -Text ([string]$ran.Output)))
+    }
+    return [PSCustomObject]@{ Clean = $after.Clean; Detail = $detail; Attempted = $true }
+}
+
 function Set-WacCampaignDurableArming {
     <#
     .SYNOPSIS
@@ -469,6 +538,17 @@ elseif ($null -eq $state) {
 
     $projectRoot = Expand-WacCampaignProject -Archive $archivePath `
         -Destination (Join-Path -Path $workRoot -ChildPath ([string]$request.commit).Substring(0, 12))
+
+    # A campaign starts from a known machine or it does not start. The host's base checkpoint is
+    # taken around whatever is here, so residue left by a previous campaign would otherwise be
+    # restored between every scenario as if it were the baseline.
+    Publish-WacCampaignValue -Name 'Step' -Value 'returning the machine to a clean baseline'
+    $baseline = Reset-WacCampaignMachine -ProjectRoot $projectRoot
+    Publish-WacCampaignValue -Name 'Baseline' -Value $(if ($baseline.Clean) { 'clean' } else { 'polluted' })
+    if (-not $baseline.Clean) {
+        Publish-WacCampaignFault -Reason ('this guest could not be returned to a clean baseline, so no scenario ran: ' + $baseline.Detail)
+        exit 1
+    }
 
     $state = [PSCustomObject]@{
         campaignId = [string]$request.campaignId

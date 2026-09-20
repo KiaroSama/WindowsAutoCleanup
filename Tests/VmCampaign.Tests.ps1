@@ -383,4 +383,48 @@ Test-Case 'The extracted project is on the disk before a scenario can cut the po
     Assert-Equal 1 $flush.Count 'the extracted tree is not flushed to the device, so a cut can leave the product half-written'
 }
 
+Test-Case 'A campaign starts from a proven-clean machine, or it does not start' {
+    # Isolation between SCENARIOS already worked - the host restores its base checkpoint between
+    # them. Isolation between CAMPAIGNS did not, because that checkpoint is taken at campaign START:
+    # residue from a previous run sits inside the baseline every scenario is returned to. Measured
+    # 2026-09-20, a killed campaign left an outstanding uninstall intent and every later
+    # power-loss-during-uninstall failed in its prepare step, with the product correctly refusing to
+    # install over it. A verdict from that machine is a verdict about the previous campaign.
+    $agentPath = Join-Path -Path $script:CampaignRoot -ChildPath 'WacCampaignAgent.ps1'
+    $text = [System.IO.File]::ReadAllText($agentPath)
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($agentPath, [ref]$null, [ref]$null)
+
+    $reset = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Reset-WacCampaignMachine'
+            }, $true))
+    Assert-Equal 1 $reset.Count 'the agent does not bring the machine to a baseline before a campaign'
+
+    # The verdict has to come from LOOKING again, never from the uninstaller's exit code: "the
+    # command succeeded" and "the machine is clean" are different claims, and only the second one
+    # is what the next scenario depends on.
+    $body = [string]$reset[0].Extent.Text
+    Assert-True ($body -match 'Clean\s*=\s*\$after\.Clean') `
+        'the baseline verdict is not read back from the machine after the attempt'
+    Assert-False ($body -match 'Clean\s*=\s*\(?\$ran\.ExitCode') `
+        'the baseline is declared clean from an exit code instead of from the machine'
+
+    # And it must FAIL CLOSED at the call site: a polluted machine that produces verdicts is worse
+    # than one that says it cannot.
+    $guard = [regex]::Match($text, 'if \(-not \$baseline\.Clean\) \{(?<body>[^}]*)\}')
+    Assert-True $guard.Success 'nothing refuses the campaign when the baseline could not be restored'
+    Assert-True ($guard.Groups['body'].Value -match 'Publish-WacCampaignFault') `
+        'the refusal is silent; the host would see a campaign that simply stopped'
+    Assert-True ($guard.Groups['body'].Value -match 'exit\s') `
+        'the agent reports the polluted baseline and then runs the scenarios anyway'
+
+    # The resume path must NOT touch it: after a power cut the machine's state IS the evidence, and
+    # resetting it would destroy exactly what the scenario came back to verify.
+    $resume = [regex]::Match($text, "if \(\`$null -ne \`$state -and \[string\]\`$state\.phase -ceq 'awaiting-power-cut'\) \{(?<body>(?s).*?)\r?\n\}")
+    Assert-True $resume.Success 'the post-crash resume branch could not be located'
+    Assert-False ($resume.Groups['body'].Value -match 'Reset-WacCampaignMachine') `
+        'the resume path resets the machine, which erases the state the cut was taken to produce'
+}
+
 Complete-TestRun
