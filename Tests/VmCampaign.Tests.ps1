@@ -275,4 +275,54 @@ Test-Case 'No reader in the campaign takes a beacon on presence alone' {
     }
 }
 
+Test-Case 'The resume point is on the DISK before the cut, not merely in the write cache' {
+    # The one file in this project whose only purpose is to survive a power cut. Its writer used to
+    # say "written and flushed first, every time" and call File::WriteAllText, which flushes
+    # nothing - it returns once Windows has the bytes in its cache, and the cache is exactly what
+    # the cut discards. Measured on 2026-09-20: the guest was cut mid-install, came back in twenty
+    # seconds, read NO resume state and went to "waiting for the host to deliver a request", so the
+    # scenario stopped testing recovery and waited instead.
+    #
+    # Asserted on the writer rather than by cutting power in a unit test, because the difference is
+    # invisible to any read that happens while the machine is still on: a cached write and a durable
+    # one both read back perfectly.
+    $agentPath = Join-Path -Path $script:CampaignRoot -ChildPath 'WacCampaignAgent.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($agentPath, [ref]$null, [ref]$null)
+    $fn = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Save-WacCampaignState'
+            }, $true))
+    Assert-Equal 1 $fn.Count 'the agent no longer defines exactly one Save-WacCampaignState'
+    $body = [string]$fn[0].Extent.Text
+
+    # Asserted over the CALLS the function makes, not over its text: the explanation above names
+    # WriteAllText to say why it is wrong, and a text search cannot tell an argument from a warning.
+    $calls = @($fn[0].FindAll({
+                param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+            }, $true))
+    $members = @($calls | ForEach-Object { [string]$_.Member.Extent.Text })
+
+    Assert-False ($members -ccontains 'WriteAllText') `
+        'the resume point is written with WriteAllText again, which returns before the bytes reach the disk'
+
+    $flush = @($calls | Where-Object {
+            [string]$_.Member.Extent.Text -ceq 'Flush' -and
+            ([string]$_.Extent.Text).Replace(' ', '').EndsWith('.Flush($true)', [System.StringComparison]::Ordinal)
+        })
+    Assert-Equal 1 $flush.Count `
+        'the resume point is not flushed to the device with Flush($true); a cut in the cache window loses the only file that matters'
+
+    # And it still has to produce a file the reader can parse, or durability bought nothing.
+    . ([scriptblock]::Create($body))
+    $tmp = Join-Path -Path ([System.IO.Path]::GetTempPath()) ('wac-state-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        Save-WacCampaignState -Path $tmp -State ([PSCustomObject]@{ phase = 'awaiting-power-cut'; cutStep = 'power-loss-during-install' })
+        $read = [System.IO.File]::ReadAllText($tmp) | ConvertFrom-Json
+        Assert-Equal 'awaiting-power-cut' ([string]$read.phase) 'the durable writer did not round-trip the phase'
+        Assert-Equal 'power-loss-during-install' ([string]$read.cutStep) 'the durable writer did not round-trip the cut step'
+    }
+    finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
+}
+
 Complete-TestRun

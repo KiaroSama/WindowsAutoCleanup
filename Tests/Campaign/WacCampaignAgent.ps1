@@ -296,17 +296,37 @@ function Get-WacCampaignState {
 function Save-WacCampaignState {
     <#
     .SYNOPSIS
-        Writes the resume point to disk BEFORE the action it describes.
+        Writes the resume point BEFORE the action it describes, and does not return until the bytes
+        are on the DEVICE rather than merely in the operating system's write cache.
     .DESCRIPTION
-        Written and flushed first, every time. A state file written after the thing it records is a
-        state file that does not exist when the power goes - which is the only moment it is for.
+        The previous version said "written and flushed first, every time" and called
+        `File::WriteAllText`, which flushes nothing: it returns once Windows has accepted the data
+        into its cache, and the cache is exactly what a power cut discards. The comment asserted a
+        property the code did not implement, on the one file in this project whose only purpose is
+        to survive that cut.
+
+        Measured cost, 2026-09-20: the guest was cut mid-install, came back in twenty seconds, read
+        NO resume state and went to "waiting for the host to deliver a request". `ConvertFrom-Json`
+        returns $null for an absent or half-written file and the agent cannot tell those apart from
+        a first run, so the scenario stopped testing recovery and quietly waited instead - a harness
+        that measures crash durability, not being crash durable itself.
+
+        `FileStream.Flush($true)` issues FlushFileBuffers, which is the difference between "Windows
+        has the bytes" and "the disk has the bytes".
     #>
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)]$State)
 
     $directory = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory -Force) }
-    [System.IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $State -Depth 8),
-        (New-Object System.Text.UTF8Encoding($false)))
+
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes((ConvertTo-Json -InputObject $State -Depth 8))
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
 }
 
 function Expand-WacCampaignProject {
