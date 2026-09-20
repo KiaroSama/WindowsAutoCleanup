@@ -195,4 +195,84 @@ Test-Case 'The FIRST thing the driver does on its way out is stop the guest' {
         'the guest is restored before it is stopped; a running machine cannot be restored coherently'
 }
 
+
+Test-Case 'A sticky beacon is judged by its OWN timestamp, not by being present' {
+    # The defect this replaces cost a real run twice over. Key-Value Pair Exchange keeps the last
+    # value the guest wrote until something overwrites it, so after a reboot the previous session's
+    # timestamp is sitting right there. The driver used to accept `AgentReady` merely for EXISTING,
+    # and did so on a value from an hour earlier - delivering a payload to a guest whose agent had
+    # not started. Presence is not freshness.
+    #
+    # The function is lifted out of the driver by AST rather than dot-sourced, because the driver
+    # has a mandatory parameter and running it here would start a campaign.
+    $driverPath = Join-Path -Path $script:CampaignRoot -ChildPath 'Invoke-WacVmCampaign.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($driverPath, [ref]$null, [ref]$null)
+    $fn = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Get-CampaignBeaconUtc'
+            }, $true))
+    Assert-Equal 1 $fn.Count 'the driver no longer defines exactly one Get-CampaignBeaconUtc'
+    . ([scriptblock]::Create($fn[0].Extent.Text))
+
+    $cut = [datetime]::SpecifyKind([datetime]::Parse('2026-09-20T00:45:38Z', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal), [System.DateTimeKind]::Utc)
+
+    $stale = Get-CampaignBeaconUtc -Item @{ AgentReady = '2026-09-19T23:07:57Z' } -Name 'AgentReady'
+    Assert-True ($null -ne $stale) 'a well-formed stale beacon was not parsed at all'
+    Assert-False ($stale -gt $cut) 'a beacon from the PREVIOUS session counted as this boot'
+
+    $fresh = Get-CampaignBeaconUtc -Item @{ AgentReady = '2026-09-20T00:45:52Z' } -Name 'AgentReady'
+    Assert-True ($fresh -gt $cut) 'a beacon stamped after the cut was not accepted'
+
+    # Anything unreadable is absent, never guessed at: a guess here is a payload delivered to a
+    # guest that is not listening.
+    Assert-True ($null -eq (Get-CampaignBeaconUtc -Item @{ } -Name 'AgentReady')) 'a missing beacon was not reported as absent'
+    Assert-True ($null -eq (Get-CampaignBeaconUtc -Item @{ AgentReady = '' } -Name 'AgentReady')) 'a blank beacon was not reported as absent'
+    Assert-True ($null -eq (Get-CampaignBeaconUtc -Item @{ AgentReady = 'System.Object[]' } -Name 'AgentReady')) 'an unparseable beacon was not reported as absent'
+    Assert-True ($null -eq (Get-CampaignBeaconUtc -Item $null -Name 'AgentReady')) 'a null item was not reported as absent'
+}
+
+Test-Case 'After restoring power the campaign waits for the new boot before reading the guest again' {
+    # `Await` still holds the request that was just serviced - the guest was powered off before it
+    # could clear it. Returning straight to the read loop cut the power a SECOND time for the same
+    # step, observed live: two cuts eighteen seconds apart during one power-loss-during-install.
+    # That is not the scenario's contract, and a verdict from it answers a different question.
+    #
+    # Asserted as ORDER inside the function, because a Wait- call sitting anywhere in the file would
+    # satisfy a mere text search while the defect stayed exactly where it was.
+    $driverPath = Join-Path -Path $script:CampaignRoot -ChildPath 'Invoke-WacVmCampaign.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($driverPath, [ref]$null, [ref]$null)
+    $fn = @($ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq 'Invoke-CampaignPowerCut'
+            }, $true))
+    Assert-Equal 1 $fn.Count 'the driver no longer defines exactly one Invoke-CampaignPowerCut'
+
+    $commands = @($fn[0].FindAll({
+                param($node) $node -is [System.Management.Automation.Language.CommandAst]
+            }, $true) | ForEach-Object { [string]$_.GetCommandName() })
+
+    $startIndex = [array]::IndexOf($commands, 'Start-VM')
+    Assert-True ($startIndex -ge 0) 'the power cut no longer starts the guest again'
+    $waitIndex = -1
+    for ($i = $startIndex + 1; $i -lt $commands.Count; $i++) {
+        if ($commands[$i] -ceq 'Wait-WacCampaignSignal') { $waitIndex = $i; break }
+    }
+    Assert-True ($waitIndex -gt $startIndex) `
+        'nothing waits for the guest between restoring its power and handing control back, so a stale Await can cut it again'
+}
+
+Test-Case 'No reader in the campaign takes a beacon on presence alone' {
+    # The whole class, not the two instances repaired. A future `ContainsKey` on one of these
+    # timestamps reintroduces exactly the same false signal somewhere new.
+    foreach ($file in (Get-CampaignFileText)) {
+        foreach ($beacon in @('AgentReady', 'AgentBoot')) {
+            $pattern = "ContainsKey\('" + $beacon + "'\)"
+            Assert-False ($file.Text -match $pattern) `
+                ('{0} tests {1} for presence instead of freshness; use its timestamp against the event' -f $file.Name, $beacon)
+        }
+    }
+}
+
 Complete-TestRun
