@@ -117,27 +117,80 @@ function New-CampaignPayload {
     }
 }
 
+function Get-CampaignBeaconUtc {
+    <#
+    .SYNOPSIS
+        One of the guest's ISO-8601 beacons as a UTC DateTime, or $null when it has published none
+        this host can read.
+    .DESCRIPTION
+        Key-Value Pair Exchange is STICKY. The guest writes these values into its own registry and
+        they stay there until something overwrites them, so a beacon read just after a reboot is
+        very often the PREVIOUS session's. Presence therefore proves nothing about this boot, and
+        the only sound test is the beacon's own timestamp against the instant of the event being
+        waited on. A value that cannot be parsed is reported as absent rather than guessed at.
+    #>
+    param($Item, [Parameter(Mandatory = $true)][string]$Name)
+
+    if ($null -eq $Item -or -not $Item.ContainsKey($Name)) { return $null }
+    $raw = [string]$Item[$Name]
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+
+    $parsed = [datetime]::MinValue
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    if (-not [datetime]::TryParse($raw, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) {
+        return $null
+    }
+    return $parsed
+}
+
 function Invoke-CampaignPowerCut {
     <#
     .SYNOPSIS
-        Pulls the guest's power at the point the guest itself said it had reached, then starts it
-        again so its recovery path runs on a real post-crash machine.
+        Pulls the guest's power at the point the guest itself said it had reached, starts it again,
+        and does not return until the agent has come back and spoken for THIS boot.
     .DESCRIPTION
         The cut is taken on the GUEST's signal rather than on a host timer. A timed cut lands
         wherever the guest happened to be, which makes a pass unrepeatable and a failure
         undiagnosable: the interesting instant is a specific one, and only the guest knows when it
         is standing on it.
+
+        Returning as soon as the power is back is not enough, and cost a real run: the guest was
+        powered off mid-step, so `Await` still holds the request that was just serviced - the guest
+        never got the chance to clear it. The caller's loop reads that stale value and cuts the
+        power a SECOND time for the same step, which silently turns "one cut during install" into a
+        different experiment whose verdict answers a question nobody asked. So this waits for the
+        agent's own proof of a new boot: an `AgentReady` stamped after the cut, and `Await` blank
+        again, which is the order the agent publishes them in.
     #>
-    param([Parameter(Mandatory = $true)]$Vm, [Parameter(Mandatory = $true)][string]$AtStep)
+    param(
+        [Parameter(Mandatory = $true)]$Vm,
+        [Parameter(Mandatory = $true)][string]$AtStep,
+        [int]$ReturnTimeoutSeconds = 1200
+    )
 
     Write-CampaignLine ('  power cut requested by the guest at: {0}' -f $AtStep)
+    $cutUtc = [datetime]::UtcNow
     $stopped = Stop-WacCampaignVm -Vm $Vm -PowerCut
     if (-not $stopped.Off) {
         throw ('The guest did not power off for the cut; it is {0}.' -f $stopped.State)
     }
 
     Start-VM -VM $Vm -ErrorAction Stop
-    Write-CampaignLine '  power restored; the guest agent resumes on its own at startup'
+    Write-CampaignLine '  power restored; waiting for the agent to speak for the new boot'
+
+    $back = Wait-WacCampaignSignal -VMName $Vm.Name -TimeoutSeconds $ReturnTimeoutSeconds -IdleSeconds $ReturnTimeoutSeconds -Until {
+        param($item)
+        $ready = Get-CampaignBeaconUtc -Item $item -Name 'AgentReady'
+        if ($null -eq $ready -or $ready -le $cutUtc) { return $false }
+        return (-not $item.ContainsKey('Await') -or [string]::IsNullOrWhiteSpace([string]$item['Await']))
+    }
+    if (-not $back.Signalled) {
+        throw ('The guest did not come back after the cut at {0}. {1}{2}' -f
+            $AtStep, $back.Reason, (Get-CampaignGuestAccount -Item $back.Item))
+    }
+
+    $returned = Get-CampaignBeaconUtc -Item $back.Item -Name 'AgentReady'
+    Write-CampaignLine ('  the agent is back {0:N0}s after the cut' -f ($returned - $cutUtc).TotalSeconds)
     return $true
 }
 
@@ -176,12 +229,18 @@ function Invoke-CampaignOneScenario {
     $deadline = $Deadline
 
     Write-CampaignLine '  starting the guest'
+    $startedUtc = [datetime]::UtcNow
     Start-VM -VM $Vm -ErrorAction Stop
 
     # The agent publishes this as soon as it is alive. Until it does, the guest is either still
     # booting or was never armed, and those are told apart by waiting rather than assumed.
+    # It must be THIS boot's value: the beacon is sticky, so merely finding one present accepted a
+    # timestamp from a previous session and delivered the payload to a guest whose agent had not
+    # started yet.
     $ready = Wait-WacCampaignSignal -VMName $Vm.Name -TimeoutSeconds 600 -IdleSeconds 600 -Until {
-        param($item) $item.ContainsKey('AgentReady')
+        param($item)
+        $beacon = Get-CampaignBeaconUtc -Item $item -Name 'AgentReady'
+        ($null -ne $beacon -and $beacon -gt $startedUtc)
     }
     if (-not $ready.Signalled) {
         throw ('The guest agent never reported in. Either this guest was never armed, or the agent is not running. ' +
