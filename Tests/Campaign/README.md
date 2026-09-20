@@ -114,39 +114,52 @@ The resume point is written to disk **before** the cut is requested. After the p
 | --- | --- | --- |
 | `service-dispatched-maintenance` | **passed** (twice) | the Task Scheduler dispatched the installed action as SYSTEM and the cleanup ran to completion: `lastResult=0`, outcome `Succeeded`, 203 and 204 entries / 13.4 and 14.8 MB actually removed, read from the run's own `.summary.json` |
 | `reboot-recovery` | **passed** (twice) | a REAL restart across an open transaction; recovery left the files, the registration and the records agreeing |
-| `power-loss-during-install` | no verdict | see below: on a GP-armed guest nothing starts after the cut; the task-armed retry was confounded by the host |
-| `power-loss-during-uninstall` | no verdict | the same |
+| `power-loss-during-install` | unblocked, no scenario verdict yet | the agent's return after a cut is now proven (below); the scenario's own pass/fail needs a full campaign run |
+| `power-loss-during-uninstall` | the same | the same |
 
-### Why the two power-cut scenarios have no verdict, and what that is not
+### The power-cut blocker is closed: a task-armed guest DOES come back
 
-The agent publishes `AgentBoot` as its first act, before anything else can throw. On every clean
-boot it appears within seconds. **On a GP-armed guest it never appears at all after a hard power
-cut**, on a guest that is Running, with memory assigned and its heartbeat back. Nothing starts, so
-nothing reports.
+The agent publishes `AgentBoot` as its first act, before anything else can throw. On a **GP-armed**
+guest it never appeared at all after a hard cut, on a guest that was Running with memory assigned
+and its heartbeat back - nothing started, so nothing reported. That is a defect of the arming, and
+it is now demonstrated as such: with the machine carrying the **scheduled task instead**, and the
+Group Policy startup script removed so the task was the only start path left, a deliberate cut taken
+at the instant the guest asked for it was answered by a fresh beacon **13 seconds later**.
 
-That pattern fits the results exactly: both passing scenarios boot cleanly - `reboot-recovery` uses
-`Restart-Computer`, which is a clean, flushing restart - and only the cut scenarios are silent.
+```text
+cut at  2026-09-20T00:45:38Z
+beacon  2026-09-20T00:45:52Z   (+13 s, agent log: "--- agent started ---")
+```
 
-**The suspect is how the guest was armed, not the product and not the campaign.** A guest armed from
-the HOST can only be armed with a local Group Policy machine startup script, whose registration the
-Group Policy service keeps in the registry; a dirty shutdown can roll that back, leaving nothing for
-`gpscript.exe /startup` to run. The scheduled task the agent now registers for itself goes through
-Task Scheduler's own transactional store, which is the mechanism designed to survive exactly this.
+A guest armed from the HOST can only be armed with a local Group Policy machine startup script,
+whose registration the Group Policy service keeps in the registry, and a dirty shutdown can roll
+that back leaving nothing for `gpscript.exe /startup` to run. The scheduled task goes through Task
+Scheduler's own transactional store, which is the mechanism designed to survive exactly this. The
+measurement above is what turns that from a plausible story into the answer.
 
-**The task-armed retry did not settle it.** A cut was taken against a guest carrying the scheduled
-task, and it was silent too - but that run says nothing either way, because the guest never got its
-heartbeat back and sat pinned at its dynamic-memory floor for the whole watch. The host had nothing
-left to give it. Read the two silences apart before concluding anything:
+**What this does NOT say.** It does not say the two scenarios pass. The recovered agent resumed its
+interrupted work (`Status=running`, `Step=power-loss-during-install`) and the probe stopped watching
+before the scenario reached its own verdict, because the question being answered was whether
+anything came back at all. Both scenarios now need one ordinary campaign run to report themselves.
+
+### Reading a silent guest, so the next run is not wasted
+
+Two earlier readings of these failures were wrong and are retracted: they were not a guest that
+could not come back (it returns in **13 seconds**, measured twice), and the GP-armed silence was not
+starvation - there the heartbeat was healthy and only the agent was missing. A silence has to be
+split before it means anything:
 
 | what the host sees after the cut | what it means |
 | --- | --- |
 | heartbeat never returns, `MemoryAssigned` stuck at the floor | the HOST starved the guest. No evidence about the product, the campaign or the arming. |
 | heartbeat OK, memory assigned, no `AgentBoot` | nothing started inside the guest. That is a real finding about the arming. |
 
-**What the next attempt needs is a host, not a code change**: nothing else of size running, and an
-allocation the host can hold for the entire run. Until then the two scenarios prove nothing about
-the product either way, and the campaign reports them rather than issuing a verdict.
+The way to stop producing the first kind is not to wait for an idle host, which is a condition
+nobody can prove. It is to give the guest **static** memory for the run: Hyper-V must then commit
+the whole allocation at start, so either the guest holds all of it or `Start-VM` fails immediately
+and says so. An honest refusal beats a guest that starves in silence for fifteen minutes.
 
-Two earlier readings of these failures were wrong and are retracted here: they were not a guest that
-could not come back (it returns in **12 seconds**, measured), and the GP-armed silence was not
-starvation - there the heartbeat was healthy and only the agent was missing.
+And `AgentBoot` is a sticky value - the guest's registry keeps the previous boot's timestamp until
+something overwrites it - so "a beacon is present" proves nothing. Compare the beacon's OWN
+timestamp against the instant of the cut. A stale read during the reboot window then fails by
+arithmetic instead of being mistaken for a recovery.
