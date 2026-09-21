@@ -174,24 +174,55 @@ function Invoke-WacCampaignHost {
 }
 
 function Close-WacCampaignLaunch {
-    param([Parameter(Mandatory = $true)]$Started)
+    <# Observe BOTH native completion facts before releasing handles. Repeat closes retain proof. #>
+    param([Parameter(Mandatory = $true)]$Started, [ValidateRange(0, 5000)][int]$TimeoutMs = 5000)
+    if (@($Started.PSObject.Properties.Name) -ccontains 'CloseProof') {
+        $old = $Started.CloseProof
+        if (-not $old.Finalized) { throw 'Campaign close is already in progress.' }
+        if ($old.Failure) { throw ([string]$old.Failure) }
+        return
+    }
+    $proof = [PSCustomObject]@{ Finalized = $false; TerminationProven = $false; Requested = $false
+        RequestError = 0; RootSignalled = $false; ActiveProcesses = -1; WaitedMs = 0L; Failure = '' }
+    $Started | Add-Member -NotePropertyName CloseProof -NotePropertyValue $proof
+    $problems = New-Object 'Collections.Generic.List[string]'
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
-        [void][WacOwnedProcess]::TerminateJob($Started.Launch.Job)
-        $watch = [Diagnostics.Stopwatch]::StartNew()
+        if ($Started.Launch.Job -eq [IntPtr]::Zero -or $Started.Launch.Process -eq [IntPtr]::Zero) {
+            throw 'Campaign close has no live owned job/root handles; absence is not termination proof.'
+        }
+        $proof.Requested = [WacOwnedProcess]::TerminateJob($Started.Launch.Job)
+        if (-not $proof.Requested) { $proof.RequestError = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
         do {
-            $active = [WacOwnedProcess]::ActiveProcessesInJob($Started.Launch.Job)
-            if ($active -eq 0) { break }
-            Start-Sleep -Milliseconds 50
-        } while ($watch.ElapsedMilliseconds -lt 5000)
-        if ($active -ne 0 -or -not [WacOwnedProcess]::WaitForExit($Started.Launch.Process, 0)) {
-            throw 'The failed campaign launch did not prove whole-job termination.'
+            $left = [int][Math]::Max(0, $TimeoutMs - $watch.ElapsedMilliseconds)
+            # Empty job accounting may precede root signaling. A zero-time poll immediately after
+            # seeing ActiveProcesses=0 produced a false failure. Neither fact substitutes for the other.
+            $proof.RootSignalled = [WacOwnedProcess]::WaitForExit($Started.Launch.Process, [Math]::Min(50, $left))
+            $proof.ActiveProcesses = [WacOwnedProcess]::ActiveProcessesInJob($Started.Launch.Job)
+            $proof.TerminationProven = $proof.RootSignalled -and $proof.ActiveProcesses -eq 0
+            if ($proof.TerminationProven) { break }
+            $left = [int][Math]::Max(0, $TimeoutMs - $watch.ElapsedMilliseconds)
+            if ($proof.RootSignalled -and $left -gt 0) { Start-Sleep -Milliseconds ([Math]::Min(50, $left)) }
+        } while ($watch.ElapsedMilliseconds -lt $TimeoutMs)
+        if (-not $proof.TerminationProven) {
+            throw ('Campaign termination unproven: requested={0}; win32={1}; rootSignalled={2}; active={3}.' -f
+                $proof.Requested, $proof.RequestError, $proof.RootSignalled, $proof.ActiveProcesses)
         }
     }
+    catch { [void]$problems.Add($_.Exception.Message) }
     finally {
-        [WacOwnedProcess]::Close($Started.Launch)
-        $Started.Process.Dispose()
-        $Started.OutReader.Dispose(); $Started.ErrReader.Dispose()
+        $proof.WaitedMs = $watch.ElapsedMilliseconds
+        # One disposer failing must not prevent the other owners releasing their resources. Cache
+        # the observed result BEFORE a later finally can attempt to query zero/recycled handles.
+        try { [WacOwnedProcess]::Close($Started.Launch) } catch { [void]$problems.Add($_.Exception.Message) }
+        foreach ($name in @('Process', 'OutReader', 'ErrReader')) {
+            try { if ($null -ne $Started.$name) { $Started.$name.Dispose() } }
+            catch { [void]$problems.Add(($name + ': ' + $_.Exception.Message)) }
+        }
+        $proof.Failure = $problems -join ' / '
+        $proof.Finalized = $true
     }
+    if ($proof.Failure) { throw ([string]$proof.Failure) }
 }
 
 function Invoke-WacCampaignMaintenance {
