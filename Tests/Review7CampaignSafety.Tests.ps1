@@ -44,6 +44,9 @@ Test-Case 'The arming predicate refuses a physical Microsoft workstation' {
     }, $true)
     Assert-True ($null -ne $condition) 'the real hardware refusal predicate was not located'
     $model = 'Surface Pro 9'; $manufacturer = 'Microsoft Corporation'
+    # The extracted production predicate reads these names through PowerShell dynamic scope.
+    Assert-Equal 'Surface Pro 9' $model
+    Assert-Equal 'Microsoft Corporation' $manufacturer
     $expression = [scriptblock]::Create($condition.Clauses[0].Item1.Extent.Text)
     Assert-True ([bool](& $expression)) 'a physical Microsoft machine passed the VM arming guard'
     $model = 'Virtual Machine'
