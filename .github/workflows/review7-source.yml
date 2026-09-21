@@ -1,0 +1,36 @@
+name: Review source evidence
+
+on:
+  push:
+    branches: [audit/review7-state-safety]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Archive Git objects, never local credentials or untracked files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=zip --output="$RUNNER_TEMP/source.zip" HEAD
+          git rev-parse HEAD > "$RUNNER_TEMP/source-commit.txt"
+          git ls-tree -r HEAD > "$RUNNER_TEMP/source-tree.txt"
+          cd "$RUNNER_TEMP"
+          sha256sum source.zip source-commit.txt source-tree.txt > source-sha256.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: review-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/source.zip
+            ${{ runner.temp }}/source-commit.txt
+            ${{ runner.temp }}/source-tree.txt
+            ${{ runner.temp }}/source-sha256.txt
+          if-no-files-found: error
+          retention-days: 14
