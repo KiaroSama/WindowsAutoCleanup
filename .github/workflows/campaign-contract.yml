@@ -1,0 +1,43 @@
+name: Campaign contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  campaign-contract:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Safe fixtures on both PowerShell hosts
+        shell: pwsh
+        run: |
+          .\Tests\Run-Tests.ps1 -Host both -Filter Campaign -ManifestPath "$env:RUNNER_TEMP\campaign-manifest.txt" *>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\campaign-output.log"
+          exit $LASTEXITCODE
+      - name: Capture tracked revision only
+        if: always()
+        shell: pwsh
+        run: |
+          git archive --format=zip --output="$env:RUNNER_TEMP\source.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git rev-parse HEAD | Set-Content -LiteralPath "$env:RUNNER_TEMP\source-commit.txt"
+          git ls-tree -r HEAD | Set-Content -LiteralPath "$env:RUNNER_TEMP\source-tree.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: campaign-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/campaign-manifest.txt
+            ${{ runner.temp }}/campaign-output.log
+            ${{ runner.temp }}/source.zip
+            ${{ runner.temp }}/source-commit.txt
+            ${{ runner.temp }}/source-tree.txt
+          if-no-files-found: error
+          retention-days: 14

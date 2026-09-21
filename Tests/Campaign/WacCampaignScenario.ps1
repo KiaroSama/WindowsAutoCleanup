@@ -1,72 +1,42 @@
 <#
 .SYNOPSIS
-    The campaign scenarios. Each one performs something a continuous-integration runner structurally
-    cannot, inside a disposable guest, and returns a verdict about what it actually observed.
-
+    Explicitly authorized disposable-guest scenarios with independently verified postconditions.
 .DESCRIPTION
-    Every scenario returns Scenario, Verdict (`passed`, `failed` or `awaiting-power-cut`) and Detail.
-    A scenario that could not reach its own precondition returns `failed` with the reason - never
-    `passed` for want of a failure, which is the shape this project keeps finding and closing.
-
-    The interrupted scenarios do not use a timer. The agent starts the real operation, watches for
-    the record the product itself writes when it enters the transaction, and only then asks for the
-    interruption. A cut on a stopwatch lands wherever the machine happened to be, which makes a pass
-    unrepeatable and a failure undiagnosable.
+    Loading this library performs no cleanup. A scenario returns passed, failed or awaiting-power-cut.
+    Process completion, fresh operation evidence, and task/file coherence are separate requirements.
 #>
-
 Set-StrictMode -Version 2.0
+. (Join-Path $PSScriptRoot 'WacCampaignChecks.ps1')
 
 function Get-WacCampaignSummary {
-    <#
-    .SYNOPSIS
-        The newest run summary a cleanup left behind, or $null.
-    .DESCRIPTION
-        The run's own machine-readable verdict is what the campaign reads, rather than re-deriving
-        one from free disk space or a log scrape. It is the artifact a monitor would read, so a
-        campaign that reads it is also testing the thing operators will depend on.
-    #>
     param([string[]]$Directory = @("$env:ProgramData\WindowsAutoCleanup\Logs", "$env:SystemRoot\Logs\WindowsAutoCleanup"))
-
     $found = @()
     foreach ($candidate in $Directory) {
         if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
-        $found += @(Get-ChildItem -LiteralPath $candidate -Filter '*.summary.json' -File -ErrorAction SilentlyContinue)
+        $found += @(Get-ChildItem -LiteralPath $candidate -Filter '*.summary.json' -File -ErrorAction Stop)
     }
     if ($found.Count -eq 0) { return $null }
-
-    $newest = @($found | Sort-Object -Property LastWriteTimeUtc -Descending)[0]
-    try { return ([System.IO.File]::ReadAllText($newest.FullName) | ConvertFrom-Json) }
+    $newest = @($found | Sort-Object LastWriteTimeUtc -Descending)[0]
+    try {
+        $summary = [IO.File]::ReadAllText($newest.FullName) | ConvertFrom-Json -ErrorAction Stop
+        if (Test-WacCampaignSummaryShape -Summary $summary) { return $summary }
+        return $null
+    }
     catch { return $null }
 }
 
 function Get-WacCampaignTail {
-    <#
-    .SYNOPSIS
-        The last useful part of a captured stream, flattened to one line and bounded.
-    .DESCRIPTION
-        Bounded because it travels to the host through a key-value exchange that chunks by length,
-        and the TAIL rather than the head because a refusal is the last thing an entry point says
-        before it exits.
-    #>
     param([AllowEmptyString()][AllowNull()][string]$Text, [int]$Max = 600)
-
     if ([string]::IsNullOrWhiteSpace($Text)) { return '(it printed nothing)' }
-
     $flat = ($Text -replace '[\r\n\t ]+', ' ').Trim()
     if ($flat.Length -le $Max) { return $flat }
     return ('...' + $flat.Substring($flat.Length - $Max))
 }
 
 function Wait-WacCampaignFile {
-    <#
-    .SYNOPSIS
-        Waits, bounded, for the product to create the record that marks the instant we want to
-        interrupt. $true when it appeared.
-    #>
     param([Parameter(Mandatory = $true)][string[]]$Path, [int]$TimeoutSeconds = 180)
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         foreach ($candidate in $Path) {
             if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) { return $true }
         }
@@ -76,434 +46,304 @@ function Wait-WacCampaignFile {
 }
 
 function Suspend-WacCampaignTree {
-    <#
-    .SYNOPSIS
-        Freezes a started process and everything it started, so the instant the power is cut at is
-        the instant the guest chose rather than whenever the host got round to it.
-    .DESCRIPTION
-        THE RACE THIS EXISTS TO REMOVE. The guest reaches the transaction, asks the host to cut, and
-        the host takes up to a poll interval to act - during which a short operation can FINISH. The
-        first real campaign lost `power-loss-during-uninstall` exactly that way: nothing was
-        interrupted, the installer correctly did not refuse, and the scenario proved nothing.
-
-        A suspended process cannot write another byte, so the on-disk state stays exactly as the
-        record left it for as long as the host needs. The parent is frozen FIRST so it cannot spawn
-        a child that outlives the sweep, and the descendants are enumerated twice because one can be
-        created between the parent's last instruction and its freeze.
-    .OUTPUTS
-        A result carrying Suspended (the ids frozen) and Detail.
-    #>
-    param([Parameter(Mandatory = $true)][int]$ProcessId)
-
-    if (-not ('WacCampaign.Nt' -as [type])) {
-        Add-Type -Namespace 'WacCampaign' -Name 'Nt' -MemberDefinition @'
-[DllImport("ntdll.dll", SetLastError = true)]
+    <# Freeze only the identified root and verified descendants; unwind partial holds. #>
+    param([Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][datetime]$ExpectedCreatedUtc)
+    if (-not ('WacCampaign.Hold' -as [type])) {
+        Add-Type -Namespace WacCampaign -Name Hold -MemberDefinition @'
+[DllImport("ntdll.dll")]
 public static extern int NtSuspendProcess(System.IntPtr processHandle);
+[DllImport("ntdll.dll")]
+public static extern int NtResumeProcess(System.IntPtr processHandle);
 '@
     }
-
-    $frozen = New-Object 'System.Collections.Generic.List[int]'
-    $trouble = New-Object 'System.Collections.Generic.List[string]'
-
-    $freeze = {
-        param([int]$Id)
-        try {
-            $process = [System.Diagnostics.Process]::GetProcessById($Id)
-            $status = [WacCampaign.Nt]::NtSuspendProcess($process.Handle)
-            if ($status -eq 0) { [void]$frozen.Add($Id) }
-            else { [void]$trouble.Add(('{0}: NtSuspendProcess returned 0x{1:X8}' -f $Id, $status)) }
-        }
-        catch { [void]$trouble.Add(('{0}: {1}' -f $Id, $_.Exception.Message)) }
-    }
-
-    & $freeze $ProcessId
-    for ($pass = 0; $pass -lt 2; $pass++) {
-        foreach ($child in @(Get-CimInstance Win32_Process -Filter ("ParentProcessId={0}" -f $ProcessId) -ErrorAction SilentlyContinue)) {
-            if ($frozen -contains [int]$child.ProcessId) { continue }
-            & $freeze ([int]$child.ProcessId)
-        }
-    }
-
-    return [PSCustomObject]@{
-        Suspended = @($frozen.ToArray())
-        Detail = ('froze {0} process(es){1}' -f $frozen.Count,
-            $(if ($trouble.Count -gt 0) { '; ' + ($trouble.ToArray() -join '; ') } else { '' }))
-    }
-}
-
-function Stop-WacCampaignTree {
-    <#
-    .SYNOPSIS
-        Terminates a started process and everything it started, and SAYS what happened.
-    .DESCRIPTION
-        The whole tree, because a killed parent leaves its dism.exe or cleanmgr.exe running inside a
-        guest that is about to be checkpointed away with them. Windows PowerShell 5.1 has no
-        entireProcessTree overload, so the fallback is the single process - which is worth reporting
-        rather than swallowing, because the difference is exactly what leaks.
-    #>
-    param([Parameter(Mandatory = $true)]$Process)
-
+    $held = New-Object 'Collections.Generic.List[object]'
+    $queue = New-Object 'Collections.Generic.Queue[object]'
+    $seen = @{}
+    $queue.Enqueue([PSCustomObject]@{ Id = $ProcessId; Born = $ExpectedCreatedUtc; Exact = $true })
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $Process.Kill($true)
-        return 'the process tree was terminated'
+        while ($queue.Count -gt 0) {
+            if ($watch.Elapsed.TotalSeconds -ge 20 -or $held.Count -ge 256) { throw 'The bounded hold limit was reached.' }
+            $next = $queue.Dequeue()
+            if ($seen.ContainsKey([int]$next.Id)) { continue }
+            $process = [Diagnostics.Process]::GetProcessById($next.Id)
+            try {
+                $born = $process.StartTime.ToUniversalTime()
+                if (($next.Exact -and $born -ne $next.Born) -or $born -lt $next.Born) { throw 'A process identity changed.' }
+                if ([WacCampaign.Hold]::NtSuspendProcess($process.Handle) -ne 0) { throw 'A process could not be held.' }
+            }
+            catch { $process.Dispose(); throw }
+            [void]$held.Add($process)
+            $seen[[int]$process.Id] = $true
+            # A held parent cannot spawn after this query. Traverse recursively, not twice at root.
+            foreach ($child in @(Get-CimInstance Win32_Process -Filter ('ParentProcessId={0}' -f $process.Id) -ErrorAction Stop)) {
+                $queue.Enqueue([PSCustomObject]@{ Id = [int]$child.ProcessId; Born = $born; Exact = $false })
+            }
+        }
+        return [PSCustomObject]@{ RootHeld = $true; Processes = @($held.ToArray()); Detail = ('held ' + $held.Count + ' identified processes') }
     }
     catch {
-        try {
-            $Process.Kill()
-            return ('only the parent process could be terminated (' + $_.Exception.Message + '); a child may still be running')
+        $reason = $_.Exception.Message
+        foreach ($process in @($held.ToArray())) {
+            try { [void][WacCampaign.Hold]::NtResumeProcess($process.Handle) } finally { $process.Dispose() }
         }
-        catch {
-            return ('the process could not be terminated at all: ' + $_.Exception.Message)
-        }
+        return [PSCustomObject]@{ RootHeld = $false; Processes = @(); Detail = $reason }
     }
 }
 
 function Invoke-WacCampaignHost {
-    <#
-    .SYNOPSIS
-        Runs one of the project's own entry points and returns its exit code and output.
-    .DESCRIPTION
-        Started hidden with its streams captured. Nothing this agent runs ever draws a window: the
-        guest is unattended by definition and a prompt in here is a hang nobody is watching.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$ScriptPath,
-        [string[]]$ArgumentList = @(),
-        [int]$TimeoutSeconds = 2400,
-        [switch]$PassThruProcess
-    )
-
-    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath) + @($ArgumentList)
-    $outFile = [System.IO.Path]::GetTempFileName()
-    $errFile = [System.IO.Path]::GetTempFileName()
-
-    $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -PassThru `
-        -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-
-    # Touch Handle while the child is still alive, or every exit code below is a LIE. Windows
-    # PowerShell 5.1 returns 0 from `Start-Process -PassThru`'s ExitCode unless the handle was
-    # cached before the process went away - this project measured that across three shapes and
-    # wrote it down, and the product's own elevation path does exactly this at
-    # Install-WindowsAutoCleanupTask.ps1. The campaign did not, and so read a correct FR-015
-    # refusal (exit 1, message and all) as a successful install, and a recovery run that crashed on
-    # a damaged source file as a clean exit 0. Two verdicts about the product that were really
-    # verdicts about this line.
-    try { $null = $process.Handle } catch { $null = $_ }
-
-    if ($PassThruProcess) {
-        return [PSCustomObject]@{ Process = $process; OutFile = $outFile; ErrFile = $errFile; ExitCode = $null; Output = '' }
+    <# A transparent fixed adapter, with typed booleans, uses the existing owned-process runner. #>
+    param([Parameter(Mandatory = $true)][string]$ScriptPath, [string[]]$ArgumentList = @(),
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 2400, [switch]$PassThruProcess)
+    $core = Join-Path (Split-Path -Parent $ScriptPath) 'src\WindowsAutoCleanup.Core.psm1'
+    if (-not (Test-Path -LiteralPath $core -PathType Leaf)) {
+        $core = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'src\WindowsAutoCleanup.Core.psm1'
     }
-
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        $killed = Stop-WacCampaignTree -Process $process
-        return [PSCustomObject]@{ ExitCode = -1
-            Output = ('timed out after {0}s; {1}' -f $TimeoutSeconds, $killed) }
+    Import-Module $core -DisableNameChecking -ErrorAction Stop
+    $map = @{ NoPause = 'NoPauseValue'; ResetWindowsUpdateBase = 'ResetValue'
+        PruneSupersededDrivers = 'PruneValue'; Scheduled = 'ScheduledValue' }
+    $seen = @{}
+    $argv = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+        (Join-Path $PSScriptRoot 'Invoke-WacCampaignScript.ps1'), '-ScriptPath', [IO.Path]::GetFullPath($ScriptPath))
+    foreach ($argument in $ArgumentList) {
+        if ($argument -notmatch '^-(NoPause|ResetWindowsUpdateBase|PruneSupersededDrivers|Scheduled)(?::\$?(true|false))?$') {
+            throw 'Only the four documented campaign switches are accepted.'
+        }
+        $name = $Matches[1]
+        if ($seen.ContainsKey($name)) { throw ('Duplicate campaign switch: ' + $name) }
+        $seen[$name] = $true
+        $value = if ($Matches.ContainsKey(2) -and $Matches[2] -ieq 'false') { '0' } else { '1' }
+        $argv += @('-' + $map[$name], $value)
     }
-
-    $output = ''
-    foreach ($file in @($outFile, $errFile)) {
-        try { $output += [System.IO.File]::ReadAllText($file) }
-        catch { $output += ('[a captured stream could not be read: ' + $_.Exception.Message + ']') }
-        Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue
+    $exe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ([IO.Path]::GetFileName($exe) -notmatch '^(powershell|pwsh)\.exe$') {
+        $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     }
-    return [PSCustomObject]@{ ExitCode = [int]$process.ExitCode; Output = $output }
+    if (-not $PassThruProcess) {
+        $ran = Invoke-WacProcess -FilePath $exe -ArgumentList $argv -TimeoutMs ($TimeoutSeconds * 1000)
+        $settled = $ran.Started -and -not $ran.TimedOut -and $ran.TerminationProven -and $ran.OutputComplete -and
+            $null -ne $ran.ExitCode -and $ran.Owned -and $ran.OwnedTreeState -ceq 'Complete'
+        return [PSCustomObject]@{ ExitCode = $(if ($settled) { [int]$ran.ExitCode } else { -1 })
+            Output = ([string]$ran.StandardOutput + [string]$ran.StandardError); Settled = $settled }
+    }
+    $tick = [Diagnostics.Stopwatch]::GetTimestamp() + [long]($TimeoutSeconds * [Diagnostics.Stopwatch]::Frequency)
+    $launch = Start-WacOwnedProcess -FilePath $exe -ArgumentList $argv -DeadlineTick $tick
+    if ($null -eq $launch) { throw 'The campaign requires an owned launch; no fallback was started.' }
+    if (-not $launch.Owned -or $launch.State -cne 'Resumed' -or $launch.Failure) {
+        try {
+            if ($launch.Owned) { [void][WacOwnedProcess]::TerminateJob($launch.Job) }
+            else { [void](Stop-WacProcessTree -ProcessId $launch.ProcessId -TimeoutMs 5000) }
+        }
+        finally { [WacOwnedProcess]::Close($launch) }
+        throw 'The campaign could not establish launch ownership.'
+    }
+    $process = $null; $outReader = $null; $errReader = $null
+    try {
+        $process = [Diagnostics.Process]::GetProcessById($launch.ProcessId)
+        $null = $process.Handle
+        $outReader = New-Object IO.StreamReader($launch.StandardOutput, [Text.Encoding]::UTF8)
+        $errReader = New-Object IO.StreamReader($launch.StandardError, [Text.Encoding]::UTF8)
+        return [PSCustomObject]@{ Process = $process; Launch = $launch; OutReader = $outReader; ErrReader = $errReader
+            OutTask = $outReader.ReadToEndAsync(); ErrTask = $errReader.ReadToEndAsync(); ExitCode = $null; Output = '' }
+    }
+    catch {
+        [void][WacOwnedProcess]::TerminateJob($launch.Job)
+        [WacOwnedProcess]::Close($launch)
+        if ($process) { $process.Dispose() }
+        if ($outReader) { $outReader.Dispose() }; if ($errReader) { $errReader.Dispose() }
+        throw
+    }
+}
+
+function Close-WacCampaignLaunch {
+    param([Parameter(Mandatory = $true)]$Started)
+    try {
+        [void][WacOwnedProcess]::TerminateJob($Started.Launch.Job)
+        [void][WacOwnedProcess]::WaitForExit($Started.Launch.Process, 5000)
+    }
+    finally {
+        [WacOwnedProcess]::Close($Started.Launch)
+        $Started.Process.Dispose()
+        $Started.OutReader.Dispose(); $Started.ErrReader.Dispose()
+    }
 }
 
 function Invoke-WacCampaignMaintenance {
-    <#
-    .SYNOPSIS
-        THE GAP THIS CAMPAIGN EXISTS TO CLOSE: the shipped scheduled task, dispatched by the Task
-        Scheduler as SYSTEM, running a real cleanup to completion on a real Windows client.
-    .DESCRIPTION
-        The live lifecycle lane already proves the task can be registered, started and removed. It
-        has never proved the CLEANUP runs - its task pointed at a deployment root that did not
-        exist, so the scheduler started an action that failed on its working directory, and
-        `lastResult=2147942667` is what that looks like.
-
-        Here the installer really installs, so the action really exists, and the verdict is read
-        from the run's own summary rather than from the scheduler's opinion of its exit code.
-    #>
-    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
+    <# Require a fresh scheduler invocation, its own summary and positively successful teardown. #>
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot, [ValidateRange(1, 2700)][int]$TimeoutSeconds = 2700)
+    $scenario = 'service-dispatched-maintenance'
     $install = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') `
-        -ArgumentList @('-NoPause')
+        -ArgumentList @('-NoPause', '-ResetWindowsUpdateBase:$false')
     if ($install.ExitCode -ne 0) {
-        return [PSCustomObject]@{ Scenario = 'service-dispatched-maintenance'; Verdict = 'failed'
-            Detail = ('the installer exited {0}; nothing downstream of it was tested. {1}' -f $install.ExitCode, $install.Output) }
+        return [PSCustomObject]@{ Scenario = $scenario; Verdict = 'failed'; Detail = ('installer exit=' + $install.ExitCode) }
     }
-
-    $task = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
-    if ($task.Count -ne 1) {
-        # An exit code of 0 with nothing registered is a REFUSAL, and the refusal is in the output.
-        # Reporting only the count leaves the one sentence that explains it on the floor - which is
-        # exactly what the first real campaign run did.
-        return [PSCustomObject]@{ Scenario = 'service-dispatched-maintenance'; Verdict = 'failed'
-            Detail = ('the installer exited 0 but {0} task(s) are registered. It said: {1}' -f
-                $task.Count, (Get-WacCampaignTail -Text $install.Output)) }
+    $machine = Get-WacCampaignMachine -ProjectRoot $ProjectRoot -Installed
+    if (-not $machine.SafeMaintenance) {
+        return [PSCustomObject]@{ Scenario = $scenario; Verdict = 'failed'; Detail = 'The registered task and safe maintenance policy were not proven.' }
     }
-
+    $task = $machine.Tasks[0]
     $before = Get-WacCampaignSummary
     $beforeId = if ($null -eq $before) { '' } else { [string]$before.executionId }
-
-    Start-ScheduledTask -InputObject $task[0]
-
-    # Two waits, in order: the scheduler must actually START the action before its result means
-    # anything. 267011 is "task has not run"; reading it as a verdict is how a start that never
-    # happened gets recorded as a finish.
-    $deadline = (Get-Date).AddMinutes(45)
-    $launched = $false
-    while ((Get-Date) -lt $deadline) {
-        $info = Get-ScheduledTaskInfo -InputObject $task[0]
-        $state = [string](Get-ScheduledTask -TaskPath $task[0].TaskPath -TaskName $task[0].TaskName).State
-        if ($state -ceq 'Running' -or [int]$info.LastTaskResult -ne 267011) { $launched = $true; break }
-        Start-Sleep -Seconds 2
+    $old = Get-ScheduledTaskInfo -InputObject $task -ErrorAction Stop
+    $started = [datetime]::UtcNow
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    Start-ScheduledTask -InputObject $task -ErrorAction Stop
+    $complete = $false; $info = $null; $after = $null
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $current = Get-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName -ErrorAction Stop
+        $info = Get-ScheduledTaskInfo -InputObject $current -ErrorAction Stop
+        if ($current.State -ceq 'Ready' -and $info.LastRunTime -gt $old.LastRunTime -and
+            $info.LastRunTime.ToUniversalTime() -ge $started.AddSeconds(-1)) {
+            $after = Get-WacCampaignSummary
+            if (Test-WacCampaignRunEvidence -Summary $after -PreviousId $beforeId -StartedUtc $started -ObservedExit ([int]$info.LastTaskResult)) {
+                $complete = $true; break
+            }
+        }
+        Start-Sleep -Milliseconds 500
     }
-    if (-not $launched) {
-        return [PSCustomObject]@{ Scenario = 'service-dispatched-maintenance'; Verdict = 'failed'
-            Detail = 'the scheduler never started the action, so nothing about the cleanup was observed.' }
+    if (-not $complete) {
+        # Never tear down a possibly active installation after an unproven completion.
+        return [PSCustomObject]@{ Scenario = $scenario; Verdict = 'failed'; Detail = 'No fresh successful scheduler/summary pair completed within the deadline.' }
     }
-
-    while ((Get-Date) -lt $deadline) {
-        $state = [string](Get-ScheduledTask -TaskPath $task[0].TaskPath -TaskName $task[0].TaskName).State
-        if ($state -cne 'Running') { break }
-        Start-Sleep -Seconds 5
-    }
-
-    $info = Get-ScheduledTaskInfo -InputObject $task[0]
-    $after = Get-WacCampaignSummary
-    if ($null -eq $after -or [string]$after.executionId -ceq $beforeId) {
-        return [PSCustomObject]@{ Scenario = 'service-dispatched-maintenance'; Verdict = 'failed'
-            Detail = ('the task finished with lastResult={0} but wrote no new run summary, so no cleanup is proved.' -f $info.LastTaskResult) }
-    }
-
-    $uninstall = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Uninstall-WindowsAutoCleanupTask.ps1') `
-        -ArgumentList @('-NoPause')
-
-    $verdict = if ([int]$info.LastTaskResult -eq 0 -and [string]$after.outcome -ceq 'Succeeded') { 'passed' } else { 'failed' }
-    return [PSCustomObject]@{
-        Scenario = 'service-dispatched-maintenance'; Verdict = $verdict
-        Detail = ('lastResult={0} outcome={1} exitCode={2} removedEntries={3} removedBytes={4} uninstallExit={5}' -f
-            $info.LastTaskResult, [string]$after.outcome, [int]$after.exitCode,
-            [int]$after.removed.entries, [long]$after.removed.bytes, $uninstall.ExitCode)
-    }
+    $uninstall = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Uninstall-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
+    $clean = Get-WacCampaignMachine
+    $ok = $uninstall.ExitCode -eq 0 -and $clean.Clean
+    return [PSCustomObject]@{ Scenario = $scenario; Verdict = $(if ($ok) { 'passed' } else { 'failed' })
+        Detail = ('executionId={0} taskExit={1} uninstallExit={2} clean={3}' -f $after.executionId, $info.LastTaskResult, $uninstall.ExitCode, $clean.Clean) }
 }
 
 function Start-WacCampaignInterruption {
-    <#
-    .SYNOPSIS
-        Starts a real transaction, waits for the product's own record of it, and then asks to be
-        interrupted at that exact instant.
-    .DESCRIPTION
-        The record is what makes the instant reproducible. Saving the resume point BEFORE the
-        interruption is requested is the whole contract: after the power goes there is nothing left
-        but this file, and a resume point written afterwards is one that was never written.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Scenario,
-        [Parameter(Mandatory = $true)][string]$ScriptPath,
-        [string[]]$ArgumentList = @(),
+    <# A cut needs an owned root, the complete owned tree held and records reread while held. #>
+    param([Parameter(Mandatory = $true)][string]$Scenario,
+        [Parameter(Mandatory = $true)][string]$ScriptPath, [string[]]$ArgumentList = @(),
         [Parameter(Mandatory = $true)][string[]]$RecordPath,
-        [Parameter(Mandatory = $true)]$State,
-        [Parameter(Mandatory = $true)][string]$StatePath,
-        [Parameter(Mandatory = $true)][scriptblock]$Save,
-        [string]$ResumeKind = 'power-cut'
-    )
-
+        [Parameter(Mandatory = $true)]$State, [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][scriptblock]$Save, [string]$ResumeKind = 'power-cut')
     $started = Invoke-WacCampaignHost -ScriptPath $ScriptPath -ArgumentList $ArgumentList -PassThruProcess
-    if (-not (Wait-WacCampaignFile -Path $RecordPath -TimeoutSeconds 240)) {
-        $killed = Stop-WacCampaignTree -Process $started.Process
-
-        # WHICH record was missing, and what the operation said while not writing it. The first real
-        # run reported only that no record appeared, which named neither the paths being watched nor
-        # the refusal that explained them.
-        $said = ''
-        foreach ($capture in @($started.OutFile, $started.ErrFile)) {
-            try { $said += [System.IO.File]::ReadAllText($capture) } catch { $said += '' }
+    $armed = $false; $held = $null
+    try {
+        if (-not (Wait-WacCampaignFile -Path $RecordPath -TimeoutSeconds 240)) { throw 'No transaction record was observed.' }
+        $held = Suspend-WacCampaignTree -ProcessId $started.Process.Id -ExpectedCreatedUtc $started.Process.StartTime.ToUniversalTime()
+        $tree = Get-WacOwnedTreeState -Launch $started.Launch
+        if (-not $held.RootHeld -or $tree.State -cne 'Alive' -or
+            $tree.ActiveProcesses -ne @($held.Processes).Count) { throw 'The complete owned tree was not proven held.' }
+        $records = @{}
+        foreach ($path in $RecordPath) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $text = [IO.File]::ReadAllText($path)
+            $record = $text | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $record) { throw 'The transaction record is not valid JSON.' }
+            $records[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
         }
-
-        return [PSCustomObject]@{ Scenario = $Scenario; Verdict = 'failed'
-            Detail = ('the operation wrote none of [{0}], so there was no defined instant to interrupt. It said: {1} ({2})' -f
-                ((@($RecordPath) | ForEach-Object { Split-Path -Leaf $_ }) -join ', '),
-                (Get-WacCampaignTail -Text $said), $killed) }
+        if ($records.Count -eq 0) { throw 'The transaction finished before the root was held.' }
+        $uptime = Get-WacMachineUptimeMs
+        if ($null -eq $uptime) { throw 'Monotonic restart evidence is unavailable.' }
+        $State.phase = 'awaiting-power-cut'
+        $State.cutStep = $Scenario
+        $State | Add-Member -NotePropertyName resumeKind -NotePropertyValue $ResumeKind -Force
+        $State | Add-Member -NotePropertyName cutUptimeMs -NotePropertyValue ([long]$uptime) -Force
+        $State | Add-Member -NotePropertyName cutRecords -NotePropertyValue $records -Force
+        & $Save -Path $StatePath -State $State
+        # Service-dispatched work is not silently described as frozen by a descendant hold.
+        foreach ($path in $records.Keys) {
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash -cne $records[$path]) { throw 'The transaction record moved during capture.' }
+        }
+        $script:CampaignHeldLaunch = $started
+        $armed = $true
+        if ($ResumeKind -ceq 'reboot') { Restart-Computer -Force -ErrorAction Stop }
+        return [PSCustomObject]@{ Scenario = $Scenario; Verdict = 'awaiting-power-cut'; Detail = $held.Detail }
     }
-
-    # FREEZE FIRST, then record, then ask. In that order the on-disk state cannot move again: the
-    # operation is stopped at the record, the resume point describes the state that will still be
-    # there after the power goes, and the host may take as long as it likes to act.
-    $held = Suspend-WacCampaignTree -ProcessId $started.Process.Id
-    if (@($held.Suspended).Count -eq 0) {
-        # Nothing was frozen, so the operation is still free to finish before the cut lands. That is
-        # the racy scenario this replaced, and running it anyway would produce a pass or a fail that
-        # means neither thing.
-        [void](Stop-WacCampaignTree -Process $started.Process)
-        return [PSCustomObject]@{ Scenario = $Scenario; Verdict = 'failed'
-            Detail = ('the operation reached its record but could not be held there ({0}), so the cut would have been a race.' -f $held.Detail) }
+    catch {
+        $armed = $false
+        return [PSCustomObject]@{ Scenario = $Scenario; Verdict = 'failed'; Detail = $_.Exception.Message }
     }
-
-    $State.phase = 'awaiting-power-cut'
-    $State.cutStep = $Scenario
-    $State | Add-Member -NotePropertyName 'resumeKind' -NotePropertyValue $ResumeKind -Force
-    $State | Add-Member -NotePropertyName 'cutHeld' -NotePropertyValue ([string]$held.Detail) -Force
-    & $Save -Path $StatePath -State $State
-
-    if ($ResumeKind -ceq 'reboot') {
-        # A clean restart the guest performs itself. The restart proof reads a monotonic counter,
-        # and only a real restart moves it - which is the entire point of doing this here.
-        Restart-Computer -Force
-        Start-Sleep -Seconds 120
+    finally {
+        if ($null -ne $held) { foreach ($process in @($held.Processes)) { $process.Dispose() } }
+        if (-not $armed) { Close-WacCampaignLaunch -Started $started }
     }
-
-    return [PSCustomObject]@{ Scenario = $Scenario; Verdict = 'awaiting-power-cut'; Detail = 'the host was asked to interrupt' }
 }
 
 function Invoke-WacCampaignRecoveryCheck {
-    <#
-    .SYNOPSIS
-        Runs after a real interruption: does the documented recovery path leave a coherent machine?
-    .DESCRIPTION
-        Re-running the installer IS the recovery path, and that is exactly why no separate
-        "clear the record" command exists. What is asserted is the machine AFTERWARDS - the files,
-        the registration and the records agreeing - not the verdict label the recovery printed.
-    #>
+    <# Exit zero alone is not task/file coherence. Read postconditions independently. #>
     param([Parameter(Mandatory = $true)]$State, [Parameter(Mandatory = $true)][string]$ProjectRoot)
-
     $scenario = [string]$State.cutStep
-
     if ($scenario -ceq 'power-loss-during-uninstall') {
-        # FIRST, before anything resolves the interrupted removal: an installer must refuse while
-        # the intent stands, and FR-015 requires it to name the file that is blocking it.
-        $premature = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
-        $refused = $premature.ExitCode -ne 0
-        $named = $premature.Output -match '(?i)\.json|record|intent'
-
+        $premature = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') `
+            -ArgumentList @('-NoPause', '-ResetWindowsUpdateBase:$false')
+        $refused = $premature.ExitCode -ne 0 -and $premature.Output -match '(?i)record|intent|\.json'
         $finish = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Uninstall-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
-        $tasks = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
-
-        $verdict = if ($refused -and $named -and $finish.ExitCode -eq 0 -and $tasks.Count -eq 0) { 'passed' } else { 'failed' }
-        $intent = (Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup') + '.uninstall.json'
-        return [PSCustomObject]@{ Scenario = $scenario; Verdict = $verdict
-            Detail = ('installerRefused={0} refusalNamedTheRecord={1} uninstallExit={2} tasksRemaining={3} || intentPresent={4} || the install said: {5}' -f
-                $refused, $named, $finish.ExitCode, $tasks.Count,
-                (Test-Path -LiteralPath $intent -PathType Leaf),
-                (Get-WacCampaignTail -Text ([string]$premature.Output))) }
+        $machine = Get-WacCampaignMachine
+        $ok = $refused -and $finish.ExitCode -eq 0 -and $machine.Clean
     }
-
-    # What the interrupted run LEFT, read BEFORE the recovery is allowed to consume it. A bare
-    # "no task registered" names a symptom and no cause; which records survived the cut separates
-    # "the journal never reached the disk" from "the journal was read and the recovery did not
-    # finish the job it described".
-    $deploymentRoot = Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup'
-    $suffixes = @('.transaction.json', '.taskcapture.json', '.uninstall.json')
-    $before = @($suffixes | Where-Object { Test-Path -LiteralPath ($deploymentRoot + $_) -PathType Leaf })
-    $tasksBefore = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
-    $runBefore = Test-Path -LiteralPath (Join-Path $deploymentRoot 'Run.ps1') -PathType Leaf
-
-    $recovery = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') -ArgumentList @('-NoPause')
-    $tasks = @(Get-ScheduledTask -TaskPath '\WindowsAutoCleanup\' -ErrorAction SilentlyContinue)
-    $runPresent = Test-Path -LiteralPath (Join-Path $deploymentRoot 'Run.ps1') -PathType Leaf
-    $after = @($suffixes | Where-Object { Test-Path -LiteralPath ($deploymentRoot + $_) -PathType Leaf })
-
-    # The pair is the claim: one generation's files under that same generation's registration. A
-    # registered task pointing at files that are not there is the defect this scenario hunts.
-    $coherent = ($recovery.ExitCode -eq 0) -and ($tasks.Count -eq 1) -and $runPresent
-    return [PSCustomObject]@{ Scenario = $scenario; Verdict = $(if ($coherent) { 'passed' } else { 'failed' })
-        Detail = ('recoveryExit={0} tasksRegistered={1} deployedRunPresent={2} resumeKind={3} || after the cut records=[{4}] tasks={5} run={6} || after recovery records=[{7}] || it said: {8}' -f
-            $recovery.ExitCode, $tasks.Count, $runPresent, [string]$State.resumeKind,
-            (($before | ForEach-Object { $_.Trim('.') }) -join ','), $tasksBefore.Count, $runBefore,
-            (($after | ForEach-Object { $_.Trim('.') }) -join ','),
-            (Get-WacCampaignTail -Text ([string]$recovery.Output))) }
+    else {
+        $finish = Invoke-WacCampaignHost -ScriptPath (Join-Path $ProjectRoot 'Install-WindowsAutoCleanupTask.ps1') `
+            -ArgumentList @('-NoPause', '-ResetWindowsUpdateBase:$false')
+        $machine = Get-WacCampaignMachine -ProjectRoot $ProjectRoot -Installed
+        $ok = $finish.ExitCode -eq 0 -and $machine.Coherent -and $machine.SafeMaintenance
+    }
+    return [PSCustomObject]@{ Scenario = $scenario; Verdict = $(if ($ok) { 'passed' } else { 'failed' })
+        Detail = ('recoveryExit={0} known={1} clean={2} coherent={3}' -f $finish.ExitCode, $machine.Known, $machine.Clean, $machine.Coherent) }
 }
 
 function Invoke-WacCampaignScenario {
-    <#
-    .SYNOPSIS
-        Dispatches one scenario by name.
-    .DESCRIPTION
-        The destructive pair is gated here as well as on the host, because the guest is the machine
-        that would actually lose the drivers. An authorization that only existed on the host would
-        be one delivered file away from not existing at all.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)]$State,
-        [Parameter(Mandatory = $true)][string]$StatePath,
-        [Parameter(Mandatory = $true)][scriptblock]$Save
-    )
-
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][string]$StatePath, [Parameter(Mandatory = $true)][scriptblock]$Save)
     $projectRoot = [string]$State.projectRoot
     $installer = Join-Path $projectRoot 'Install-WindowsAutoCleanupTask.ps1'
     $uninstaller = Join-Path $projectRoot 'Uninstall-WindowsAutoCleanupTask.ps1'
     $run = Join-Path $projectRoot 'Run.ps1'
-
-    # The durable records sit BESIDE the deployment root, never inside it, so no move or delete of a
-    # slot carries them off. Those exact names are what marks the transaction instant to interrupt:
-    # Get-WacDeploymentJournalPath builds them as <root>.transaction.json, .taskcapture.json and
-    # .uninstall.json, and the driver backups live under ProgramData instead.
-    $deploymentRoot = Join-Path -Path $env:ProgramFiles -ChildPath 'WindowsAutoCleanup'
+    $deploymentRoot = Join-Path $env:ProgramFiles 'WindowsAutoCleanup'
     $swapRecord = $deploymentRoot + '.transaction.json'
     $captureRecord = $deploymentRoot + '.taskcapture.json'
     $uninstallRecord = $deploymentRoot + '.uninstall.json'
-    $driverBackupRoot = Join-Path -Path $env:ProgramData -ChildPath 'WindowsAutoCleanup\DriverBackup'
-
-    if (@('driver-prune', 'reset-base') -ccontains $Name -and -not [bool]$State.destructiveAuthorized) {
-        return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'
-            Detail = 'the destructive scenarios were not authorized for this campaign, so this one did not run.' }
+    if (@('driver-prune', 'reset-base') -ccontains $Name -and ($State.destructiveAuthorized -isnot [bool] -or -not $State.destructiveAuthorized)) {
+        return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'; Detail = 'The destructive scenario was not authorized.' }
     }
-
     switch ($Name) {
         'service-dispatched-maintenance' { return (Invoke-WacCampaignMaintenance -ProjectRoot $projectRoot) }
-
         'power-loss-during-install' {
-            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-NoPause') `
-                -RecordPath @($swapRecord, $captureRecord) `
-                -State $State -StatePath $StatePath -Save $Save)
+            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-NoPause', '-ResetWindowsUpdateBase:$false') `
+                -RecordPath @($swapRecord, $captureRecord) -State $State -StatePath $StatePath -Save $Save)
         }
-
         'power-loss-during-uninstall' {
-            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-NoPause')
+            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-NoPause', '-ResetWindowsUpdateBase:$false')
             if ($prepare.ExitCode -ne 0) {
-                return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'
-                    Detail = ('nothing was installed to interrupt the removal of; installer exited {0}.' -f $prepare.ExitCode) }
+                return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'; Detail = ('installer exit=' + $prepare.ExitCode) }
             }
             return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $uninstaller -ArgumentList @('-NoPause') `
-                -RecordPath @($uninstallRecord) `
-                -State $State -StatePath $StatePath -Save $Save)
+                -RecordPath @($uninstallRecord) -State $State -StatePath $StatePath -Save $Save)
         }
-
         'reboot-recovery' {
-            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-NoPause')
+            $prepare = Invoke-WacCampaignHost -ScriptPath $installer -ArgumentList @('-NoPause', '-ResetWindowsUpdateBase:$false')
             if ($prepare.ExitCode -ne 0) {
-                return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'
-                    Detail = ('nothing was installed to restart across; installer exited {0}.' -f $prepare.ExitCode) }
+                return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'; Detail = ('installer exit=' + $prepare.ExitCode) }
             }
-            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-NoPause') `
-                -RecordPath @($swapRecord, $captureRecord) `
-                -State $State -StatePath $StatePath -Save $Save -ResumeKind 'reboot')
+            return (Start-WacCampaignInterruption -Scenario $Name -ScriptPath $installer -ArgumentList @('-NoPause', '-ResetWindowsUpdateBase:$false') `
+                -RecordPath @($swapRecord, $captureRecord) -State $State -StatePath $StatePath -Save $Save -ResumeKind 'reboot')
         }
-
         'driver-prune' {
+            $previous = Get-WacCampaignSummary
+            $previousId = if ($null -eq $previous) { '' } else { [string]$previous.executionId }
+            $began = [datetime]::UtcNow
             $result = Invoke-WacCampaignHost -ScriptPath $run -ArgumentList @('-PruneSupersededDrivers', '-ResetWindowsUpdateBase:$false')
             $summary = Get-WacCampaignSummary
-            $backup = @(Get-ChildItem -LiteralPath $driverBackupRoot -Recurse -Filter '*.inf' -File -ErrorAction SilentlyContinue)
-            $step = if ($null -eq $summary) { $null } else { @(@($summary.steps) | Where-Object { [string]$_.category -match 'driver' }) }
-            $verdict = if ($result.ExitCode -eq 0 -and $null -ne $step -and $step.Count -gt 0) { 'passed' } else { 'failed' }
-            return [PSCustomObject]@{ Scenario = $Name; Verdict = $verdict
-                Detail = ('exit={0} driverStepState={1} exportedInfFiles={2}' -f $result.ExitCode,
-                    $(if ($null -ne $step -and $step.Count -gt 0) { [string]$step[0].state } else { 'absent' }), $backup.Count) }
+            $ok = Test-WacCampaignRunEvidence -Summary $summary -PreviousId $previousId -StartedUtc $began `
+                -ObservedExit $result.ExitCode -Category 'Superseded driver packages (pnputil)'
+            return [PSCustomObject]@{ Scenario = $Name; Verdict = $(if ($ok) { 'passed' } else { 'failed' })
+                Detail = ('Fresh executed pnputil pruning evidence={0}; exit={1}' -f $ok, $result.ExitCode) }
         }
-
         'reset-base' {
+            $previous = Get-WacCampaignSummary
+            $previousId = if ($null -eq $previous) { '' } else { [string]$previous.executionId }
+            $began = [datetime]::UtcNow
             $result = Invoke-WacCampaignHost -ScriptPath $run -ArgumentList @('-ResetWindowsUpdateBase')
             $summary = Get-WacCampaignSummary
-            $step = if ($null -eq $summary) { $null } else { @(@($summary.steps) | Where-Object { [string]$_.category -match 'DISM' }) }
-            $verdict = if ($result.ExitCode -eq 0 -and $null -ne $step -and $step.Count -gt 0 -and [string]$step[0].state -ceq 'executed') { 'passed' } else { 'failed' }
-            return [PSCustomObject]@{ Scenario = $Name; Verdict = $verdict
-                Detail = ('exit={0} componentStoreStep={1}. Updates installed before this run can no longer be uninstalled on this guest.' -f
-                    $result.ExitCode, $(if ($null -ne $step -and $step.Count -gt 0) { [string]$step[0].state } else { 'absent' })) }
+            $ok = Test-WacCampaignRunEvidence -Summary $summary -PreviousId $previousId -StartedUtc $began `
+                -ObservedExit $result.ExitCode -Category 'Windows component store cleanup (DISM)'
+            return [PSCustomObject]@{ Scenario = $Name; Verdict = $(if ($ok) { 'passed' } else { 'failed' })
+                Detail = ('Fresh authorized component-store evidence={0}; exit={1}' -f $ok, $result.ExitCode) }
         }
-
-        default {
-            return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'; Detail = 'no such scenario' }
-        }
+        default { return [PSCustomObject]@{ Scenario = $Name; Verdict = 'failed'; Detail = 'No such scenario.' } }
     }
 }
