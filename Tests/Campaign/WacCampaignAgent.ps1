@@ -15,6 +15,7 @@ $script:KvpKey = 'HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest'
 $script:Prefix = 'WacCampaign.'
 $script:Chunk = 900
 $script:LogPath = Join-Path $Root 'agent.log'
+$script:CampaignChannelAvailable = $false
 
 function Write-WacCampaignAgentLog {
     param([AllowEmptyString()][string]$Text, [ValidateSet('INFO', 'WARNING', 'ERROR', 'DEBUG')][string]$Level = 'INFO')
@@ -64,13 +65,25 @@ function Reset-WacCampaignMachine {
         Detail = ('uninstaller exit={0}; independently clean={1}' -f $ran.ExitCode, $after.Clean) }
 }
 function Set-WacCampaignDurableArming {
-    <# Manual registration is the authority. A legacy entry cannot silently manufacture new arming. #>
+    <# Preserve the owner's legacy startup entry while upgrading to the verified durable task. #>
+    param([string]$RegistrationScript = (Join-Path $PSScriptRoot 'Register-WacCampaignAgent.ps1'),
+        [string]$AgentSource = (Join-Path $PSScriptRoot 'WacCampaignAgent.ps1'))
     $existing = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
         $_.TaskPath -ieq '\WindowsAutoCleanupCampaign\' -and $_.TaskName -ieq 'CampaignAgent'
     })
-    if ($existing.Count -ne 1) {
-        throw 'Run Register-WacCampaignAgent.ps1 manually in this disposable guest before starting campaigns.'
+    $wasRegistered = $false
+    if ($existing.Count -eq 0) {
+        # The owner-started guest agent may install its existing dedicated registration helper.
+        # Call the script with typed parameters; never rewrite or delete shared startup policy.
+        $global:LASTEXITCODE = 0
+        & $RegistrationScript -Root $Root -AgentPath $AgentSource
+        if ($LASTEXITCODE -ne 0) { throw 'Durable campaign registration failed.' }
+        $existing = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+            $_.TaskPath -ieq '\WindowsAutoCleanupCampaign\' -and $_.TaskName -ieq 'CampaignAgent'
+        })
+        $wasRegistered = $true
     }
+    if ($existing.Count -ne 1) { throw 'Exactly one verified agent registration is required.' }
     $expected = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Root "{1}"' -f
         (Join-Path (Join-Path $Root 'agent') 'WacCampaignAgent.ps1'), $Root.TrimEnd('\')
     if (@($existing[0].Actions).Count -ne 1 -or $existing[0].Actions[0].Arguments -cne $expected -or
@@ -78,7 +91,7 @@ function Set-WacCampaignDurableArming {
         throw 'The registered agent definition is not the explicitly armed definition for this directory.'
     }
     Write-WacCampaignAgentLog -Text 'Durable task verified; legacy startup policy remains untouched.'
-    return 'task-already-present'
+    return $(if ($wasRegistered) { 'task-registered' } else { 'task-already-present' })
 }
 function Expand-WacCampaignProject {
     param([Parameter(Mandatory = $true)][string]$Archive, [Parameter(Mandatory = $true)][string]$Destination)
@@ -123,6 +136,7 @@ try {
     if (@($hardware).Count -ne 1 -or -not (Test-WacCampaignGuest -Computer $hardware[0])) {
         throw 'Positive supported virtual hardware evidence is required; the agent is not armed here.'
     }
+    $script:CampaignChannelAvailable = $true
     Publish-WacCampaignValue -Name 'AgentBoot' -Value ([datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
     Publish-WacCampaignValue -Name 'AgentFault' -Value ''
     . (Join-Path $PSScriptRoot 'WacCampaignState.ps1')
@@ -231,7 +245,11 @@ try {
     Publish-WacCampaignValue -Name 'Status' -Value $status
     exit $(if ($status -ceq 'complete') { 0 } else { 1 })
 }
-catch { Publish-WacCampaignFault -Reason $_.Exception.Message; exit 1 }
+catch {
+    if ($script:CampaignChannelAvailable) { Publish-WacCampaignFault -Reason $_.Exception.Message }
+    else { Write-Error $_ -ErrorAction Continue }
+    exit 1
+}
 finally {
     $script:AgentMutex.ReleaseMutex()
     $script:AgentMutex.Dispose()

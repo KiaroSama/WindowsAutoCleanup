@@ -48,15 +48,21 @@ function Wait-WacCampaignFile {
 function Suspend-WacCampaignTree {
     <# Freeze only the identified root and verified descendants; unwind partial holds. #>
     param([Parameter(Mandatory = $true)][int]$ProcessId,
-        [Parameter(Mandatory = $true)][datetime]$ExpectedCreatedUtc)
+        [Parameter(Mandatory = $true)][datetime]$ExpectedCreatedUtc,
+        [Parameter(Mandatory = $true)][IntPtr]$Job)
     if (-not ('WacCampaign.Hold' -as [type])) {
         Add-Type -Namespace WacCampaign -Name Hold -MemberDefinition @'
 [DllImport("ntdll.dll")]
 public static extern int NtSuspendProcess(System.IntPtr processHandle);
 [DllImport("ntdll.dll")]
 public static extern int NtResumeProcess(System.IntPtr processHandle);
+[DllImport("kernel32.dll", SetLastError = true)]
+[return: MarshalAs(UnmanagedType.Bool)]
+public static extern bool IsProcessInJob(System.IntPtr processHandle, System.IntPtr jobHandle,
+    [MarshalAs(UnmanagedType.Bool)] out bool belongs);
 '@
     }
+    if ($Job -eq [IntPtr]::Zero) { throw 'A campaign hold requires the owned job identity.' }
     $held = New-Object 'Collections.Generic.List[object]'
     $queue = New-Object 'Collections.Generic.Queue[object]'
     $seen = @{}
@@ -70,7 +76,16 @@ public static extern int NtResumeProcess(System.IntPtr processHandle);
             $process = [Diagnostics.Process]::GetProcessById($next.Id)
             try {
                 $born = $process.StartTime.ToUniversalTime()
-                if (($next.Exact -and $born -ne $next.Born) -or $born -lt $next.Born) { throw 'A process identity changed.' }
+                $belongs = $false
+                if (-not [WacCampaign.Hold]::IsProcessInJob($process.Handle, $Job, [ref]$belongs)) { throw 'Cannot verify owned job membership.' }
+                if (-not $belongs) {
+                    if ($next.Exact) { throw 'The root no longer belongs to the owned job.' }
+                    # An OS-created auxiliary child may not belong to this job; never suspend it.
+                    $process.Dispose()
+                    continue
+                }
+                if (($next.Exact -and $born -ne $next.Born) -or
+                    (-not $next.Exact -and [Math]::Abs(($born - $next.Born).TotalMilliseconds) -gt 1)) { throw 'A process identity changed.' }
                 if ([WacCampaign.Hold]::NtSuspendProcess($process.Handle) -ne 0) { throw 'A process could not be held.' }
             }
             catch { $process.Dispose(); throw }
@@ -78,9 +93,10 @@ public static extern int NtResumeProcess(System.IntPtr processHandle);
             $seen[[int]$process.Id] = $true
             # A held parent cannot spawn after this query. Traverse recursively, not twice at root.
             foreach ($child in @(Get-CimInstance Win32_Process -Filter ('ParentProcessId={0}' -f $process.Id) -ErrorAction Stop)) {
-                $queue.Enqueue([PSCustomObject]@{ Id = [int]$child.ProcessId; Born = $born; Exact = $false })
+                $queue.Enqueue([PSCustomObject]@{ Id = [int]$child.ProcessId; Born = $child.CreationDate.ToUniversalTime(); Exact = $false })
             }
         }
+        if ([WacOwnedProcess]::ActiveProcessesInJob($Job) -ne $held.Count) { throw 'An owned job member was not held; no cut is authorized.' }
         return [PSCustomObject]@{ RootHeld = $true; Processes = @($held.ToArray()); Detail = ('held ' + $held.Count + ' identified processes') }
     }
     catch {
@@ -114,7 +130,8 @@ function Invoke-WacCampaignHost {
         if ($seen.ContainsKey($name)) { throw ('Duplicate campaign switch: ' + $name) }
         $seen[$name] = $true
         $value = if ($Matches.ContainsKey(2) -and $Matches[2] -ieq 'false') { '0' } else { '1' }
-        $argv += @('-' + $map[$name], $value)
+        $argv += ('-' + $map[$name])
+        $argv += [string]$value
     }
     $exe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     if ([IO.Path]::GetFileName($exe) -notmatch '^(powershell|pwsh)\.exe$') {
@@ -160,7 +177,15 @@ function Close-WacCampaignLaunch {
     param([Parameter(Mandatory = $true)]$Started)
     try {
         [void][WacOwnedProcess]::TerminateJob($Started.Launch.Job)
-        [void][WacOwnedProcess]::WaitForExit($Started.Launch.Process, 5000)
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            $active = [WacOwnedProcess]::ActiveProcessesInJob($Started.Launch.Job)
+            if ($active -eq 0) { break }
+            Start-Sleep -Milliseconds 50
+        } while ($watch.ElapsedMilliseconds -lt 5000)
+        if ($active -ne 0 -or -not [WacOwnedProcess]::WaitForExit($Started.Launch.Process, 0)) {
+            throw 'The failed campaign launch did not prove whole-job termination.'
+        }
     }
     finally {
         [WacOwnedProcess]::Close($Started.Launch)
@@ -224,7 +249,7 @@ function Start-WacCampaignInterruption {
     $armed = $false; $held = $null
     try {
         if (-not (Wait-WacCampaignFile -Path $RecordPath -TimeoutSeconds 240)) { throw 'No transaction record was observed.' }
-        $held = Suspend-WacCampaignTree -ProcessId $started.Process.Id -ExpectedCreatedUtc $started.Process.StartTime.ToUniversalTime()
+        $held = Suspend-WacCampaignTree -ProcessId $started.Process.Id -ExpectedCreatedUtc $started.Process.StartTime.ToUniversalTime() -Job $started.Launch.Job
         $tree = Get-WacOwnedTreeState -Launch $started.Launch
         if (-not $held.RootHeld -or $tree.State -cne 'Alive' -or
             $tree.ActiveProcesses -ne @($held.Processes).Count) { throw 'The complete owned tree was not proven held.' }

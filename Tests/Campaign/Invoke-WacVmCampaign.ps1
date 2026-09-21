@@ -105,6 +105,7 @@ function Invoke-CampaignOneScenario {
         $signal = Wait-WacCampaignSignal -VMName $Vm.Name -VmId $Vm.Id -TimeoutSeconds $remaining -IdleSeconds 900 -Until {
             param($item)
             if ($item.ContainsKey('AgentFault') -and -not [string]::IsNullOrWhiteSpace([string]$item.AgentFault)) { return $true }
+            if (-not $item.ContainsKey('ActiveCampaign') -or -not $item.ContainsKey('ActiveScenario')) { return $false }
             if ($item.ActiveCampaign -cne $Payload.CampaignId -or $item.ActiveScenario -cne $Payload.Scenario) { return $false }
             return ($item.ContainsKey('Await') -and -not [string]::IsNullOrWhiteSpace([string]$item.Await)) -or
                 ($item.ContainsKey('Status') -and @('complete', 'failed') -ccontains [string]$item.Status)

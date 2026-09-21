@@ -66,8 +66,13 @@ function Save-WacCampaignState {
     finally { $stream.Dispose() }
     # A failure deliberately leaves pending plus the previous authoritative file for inspection.
     if (Test-WacCampaignPathPresent -Path $Path) {
-        $null = Get-WacCampaignStateValue -Path $Path
-        [IO.File]::Replace($pending, $Path, $null)
+        $previous = Get-WacCampaignStateValue -Path $Path
+        if ($previous.campaignId -cne $State.campaignId -or $previous.commit -cne $State.commit -or
+            $previous.projectRoot -cne $State.projectRoot -or
+            (@($previous.scenarios) -join '|') -cne (@($State.scenarios) -join '|')) {
+            throw 'Publication cannot replace a different campaign identity.'
+        }
+        [IO.File]::Replace($pending, $Path, [Management.Automation.Language.NullString]::Value)
     }
     else { [IO.File]::Move($pending, $Path) }
 }
@@ -86,7 +91,19 @@ function Get-WacCampaignStateValue {
 function Get-WacCampaignPayloadFingerprint {
     param([Parameter(Mandatory = $true)][string]$Directory, [switch]$Flush)
     $root = [IO.Path]::GetFullPath($Directory).TrimEnd('\')
-    $items = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop | Sort-Object FullName)
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($root)
+    $files = New-Object 'Collections.Generic.List[object]'
+    while ($pending.Count -gt 0) {
+        $directoryPath = $pending.Pop()
+        $attributes = [IO.File]::GetAttributes($directoryPath)
+        if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Campaign payload directory is a reparse point.' }
+        foreach ($entry in @(Get-ChildItem -LiteralPath $directoryPath -Force -ErrorAction Stop)) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Campaign payload contains a reparse point.' }
+            if ($entry.PSIsContainer) { $pending.Push($entry.FullName) } else { [void]$files.Add($entry) }
+        }
+    }
+    $items = @($files.ToArray() | Sort-Object FullName)
     $rows = New-Object 'Collections.Generic.List[string]'
     foreach ($item in $items) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Campaign payload cannot contain reparse points.' }
