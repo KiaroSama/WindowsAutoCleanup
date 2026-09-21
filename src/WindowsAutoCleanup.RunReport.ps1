@@ -187,6 +187,30 @@ function Get-WacRunLevelOutcome {
     return $outcome
 }
 
+function Set-WacRunExitState {
+    <#
+    .SYNOPSIS
+        Records the exact process exit and its broad outcome before any terminal path leaves.
+    .DESCRIPTION
+        ExitCode remains authoritative: e.g. platform refusal is 5, while trust refusal is 7.
+        The JSON outcome describes their shared kind without remapping these public exit codes.
+    #>
+    param([Parameter(Mandatory = $true)][int]$ExitCode, [string]$Outcome = '')
+
+    $script:ExitCode = $ExitCode
+    if ([string]::IsNullOrWhiteSpace($Outcome)) {
+        $Outcome = switch ($ExitCode) {
+            0 { 'Succeeded' }
+            3 { 'Incomplete' }
+            5 { 'SecurityRefusal' }
+            6 { 'Incomplete' }
+            7 { 'SecurityRefusal' }
+            default { 'Failed' }
+        }
+    }
+    $script:FinalOutcome = $Outcome
+}
+
 function Write-WacRunVerdict {
     <#
     .SYNOPSIS
@@ -201,6 +225,7 @@ function Write-WacRunVerdict {
 
     $script:Stopwatch.Stop()
     $exitCode = [int]$script:OutcomeExitCode[$Outcome]
+    Set-WacRunExitState -ExitCode $exitCode -Outcome $Outcome
 
     Write-WacLog -Level ([string]$script:OutcomeLogLevel[$Outcome]) -Component 'Run' -Message 'Final status.' -Data @{
         status = $Outcome

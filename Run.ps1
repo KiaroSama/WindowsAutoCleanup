@@ -122,7 +122,17 @@ $SkipCategory = @($SkipCategory | ForEach-Object { $_ -split ',' } | ForEach-Obj
 $script:ScriptPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 $script:ScriptRoot = Split-Path -Parent $script:ScriptPath
 $script:Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-$script:ExitCode = 0
+# Safe terminal defaults also cover exceptions before a normal footer exists.
+$script:ExitCode = 1
+$script:FinalOutcome = 'Failed'
+$script:SummaryMode = if ($Preview) { 'preview' } else { 'cleanup' }
+$script:SummaryAvailable = $false
+$logInitialised = $false
+$targetResults = New-Object 'System.Collections.Generic.List[object]'
+$stepResults = New-Object 'System.Collections.Generic.List[object]'
+$freeBefore = $null
+$freeAfter = $null
+$rebootRequired = $false
 
 # The budget is measured from HERE rather than from wherever Initialize-WacRun happens to arm it.
 # Loading five modules, taking the lock and reaching the trust verdict is work this run performs,
@@ -303,6 +313,7 @@ foreach ($runPart in @('WindowsAutoCleanup.RunReport.ps1', 'WindowsAutoCleanup.R
     $partPath = Join-Path -Path $moduleRoot -ChildPath $runPart
     try {
         . $partPath
+        if ($runPart -ceq 'WindowsAutoCleanup.RunSummary.ps1') { $script:SummaryAvailable = $true }
     }
     catch {
         Write-WacBootstrapLine -Message ('The run part {0} failed to load: {1}' -f $runPart, $_.Exception.Message)
@@ -496,11 +507,15 @@ try {
             Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Administrator privileges are required and a scheduled run is not elevated.'
             exit 1
         }
-        exit (Invoke-WacElevatedRelaunch)
+        $script:SummaryMode = 'delegated'
+        $childExit = Invoke-WacElevatedRelaunch
+        Set-WacRunExitState -ExitCode $childExit
+        exit $childExit
     }
 
     if (-not (Test-WacSystemDriveSupported)) {
         Write-WacLog -Level CRITICAL -Component 'Run' -Message 'The online system drive is not C:. Every cleanup location in this tool is written for C:, so mixing the two could delete data belonging to a different Windows installation.' -Data @{ systemDrive = $env:SystemDrive }
+        Set-WacRunExitState -ExitCode 5
         exit 5
     }
 
@@ -509,6 +524,7 @@ try {
     if (-not $script:OperationLock) {
         # Benign as an event, and still the only thing this run will ever say about why it exited 3.
         Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Another WindowsAutoCleanup operation already holds the machine-wide lock; exiting without mutating anything.' -Data @{ mutex = $MutexName }
+        Set-WacRunExitState -ExitCode 3
         exit 3
     }
 
@@ -545,8 +561,6 @@ try {
     [void](Remove-WacOldLog -LogDirectory (Get-WacLogDirectory) -Pattern 'WindowsAutoCleanup_*.log' -KeepCount 30)
 
     $freeBefore = Get-WacRunTelemetry -What 'free space on C:' -Probe { Get-WacFreeBytes -Drive 'C:' }
-    $targetResults = New-Object 'System.Collections.Generic.List[object]'
-    $stepResults = New-Object 'System.Collections.Generic.List[object]'
     $effectiveSkip = New-Object 'System.Collections.Generic.List[string]'
     foreach ($category in $SkipCategory) { [void]$effectiveSkip.Add($category) }
 
@@ -649,16 +663,11 @@ try {
     $script:ExitCode = Write-WacRunFooter -TargetResult @($targetResults.ToArray()) -StepResult @($stepResults.ToArray()) `
         -FreeBytesBefore $freeBefore -FreeBytesAfter $freeAfter -RebootRequired $rebootRequired
 
-    # A SECOND COPY of the verdict, for a reader that is not a person. Written after the footer
-    # decided, so it can never disagree with the exit code, and its failure is only a warning: the
-    # run's answer is the log's and the exit code's, and this repeats it in a shape a monitor reads.
-    [void](Write-WacRunSummary -Outcome ([string]$script:FinalOutcome) -ExitCode ([int]$script:ExitCode) `
-            -StepResult @($stepResults.ToArray()) -TargetResult @($targetResults.ToArray()) `
-            -FreeBytesBefore $freeBefore -FreeBytesAfter $freeAfter -RebootRequired $rebootRequired)
-
     exit $script:ExitCode
 }
 catch {
+    $script:ExitCode = 1
+    $script:FinalOutcome = 'Failed'
     Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Unhandled error.' -Data @{
         error = $_.Exception.Message
         at    = if ($_.InvocationInfo) { [string]$_.InvocationInfo.PositionMessage } else { '' }
@@ -670,6 +679,25 @@ finally {
     # operation on this machine - an installer replacing this deployment, the uninstaller removing
     # it - and letting it start while this run still has an open handle on its own audit log is how
     # a run ends up without the record of how it ended.
-    Close-WacLog
-    Exit-WacBootstrapLock
+    try {
+        $script:Stopwatch.Stop()
+        if ($logInitialised -and $script:SummaryAvailable) {
+            try {
+                [void](Write-WacRunSummary -Outcome ([string]$script:FinalOutcome) -ExitCode ([int]$script:ExitCode) `
+                    -StepResult @($stepResults.ToArray()) -TargetResult @($targetResults.ToArray()) `
+                    -FreeBytesBefore $freeBefore -FreeBytesAfter $freeAfter -RebootRequired $rebootRequired `
+                    -Mode $script:SummaryMode)
+            }
+            catch {
+                # Even a broken reporting/logging helper must not change the exit already chosen,
+                # skip log closure or leave the operation lock held by an in-process caller.
+                try { Write-WacLog -Level WARNING -Component 'Summary' -Message 'Terminal JSON reporting failed; the process exit is unchanged.' }
+                catch { $null = $_ }
+            }
+        }
+    }
+    finally {
+        try { Close-WacLog }
+        finally { Exit-WacBootstrapLock }
+    }
 }
