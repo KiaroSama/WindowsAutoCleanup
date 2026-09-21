@@ -1,0 +1,189 @@
+name: Apply reviewed reporting patch
+
+on:
+  push:
+    branches: [audit/review7-state-safety]
+    paths: [.github/workflows/review7-apply.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.repository == 'KiaroSama/WindowsAutoCleanup' && github.actor == 'KiaroSama' && github.ref == 'refs/heads/audit/review7-state-safety'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Apply only the byte-verified source changes
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, subprocess
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^']).decode().strip() == 'ccdc3a5f0d9aebc559770d53f2121411a50b42bc'
+          expected = {
+              'Run.ps1': 'aa57824479b7a37a9f8a0c12d3f1488b37156b537437e9615b956ab1c82cdc7c',
+              'src/WindowsAutoCleanup.RunSummary.ps1': 'b61453118b0c789ddb5a9101fc13f03215024bb9344c53cd2c45704ba6bbda82',
+              'src/WindowsAutoCleanup.RunReport.ps1': '80d45adbe4bfc9d4d8b6d2ed3d809e10e03f14e43a67be9a1ee429a3be8544dc',
+              'src/WindowsAutoCleanup.RunPreview.ps1': '8b6b899febdbfb140a8bf3dc86ddb77040bef2cd4689334afcb9d5175b198acc'
+          }
+          texts = {}
+          for name, digest in expected.items():
+              text = Path(name).read_text()
+              assert hashlib.sha256(text.encode()).hexdigest() == digest, name
+              texts[name] = text
+          def replace(name, old, new, count=1):
+              assert texts[name].count(old) == count, (name, old)
+              texts[name] = texts[name].replace(old, new)
+          n = 'src/WindowsAutoCleanup.RunSummary.ps1'
+          replace(n, "    if ($stated -ccontains 'Attempted' -and [bool]$Result.Attempted) { return 'executed' }", "    if ($stated -cnotcontains 'Attempted' -or $Result.Attempted -isnot [bool]) { return 'unstated' }\n    if ([bool]$Result.Attempted) { return 'executed' }")
+          replace(n, "        return 'unarmed'", "        if ([string]$Result.Outcome -ceq 'Failed') { return 'refused' }\n        if (@('Succeeded', 'SafeSkip') -ccontains [string]$Result.Outcome) { return 'unarmed' }\n        return 'unstated'")
+          replace(n, "        [bool]$RebootRequired\n", "        [bool]$RebootRequired,\n        [ValidateSet('cleanup', 'preview', 'delegated')][string]$Mode = 'cleanup'\n", 2)
+          replace(n, '-FreeBytesAfter $FreeBytesAfter -RebootRequired $RebootRequired)', '-FreeBytesAfter $FreeBytesAfter -RebootRequired $RebootRequired -Mode $Mode)')
+          replace(n, '        schema = $script:RunSummarySchema', '        schema = $script:RunSummarySchema\n        mode = $Mode')
+          replace(n, '''    # Written whole, with the same encoding the log uses. A torn summary is worse than none: it
+              # looks like an answer. A failure here throws to the caller, which owns the one catch.
+              [System.IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $document -Depth 6),
+                  (New-Object System.Text.UTF8Encoding($false)))
+              return $true''', '''    # Serialize BEFORE creating a name. A collision is not our file, even when it is a hard link
+              # to an ordinary file: never open, truncate or replace it. Bind creation to the same trusted
+              # directory primitive used by the audit log rather than resolving its pathname a second time.
+              $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes((ConvertTo-Json -InputObject $document -Depth 6))
+              $full = [System.IO.Path]::GetFullPath($Path)
+              $directory = Open-WacTrustedDirectory -Path ([System.IO.Path]::GetDirectoryName($full)) `
+                  -RequireMachineTrust:(Test-WacIsAdministrator)
+              try {
+                  if (-not $directory.IsTrusted) { throw ('The summary directory was refused: ' + [string]$directory.Reason) }
+                  $created = New-WacBoundFile -DirectoryHandle $directory.Handle -Name ([System.IO.Path]::GetFileName($full))
+                  if ([string]$created.Kind -cne 'Created') {
+                      throw ('The summary name could not be exclusively created: ' + [string]$created.Kind)
+                  }
+                  try {
+                      $created.Stream.Write($bytes, 0, $bytes.Length)
+                      $created.Stream.Flush($true)
+                  }
+                  finally { $created.Stream.Dispose() }
+              }
+              finally {
+                  if ($directory.Handle -ne [IntPtr]::Zero) { [void](Close-WacTrustedDirectory -Handle $directory.Handle) }
+              }
+              # This is not an atomic-rename protocol. A process kill or storage failure can leave incomplete
+              # JSON; readers must reject it and must never infer success from file existence alone.
+              return $true''')
+          n = 'src/WindowsAutoCleanup.RunReport.ps1'
+          replace(n, 'function Write-WacRunVerdict {', '''function Set-WacRunExitState {
+              <#
+              .SYNOPSIS
+                  Records the exact process exit and its broad outcome before any terminal path leaves.
+              .DESCRIPTION
+                  ExitCode remains authoritative: e.g. platform refusal is 5, while trust refusal is 7.
+                  The JSON outcome describes their shared kind without remapping these public exit codes.
+              #>
+              param([Parameter(Mandatory = $true)][int]$ExitCode, [string]$Outcome = '')
+
+              $script:ExitCode = $ExitCode
+              if ([string]::IsNullOrWhiteSpace($Outcome)) {
+                  $Outcome = switch ($ExitCode) {
+                      0 { 'Succeeded' }
+                      3 { 'Incomplete' }
+                      5 { 'SecurityRefusal' }
+                      6 { 'Incomplete' }
+                      7 { 'SecurityRefusal' }
+                      default { 'Failed' }
+                  }
+              }
+              $script:FinalOutcome = $Outcome
+          }
+
+          function Write-WacRunVerdict {''')
+          replace(n, '    $exitCode = [int]$script:OutcomeExitCode[$Outcome]', '    $exitCode = [int]$script:OutcomeExitCode[$Outcome]\n    Set-WacRunExitState -ExitCode $exitCode -Outcome $Outcome')
+          n = 'Run.ps1'
+          replace(n, '$script:ExitCode = 0', '''# Safe terminal defaults also cover exceptions before a normal footer exists.
+          $script:ExitCode = 1
+          $script:FinalOutcome = 'Failed'
+          $script:SummaryMode = if ($Preview) { 'preview' } else { 'cleanup' }
+          $script:SummaryAvailable = $false
+          $logInitialised = $false
+          $targetResults = New-Object 'System.Collections.Generic.List[object]'
+          $stepResults = New-Object 'System.Collections.Generic.List[object]'
+          $freeBefore = $null
+          $freeAfter = $null
+          $rebootRequired = $false''')
+          replace(n, '        . $partPath', "        . $partPath\n        if ($runPart -ceq 'WindowsAutoCleanup.RunSummary.ps1') { $script:SummaryAvailable = $true }")
+          replace(n, '        exit (Invoke-WacElevatedRelaunch)', '''        $script:SummaryMode = 'delegated'
+                  $childExit = Invoke-WacElevatedRelaunch
+                  Set-WacRunExitState -ExitCode $childExit
+                  exit $childExit''')
+          replace(n, '        exit 5', '        Set-WacRunExitState -ExitCode 5\n        exit 5')
+          replace(n, '        exit 3', '        Set-WacRunExitState -ExitCode 3\n        exit 3')
+          replace(n, "    $targetResults = New-Object 'System.Collections.Generic.List[object]'\n    $stepResults = New-Object 'System.Collections.Generic.List[object]'\n", '')
+          replace(n, '''    # A SECOND COPY of the verdict, for a reader that is not a person. Written after the footer
+              # decided, so it can never disagree with the exit code, and its failure is only a warning: the
+              # run's answer is the log's and the exit code's, and this repeats it in a shape a monitor reads.
+              [void](Write-WacRunSummary -Outcome ([string]$script:FinalOutcome) -ExitCode ([int]$script:ExitCode) `
+                      -StepResult @($stepResults.ToArray()) -TargetResult @($targetResults.ToArray()) `
+                      -FreeBytesBefore $freeBefore -FreeBytesAfter $freeAfter -RebootRequired $rebootRequired)
+
+          ''', '')
+          replace(n, "catch {\n    Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Unhandled error.'", "catch {\n    $script:ExitCode = 1\n    $script:FinalOutcome = 'Failed'\n    Write-WacLog -Level CRITICAL -Component 'Run' -Message 'Unhandled error.'")
+          replace(n, '    Close-WacLog\n    Exit-WacBootstrapLock\n}', '''    try {
+                  $script:Stopwatch.Stop()
+                  if ($logInitialised -and $script:SummaryAvailable) {
+                      try {
+                          [void](Write-WacRunSummary -Outcome ([string]$script:FinalOutcome) -ExitCode ([int]$script:ExitCode) `
+                              -StepResult @($stepResults.ToArray()) -TargetResult @($targetResults.ToArray()) `
+                              -FreeBytesBefore $freeBefore -FreeBytesAfter $freeAfter -RebootRequired $rebootRequired `
+                              -Mode $script:SummaryMode)
+                      }
+                      catch {
+                          # Even a broken reporting/logging helper must not change the exit already chosen,
+                          # skip log closure or leave the operation lock held by an in-process caller.
+                          try { Write-WacLog -Level WARNING -Component 'Summary' -Message 'Terminal JSON reporting failed; the process exit is unchanged.' }
+                          catch { $null = $_ }
+                      }
+                  }
+              }
+              finally {
+                  try { Close-WacLog }
+                  finally { Exit-WacBootstrapLock }
+              }
+          }''')
+          n = 'src/WindowsAutoCleanup.RunPreview.ps1'
+          replace(n, 'PREVIEW - nothing on this machine is changed by this run.', 'PREVIEW - no cleanup or maintenance is performed; audit/state bookkeeping still applies.')
+          replace(n, 'makes every installed update permanently un-installable', 'prevents uninstalling currently installed updates')
+          replace(n, '    $skip = @($SkipCategory', '''    Write-WacPreviewLine -Text 'Always-selected maintenance, subject to runtime safety and availability:'
+              Write-WacPreviewLine -Text '  [ON ] Delivery Optimization cache (supported cmdlet, otherwise allow-list fallback)'
+              Write-WacPreviewLine -Text '  [ON ] Windows component store cleanup (DISM /StartComponentCleanup, independent of /ResetBase)'
+              Write-WacPreviewLine -Text '  [ON ] Device driver package handler (pnpclean, independent of optional package pruning)'
+              Write-WacPreviewLine -Text 'SkipCategory filters file targets; it does not disable these maintenance steps.'
+              Write-WacPreviewLine -Text 'This is selection, not permission: quarantine, trust, availability and deadlines are checked at execution.'
+              Write-WacPreviewLine -Text ''
+
+              $skip = @($SkipCategory''')
+          final = {
+              'Run.ps1': '72021bc22ac15a033372086cfc062bdd3e1fa81e4382aea77ddbbdd724e2f5ef',
+              'src/WindowsAutoCleanup.RunSummary.ps1': '905b13df88a4b376bf70636d70da24812f1b0d33eeb59c48ac26be7902853347',
+              'src/WindowsAutoCleanup.RunReport.ps1': '4318bbc65ba4d612afc883aad9a99bf620cc524d906590de42597c2e746ab043',
+              'src/WindowsAutoCleanup.RunPreview.ps1': '7a66970b2a60a46af5b9b0e862c9c9de0271a6ad8d613e4b11defed403e465fb'
+          }
+          for name, text in texts.items():
+              assert text.isascii() and len(text.splitlines()) < 800, name
+              assert hashlib.sha256(text.encode()).hexdigest() == final[name], name
+              Path(name).write_text(text, newline='\n')
+      - name: Commit only the reviewed files to the existing branch
+        shell: bash
+        env:
+          REVIEW_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git add -- Run.ps1 src/WindowsAutoCleanup.RunSummary.ps1 src/WindowsAutoCleanup.RunReport.ps1 src/WindowsAutoCleanup.RunPreview.ps1
+          git rm -- .github/workflows/review7-apply.yml
+          git diff --cached --check
+          git config user.name 'WindowsAutoCleanup review'
+          git config user.email '106400900+KiaroSama@users.noreply.github.com'
+          git commit -m 'fix: bind summary creation and report every durably logged terminal path'
+          header=$(printf 'x-access-token:%s' "$REVIEW_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $header" push origin HEAD:refs/heads/audit/review7-state-safety
