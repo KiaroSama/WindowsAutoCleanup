@@ -1,43 +1,53 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Resume uses the actual monotonic comparison, staged bytes and the recorded campaign identity.
+    Resume uses the actual monotonic comparison, staged bytes and recorded campaign identity.
 .DESCRIPTION
-    Files and hashes are real. The uptime observation is supplied; no clock change or reboot occurs.
+    Files, hashes and module import are real. Only native uptime is supplied; no reboot occurs.
 #>
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '_Harness.ps1')
 . (Join-Path $PSScriptRoot 'Campaign\WacCampaignState.ps1')
-. (Join-Path (Split-Path -Parent $PSScriptRoot) 'src\WindowsAutoCleanup.Quarantine.ps1')
 Test-Case 'Same-boot relaunch, missing proof and changed payload refuse; a counter reset with intact bytes passes' {
     $sandbox = New-TestSandbox -Prefix 'campaign-resume'
+    $core = $null; $saved = $null
     try {
         $commit = 'b' * 40; $project = Join-Path $sandbox $commit.Substring(0, 12)
         [void][IO.Directory]::CreateDirectory($project)
+        Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'src') -Destination $project -Recurse -ErrorAction Stop
         $file = Join-Path $project 'payload.txt'; [IO.File]::WriteAllText($file, 'original')
+        $core = Import-Module (Join-Path $project 'src\WindowsAutoCleanup.Core.psm1') -DisableNameChecking -PassThru -ErrorAction Stop
+        $saved = & $core { (Get-Command Get-WacMachineUptimeMs).ScriptBlock }
+        & $core {
+            $script:ObservedUptime = 1500L
+            function script:Get-WacMachineUptimeMs { return $script:ObservedUptime }
+        }
         $state = [PSCustomObject]@{ commit = $commit; projectRoot = $project; cutUptimeMs = 1000L
             payloadFingerprint = (Get-WacCampaignPayloadFingerprint -Directory $project) }
-        # The actual comparison function above is retained; only its native observation is supplied.
-        function Import-Module { [CmdletBinding()]param($Name, [switch]$DisableNameChecking) $null = $Name; $null = $DisableNameChecking }
-        $script:ObservedUptime = 1500L
-        function Get-WacMachineUptimeMs { return $script:ObservedUptime }
+        # Test-WacCampaignResume imports the real staged module. No built-in command is shadowed.
         Assert-False (Test-WacCampaignResume -State $state -WorkRoot $sandbox) 'agent restart was treated as a reboot'
-        $script:ObservedUptime = 500L
+        & $core { $script:ObservedUptime = 500L }
         Assert-True (Test-WacCampaignResume -State $state -WorkRoot $sandbox) 'positive monotonic reset and intact payload were not accepted'
         $state.cutUptimeMs = $null
         Assert-False (Test-WacCampaignResume -State $state -WorkRoot $sandbox) 'legacy missing counter was accepted'
         $state.cutUptimeMs = 1000L
-        $script:ObservedUptime = $null
+        & $core { $script:ObservedUptime = $null }
         Assert-False (Test-WacCampaignResume -State $state -WorkRoot $sandbox) 'unreadable counter was accepted'
-        $script:ObservedUptime = 500L
+        & $core { $script:ObservedUptime = 500L }
         [IO.File]::WriteAllText($file, 'changed')
         Assert-False (Test-WacCampaignResume -State $state -WorkRoot $sandbox) 'changed payload was accepted'
         [IO.File]::WriteAllText($file, 'original')
         $state.projectRoot = Join-Path $sandbox 'foreign'
         Assert-False (Test-WacCampaignResume -State $state -WorkRoot $sandbox) 'foreign payload location was accepted'
     }
-    finally { Remove-TestSandbox -Path $sandbox }
+    finally {
+        if ($core) {
+            if ($saved) { & $core { param($body) Set-Item function:script:Get-WacMachineUptimeMs $body } $saved }
+            Remove-Module -ModuleInfo $core -Force
+        }
+        Remove-TestSandbox -Path $sandbox
+    }
 }
 Test-Case 'A valid but different campaign cannot replace authoritative state' {
     $sandbox = New-TestSandbox -Prefix 'campaign-identity'

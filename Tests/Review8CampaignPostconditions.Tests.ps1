@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Operation success is the conjunction of fresh evidence and verified teardown, not an exit alone.
+    Operation success requires fresh evidence and verified teardown, not an exit alone.
 .DESCRIPTION
     Scheduler, maintenance and inventory observations are fixtures. Nothing on the machine changes.
 #>
@@ -11,12 +11,14 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'Campaign\WacCampaignScenario.ps1')
 function Invoke-MaintenanceFixture {
     param([string]$Fault = '')
+    # Nested observation functions use one explicit fixture state, not an unused outer parameter.
+    $script:MaintenanceFault = $Fault
     $script:UninstallCalls = 0; $script:InfoCalls = 0; $script:SummaryCalls = 0; $script:TaskStarts = 0
     function Invoke-WacCampaignHost {
         param([string]$ScriptPath, $ArgumentList)
         if ($ScriptPath -like '*Uninstall*') {
             $script:UninstallCalls++
-            return [PSCustomObject]@{ ExitCode = $(if ($Fault -ceq 'uninstall') { 1 } else { 0 }); Output = '' }
+            return [PSCustomObject]@{ ExitCode = $(if ($script:MaintenanceFault -ceq 'uninstall') { 1 } else { 0 }); Output = '' }
         }
         Assert-True ($ArgumentList -contains '-ResetWindowsUpdateBase:$false')
         return [PSCustomObject]@{ ExitCode = 0; Output = '' }
@@ -24,15 +26,15 @@ function Invoke-MaintenanceFixture {
     function Get-WacCampaignMachine {
         param($ProjectRoot, [switch]$Installed)
         $null = $ProjectRoot
-        return [PSCustomObject]@{ Known = $Fault -cne 'denied'; SafeMaintenance = $Fault -cne 'policy'
+        return [PSCustomObject]@{ Known = $script:MaintenanceFault -cne 'denied'; SafeMaintenance = $script:MaintenanceFault -cne 'policy'
             Tasks = @([PSCustomObject]@{ TaskName = 'fixture'; TaskPath = '\fixture\' })
-            Clean = (-not $Installed -and @('residue', 'denied') -cnotcontains $Fault) }
+            Clean = (-not $Installed -and @('residue', 'denied') -cnotcontains $script:MaintenanceFault) }
     }
     function Get-ScheduledTaskInfo {
         [CmdletBinding()]param($InputObject)
         $null = $InputObject; $script:InfoCalls++
-        $stamp = if ($script:InfoCalls -eq 1 -or $Fault -ceq 'staleTask') { (Get-Date).AddDays(-1) } else { Get-Date }
-        return [PSCustomObject]@{ LastRunTime = $stamp; LastTaskResult = $(if ($Fault -ceq 'schedulerError') { 267009 } else { 0 }) }
+        $stamp = if ($script:InfoCalls -eq 1 -or $script:MaintenanceFault -ceq 'staleTask') { (Get-Date).AddDays(-1) } else { Get-Date }
+        return [PSCustomObject]@{ LastRunTime = $stamp; LastTaskResult = $(if ($script:MaintenanceFault -ceq 'schedulerError') { 267009 } else { 0 }) }
     }
     function Get-ScheduledTask {
         [CmdletBinding()]param($TaskPath, $TaskName)
@@ -41,7 +43,7 @@ function Invoke-MaintenanceFixture {
     function Start-ScheduledTask { [CmdletBinding()]param($InputObject) $null = $InputObject; $script:TaskStarts++ }
     function Get-WacCampaignSummary {
         $script:SummaryCalls++
-        $id = if ($script:SummaryCalls -eq 1 -or $Fault -ceq 'staleSummary') { 'old' } else { 'new' }
+        $id = if ($script:SummaryCalls -eq 1 -or $script:MaintenanceFault -ceq 'staleSummary') { 'old' } else { 'new' }
         return [PSCustomObject]@{ schema = 1; mode = 'cleanup'; executionId = $id; completedUtc = [datetime]::UtcNow.ToString('o')
             exitCode = 0; outcome = 'Succeeded'; steps = @() }
     }
