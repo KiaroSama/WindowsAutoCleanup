@@ -35,6 +35,51 @@ function Set-WacProcessHandleOpener {
     $script:ProcessHandleOpener = $Opener
 }
 
+# The identity a candidate refused a termination open actually has. Same contract as the opener:
+# inject the ANSWER (Known, ParentId, Created) because the only real producer is a protected
+# process, which a test must never try to end.
+$script:ProcessIdentityReader = $null
+function Set-WacProcessIdentityReader {
+    <#
+    .SYNOPSIS
+        Replaces the query-only identity read of a refused candidate. $null restores it.
+    #>
+    param([scriptblock]$Reader)
+    $script:ProcessIdentityReader = $Reader
+}
+
+function Read-WacRefusedCandidateIdentity {
+    <#
+    .SYNOPSIS
+        Parent id and creation time of a process that would not open for termination.
+    .DESCRIPTION
+        Through an access that can only QUERY. Known is $false whenever either fact could not be
+        read, and an unknown identity is never evidence that a process is not ours.
+    #>
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    if ($script:ProcessIdentityReader) {
+        $injected = & $script:ProcessIdentityReader $ProcessId
+        return [PSCustomObject]@{ Known = [bool]$injected.Known; ParentId = [int]$injected.ParentId; Created = [long]$injected.Created }
+    }
+    $result = [PSCustomObject]@{ Known = $false; ParentId = -1; Created = 0L }
+    if (-not (Initialize-WacProcessTreeNative) -or -not (Initialize-WacNative)) { return $result }
+    $handle = [IntPtr]::Zero
+    if ([WacProcessTree]::OpenForIdentity($ProcessId, [ref]$handle) -ne 0) { return $result }
+    try {
+        $parentId = -1
+        $created = 0L
+        if ([WacNative]::ReadProcessIdentity($handle, [ref]$parentId, [ref]$created)) {
+            $result.Known = $true
+            $result.ParentId = $parentId
+            $result.Created = $created
+        }
+    }
+    catch { $result.Known = $false }
+    finally { [WacNative]::CloseProcessHandle($handle) }
+    return $result
+}
+
 function Initialize-WacProcessTreeNative {
     <#
     .SYNOPSIS
@@ -83,7 +128,13 @@ public static class WacProcessTree
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
     private const uint TH32CS_SNAPPROCESS = 0x00000002;
+    // The one right a protected process still grants, and it grants nothing that can end, wait on
+    // or change the process: enough to read who its parent is and when it was created.
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000;
     // The ONLY Process32NextW failure that means the walk finished rather than broke. See the check
     // after the enumeration loop in GetDescendantIds.
     private const int ERROR_NO_MORE_FILES = 18;
@@ -153,6 +204,14 @@ public static class WacProcessTree
         {
             CloseHandle(snapshot);
         }
+    }
+
+    // For a candidate that refused a termination open. Returns 0 and a handle, or the Win32 error.
+    public static int OpenForIdentity(int processId, out IntPtr handle)
+    {
+        handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+        if (handle == IntPtr.Zero) { return Marshal.GetLastWin32Error(); }
+        return 0;
     }
 }
 '@
@@ -348,6 +407,15 @@ function Stop-WacProcessTree {
                 continue
             }
             if ($binding.Win32Error -eq 87) { continue }
+            # Refused a termination open. A protected process (csrss) answers exactly this, and its
+            # recorded parent id may be one a member has reused. The same ownership rule as above,
+            # read through a query-only access: excluded only when it is PROVEN not ours; anything
+            # else stays an unproven survivor.
+            $identity = Read-WacRefusedCandidateIdentity -ProcessId ([int]$id)
+            if ($identity.Known) {
+                $parent = @($bound | Where-Object { $_.Id -eq $identity.ParentId })
+                if ($parent.Count -ne 1 -or $identity.Created -lt $parent[0].Created) { continue }
+            }
             [void]$unreadable.Add([int]$id)
         }
     }

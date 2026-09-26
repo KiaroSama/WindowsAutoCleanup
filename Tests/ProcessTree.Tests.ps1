@@ -519,6 +519,75 @@ Test-Case 'A descendant whose state cannot be read keeps the verdict unproven' {
     }
 }
 
+function Invoke-RefusedCandidateCase {
+    <#
+    .SYNOPSIS
+        Kills a real tree whose CHILD refuses a termination open (Win32 5, what a protected process
+        answers) and whose query-only identity is the injected one. Returns verdict and child id.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Prefix, [Parameter(Mandatory = $true)][scriptblock]$Identity)
+
+    $sandbox = New-TestSandbox -Prefix $Prefix
+    $tree = $null
+    try {
+        $tree = Start-TestTree -Sandbox $sandbox
+        $childId = $tree.Child.Id
+        $rootId = $tree.Parent.Id
+        Set-WacProcessHandleOpener -Opener {
+            param($processId)
+            if ($processId -eq $childId) { return [PSCustomObject]@{ Handle = [IntPtr]::Zero; Win32Error = 5 } }
+            $handle = [IntPtr]::Zero
+            $code = [WacNative]::OpenProcessForTermination($processId, [ref]$handle)
+            return [PSCustomObject]@{ Handle = $handle; Win32Error = $code }
+        }.GetNewClosure()
+        $answer = & $Identity $rootId
+        Set-WacProcessIdentityReader -Reader {
+            param($processId)
+            $null = $processId
+            return $answer
+        }.GetNewClosure()
+        $verdict = Stop-WacProcessTree -ProcessId $rootId -TimeoutMs 10000
+        return [PSCustomObject]@{ Verdict = $verdict; ChildId = $childId }
+    }
+    finally {
+        Set-WacProcessHandleOpener -Opener $null
+        Set-WacProcessIdentityReader -Reader $null
+        if ($tree) {
+            Stop-TestProcess -Process $tree.Parent
+            Stop-TestProcess -Process $tree.Child
+        }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
+
+Test-Case 'A refused candidate that is provably not a member is excluded, never a survivor' {
+    # The CI failure of 2026-09-26: csrss, 14 minutes older than the tree, named as its parent an id
+    # a tree member had reused. Older than its alleged parent, or not the child of a bound member:
+    # either fact read through a query-only access proves it is not ours.
+    $shapes = @(
+        @{ Name = 'older than its bound parent'; Identity = { param($rootId) [PSCustomObject]@{ Known = $true; ParentId = $rootId; Created = 1L } } },
+        @{ Name = 'child of an unbound process'; Identity = { param($rootId) $null = $rootId; [PSCustomObject]@{ Known = $true; ParentId = 4; Created = [long]::MaxValue } } }
+    )
+    foreach ($shape in $shapes) {
+        $run = Invoke-RefusedCandidateCase -Prefix 'treeghost' -Identity $shape.Identity
+        Assert-True $run.Verdict.Proven ('an unrelated protected candidate made the kill unproven ({0}): {1}' -f $shape.Name, $run.Verdict.Reason)
+        Assert-False (@($run.Verdict.Survivor) -contains $run.ChildId) ('an unrelated candidate was named a survivor: ' + $shape.Name)
+        Assert-False (@($run.Verdict.Bound) -contains $run.ChildId) ('an unrelated candidate was bound: ' + $shape.Name)
+    }
+}
+
+Test-Case 'A refused candidate that is a member, or cannot be read, stays an unproven survivor' {
+    $shapes = @(
+        @{ Name = 'a genuine member'; Identity = { param($rootId) [PSCustomObject]@{ Known = $true; ParentId = $rootId; Created = [long]::MaxValue } } },
+        @{ Name = 'an unreadable identity'; Identity = { param($rootId) $null = $rootId; [PSCustomObject]@{ Known = $false; ParentId = -1; Created = 0L } } }
+    )
+    foreach ($shape in $shapes) {
+        $run = Invoke-RefusedCandidateCase -Prefix 'treemember' -Identity $shape.Identity
+        Assert-False $run.Verdict.Proven ('a refused candidate was read as gone ({0})' -f $shape.Name)
+        Assert-True (@($run.Verdict.Survivor) -contains $run.ChildId) ('the refused candidate is missing from the survivors: ' + $shape.Name)
+    }
+}
+
 Test-Case 'The root exit check runs BEFORE the tree is read, so a dead pid never adopts strangers' {
     <#
         This is an ordering rule, so it is asserted as one. The behavioural case above passes either

@@ -88,7 +88,7 @@ Export-ModuleMember -Function @(
     'Write-WacQuarantineMarker', 'Get-WacCurrentProcessCreated',
     'ConvertTo-WacCommandLineArgument', 'ConvertTo-WacCommandLine',
     'ConvertTo-WacPowerShellLiteral', 'Get-WacRelaunchCommand', 'Get-WacRelaunchArgument',
-    'Stop-WacProcessTree', 'Set-WacProcessHandleOpener',
+    'Stop-WacProcessTree', 'Set-WacProcessHandleOpener', 'Set-WacProcessIdentityReader',
     'Start-WacOwnedProcess', 'Get-WacOwnedTreeState', 'Set-WacOwnedProcessLauncher',
     'Set-WacOwnedProcessFault', 'Get-WacOwnedProcessRawCloseCount',
     'Wait-WacOwnedTreeQuiet', 'Set-WacOwnedRunFault',
