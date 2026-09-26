@@ -438,7 +438,8 @@ that only previews is a machine nobody is cleaning, reporting success every nigh
 
 **A `.summary.json` beside every run's log**, same base name, versioned by a `schema` field. The log
 is written for a person, one line per event; this answers "did last night's run clean, or did it
-refuse?" without parsing prose. Every step carries one of four states - `executed`, `refused`,
+refuse?" without parsing prose. Its `mode` says whether the run was a `cleanup`, a `preview`
+or an unelevated parent that `delegated` the work to its elevated relaunch. Every step carries one of four states - `executed`, `refused`,
 `unarmed` or `unstated` - because a step that was switched off and a step the run refused look
 identical in any count of deleted files, and only one of them means the machine is fine. It holds
 outcomes, categories, counts and durations: no command line, no environment, no per-path inventory
