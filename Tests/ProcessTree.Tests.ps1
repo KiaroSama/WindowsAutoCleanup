@@ -588,6 +588,34 @@ Test-Case 'A refused candidate that is a member, or cannot be read, stays an unp
     }
 }
 
+Test-Case 'A real protected process refuses termination yet yields its identity to an administrator' {
+    # The injected cases above assume what this one measures on the real thing (spec 003 T012):
+    # csrss refuses a termination open, and the query-only read still answers. An elevated CI runner
+    # is where the original failure happened, so that is where the read must succeed. Unelevated,
+    # even the query-only open is refused (measured 2026-09-26), and the read must say Unknown
+    # rather than throw or invent an identity - which keeps the candidate an unproven survivor.
+    $target = @(Get-Process -Name 'csrss' -ErrorAction SilentlyContinue | Sort-Object -Property Id)
+    Assert-True ($target.Count -gt 0) 'no csrss process was found to probe'
+    $targetId = $target[0].Id
+
+    $handle = [IntPtr]::Zero
+    $code = [WacNative]::OpenProcessForTermination($targetId, [ref]$handle)
+    if ($handle -ne [IntPtr]::Zero) { [WacNative]::CloseProcessHandle($handle) }
+    Assert-True ($code -ne 0) 'csrss opened for termination, so it cannot stand in for a protected candidate'
+
+    $core = Get-Module -Name 'WindowsAutoCleanup.Core'
+    $identity = & $core { param($id) Read-WacRefusedCandidateIdentity -ProcessId $id } $targetId
+    if (Test-WacIsAdministrator) {
+        Assert-True $identity.Known 'an administrator could not read the identity of a protected process'
+        $created = [DateTime]::FromFileTimeUtc($identity.Created)
+        Assert-True ($created -le [DateTime]::UtcNow -and $created.Year -ge 2020) ('implausible creation time: ' + $created.ToString('o'))
+        Assert-True ($identity.ParentId -ge 0 -and $identity.ParentId -ne $targetId) ('implausible parent id: ' + $identity.ParentId)
+    }
+    else {
+        Assert-False $identity.Known 'an unelevated read of a protected process claimed an identity it cannot have read'
+    }
+}
+
 Test-Case 'The root exit check runs BEFORE the tree is read, so a dead pid never adopts strangers' {
     <#
         This is an ordering rule, so it is asserted as one. The behavioural case above passes either
