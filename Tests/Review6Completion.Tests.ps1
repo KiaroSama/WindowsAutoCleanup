@@ -39,6 +39,13 @@ Test-Case 'Native preparation that exhausts the operation starts no tool' {
 }
 
 Test-Case 'A bounded mutator is external unless its caller proves host-confined work' {
+    # The suite's TEMP control store cannot pass the strict owner check unelevated; the verdict is
+    # shimmed exactly as Quarantine.Tests.ps1 does, and the store stays this suite's own.
+    Set-WacDirectoryTrustJudge -ScriptBlock {
+        param($Sddl, $Strict)
+        $null = $Sddl; $null = $Strict
+        return [PSCustomObject]@{ IsTrusted = $true; Owner = $null; Reason = 'test shim: descriptor verdict'; Writers = @() }
+    }
     Reset-WacAbandonedMutator
     try {
         $run = Invoke-WacBounded -TimeoutMs 500 -Mutating -ScriptBlock { [System.Threading.Thread]::Sleep(2000) }
@@ -52,6 +59,7 @@ Test-Case 'A bounded mutator is external unless its caller proves host-confined 
         Start-Sleep -Milliseconds 2200
         [void](Remove-WacQuarantineMarker)
         Reset-WacAbandonedMutator
+        Set-WacDirectoryTrustJudge -ScriptBlock $null
     }
 }
 Complete-TestRun

@@ -87,7 +87,7 @@ Test-Case 'EITHER record standing beside the deployment leaves it unsettled, and
     # record says a registration may be missing and its definition is in there. Either alone is an
     # unfinished generation, and a check that only looked for the swap half would let a run clean
     # while the machine had no idea which task was supposed to be running it.
-    foreach ($suffix in @('.transaction.json', '.taskcapture.json')) {
+    foreach ($suffix in @('.transaction.json', '.taskcapture.json', '.uninstall.json')) {
         $sandbox = New-TestSandbox -Prefix 'fence-open'
         try {
             $root = New-FenceRoot -Sandbox $sandbox

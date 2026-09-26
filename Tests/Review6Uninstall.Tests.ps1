@@ -103,6 +103,17 @@ Test-Case 'A directory at the uninstall intent name is neither absence nor an au
         Assert-True ([System.IO.Directory]::Exists($path)) 'the untrusted intent object was altered'
     }
 }
+Test-Case 'An unreadable uninstall intent is kept, never replaced by a fresh one' {
+    Invoke-InDeploymentSandbox -Prefix 'review6-uninstall-torn' -Body {
+        param($sandbox)
+        $null = $sandbox
+        $slots = Get-WacDeploymentSlotPath
+        $path = Get-WacDeploymentJournalPath -DeploymentRoot $slots.Root -Kind Uninstall
+        [System.IO.File]::WriteAllText($path, '{ torn', (New-Object System.Text.UTF8Encoding($false)))
+        Assert-False (Set-WacUninstallIntent -DeploymentRoot $slots.Root) 'an unreadable intent was treated as absent'
+        Assert-Equal '{ torn' ([System.IO.File]::ReadAllText($path)) 'the unreadable intent was overwritten'
+    }
+}
 Test-Case 'A run that leaves the machine fenced names the record that fences it' {
     # FR-015. The intent record is written before anything is removed, and while it stands every
     # install and every scheduled cleanup refuses. A run that ended without retiring it used to say
