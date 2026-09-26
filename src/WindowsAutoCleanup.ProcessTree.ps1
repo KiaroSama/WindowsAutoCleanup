@@ -482,7 +482,10 @@ function Stop-WacProcessTree {
             # The floor is itself capped by $TimeoutMs, which the caller claimed from the run budget
             # or the recovery reserve. Without that cap a bound of 200 ms still waited a full second
             # here - a small overrun, but an unaccounted one, and per tree (ledger WAC-06R).
-            $left = (& $remaining)
+            # What is LEFT is the smaller of the clock and the bound minus what was already GRANTED:
+            # grants are ceilings that usually go unspent, so a fast rescan left the clock almost
+            # untouched and each later pass re-granted nearly the whole bound (FR-013).
+            $left = [int][Math]::Min((& $remaining), [Math]::Max(0, $TimeoutMs - $grantedWaitMs))
             $grantMs = [int][Math]::Min(5000, $left)
             if (-not $floorGranted) {
                 # The floor keeps a caller's very short bound from turning "asked" into "gave up",
@@ -518,7 +521,7 @@ function Stop-WacProcessTree {
         if ($lastPending.Count -gt 0) {
             foreach ($entry in $lastPending) { [void][WacNative]::TerminateBoundProcess($entry.Handle) }
 
-            $grantMs = [int][Math]::Min(5000, (& $remaining))
+            $grantMs = [int][Math]::Min(5000, [Math]::Min((& $remaining), [Math]::Max(0, $TimeoutMs - $grantedWaitMs)))
             $grantedWaitMs += $grantMs
             $lastWatch = [System.Diagnostics.Stopwatch]::StartNew()
             foreach ($entry in $lastPending) {
