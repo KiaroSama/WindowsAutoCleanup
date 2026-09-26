@@ -434,6 +434,68 @@ Test-Case 'A record that cannot be deleted keeps the transaction open, and no la
 # The two halves of one generation, and the two halves of two
 # ---------------------------------------------------------------------------------------------
 
+Test-Case 'Only a real true or the word True records a commit; anything else is not committed' {
+    # FR-003. [bool]'False' is $true in PowerShell, so a record carrying the WORD must be compared,
+    # never cast - a hand-edited or foreign-serialised record would otherwise commit itself.
+    foreach ($case in @(@($true, $true), @('True', $true), @('true', $true), @($false, $false),
+            @('False', $false), @('no', $false), @(0, $false), @('', $false))) {
+        $record = [PSCustomObject]@{ Committed = $case[0] }
+        $read = & $script:DeployModule { param($r) Test-WacDeploymentGenerationCommitted -Record $r } $record
+        Assert-Equal $case[1] ([bool]$read) ('Committed=' + [string]$case[0] + ' was misread')
+    }
+}
+
+Test-Case 'A first install root whose absence cannot be established is not an absence' {
+    # FR-002. Only PROVEN absence restores the no-install state. The probe is made to answer
+    # Unreadable for the root alone - the shape a denied or failing inspection produces - while
+    # the root really is gone, so the only thing standing between the two is that distinction.
+    Reset-CommitFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-commit-unknown-root' -Body {
+        param($sandbox)
+
+        $slots = Get-WacDeploymentSlotPath
+        [void](New-CommitStage -Sandbox $sandbox -Name 'first' -RunContent '# first install')
+        [void](Switch-WacDeploymentStage -KeepPrevious)
+        Reset-CommitFixture
+        [void](Remove-WacDeployment -Path $slots.Root)
+        & $script:DeployModule { param($root)
+            $script:RealPathPresence = ${function:Get-WacPathPresence}
+            $script:UnknownRoot = $root
+            function script:Get-WacPathPresence {
+                param([string]$Path)
+                if ([string]::Equals($Path, $script:UnknownRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Unreadable' }
+                return (& $script:RealPathPresence -Path $Path)
+            }
+        } $slots.Root
+        try {
+            $plan = Get-WacDeploymentRecoveryPlan -DeploymentRoot $slots.Root
+            Assert-Equal 'Valid' ([string]$plan.Swap.State) 'the fixture left no readable record'
+            Assert-True ([string]$plan.Verdict -cne 'RestoreOriginal') `
+                ('a root whose absence could not be established was read as the original absence: {0}' -f [string]$plan.Reason)
+        }
+        finally { & $script:DeployModule { Remove-Item -Path function:script:Get-WacPathPresence } }
+    }
+}
+
+Test-Case 'A committed replacement whose record cannot be retired keeps its transaction open' {
+    # FR-007 on the COMMIT branch: the rollback twin above proves only the other order.
+    Reset-CommitFixture
+    Invoke-InDeploymentSandbox -Prefix 'wac02r-commit-unretired' -Body {
+        param($sandbox)
+
+        $fixture = New-InterruptedUpgrade -Sandbox $sandbox
+        $slots = $fixture.Slots
+        $record = Set-RecordCommitted -Root $slots.Root -Committed
+        [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::ReadOnly)
+        try {
+            Assert-Throws -ScriptBlock { Invoke-RecoveryHalf -Slots $slots } -Pattern 'its journal could not be retired'
+            Assert-True (Test-Path -LiteralPath $record -PathType Leaf) 'the unretired commit record vanished'
+            Assert-Equal $fixture.Replacement (Get-CommitInventory -Path $slots.Root) 'the committed replacement was disturbed'
+        }
+        finally { [System.IO.File]::SetAttributes($record, [System.IO.FileAttributes]::Normal) }
+    }
+}
+
 Test-Case 'A capture from a DIFFERENT generation is never closed by this one, committed or not' {
     # The link is what says two durable files are two halves of one transaction, and the commit is
     # what says that transaction finished. They are independent claims and a case has to hold one
