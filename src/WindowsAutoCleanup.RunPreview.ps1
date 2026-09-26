@@ -63,7 +63,7 @@ function Show-WacRunPreview {
     )
 
     Write-WacPreviewLine -Text ''
-    Write-WacPreviewLine -Text 'PREVIEW - nothing on this machine is changed by this run.'
+    Write-WacPreviewLine -Text 'PREVIEW - no cleanup or maintenance is performed; audit/state bookkeeping still applies.'
     Write-WacPreviewLine -Text ''
 
     # The opt-ins first. They are the part an operator gets wrong at the highest cost, and unlike the
@@ -71,7 +71,7 @@ function Show-WacRunPreview {
     Write-WacPreviewLine -Text 'Destructive options, as this invocation sets them:'
     foreach ($row in @(
             @{ Name = 'Windows Update component base reset (/ResetBase)'; On = [bool]$ResetWindowsUpdateBase
-                Note = 'makes every installed update permanently un-installable' },
+                Note = 'prevents uninstalling currently installed updates' },
             @{ Name = 'Superseded driver-package pruning'; On = [bool]$PruneSupersededDrivers
                 Note = 'exports a recoverable backup before deleting any package' },
             @{ Name = 'Legacy Disk Cleanup handlers (cleanmgr)'; On = [bool]$EnableLegacyDiskCleanup
@@ -81,6 +81,14 @@ function Show-WacRunPreview {
         Write-WacPreviewLine -Text ('  [{0}] {1}' -f $(if ($row.On) { 'ON ' } else { 'off' }), $row.Name)
         if ($row.On) { Write-WacPreviewLine -Text ('        {0}' -f $row.Note) }
     }
+    Write-WacPreviewLine -Text ''
+
+    Write-WacPreviewLine -Text 'Always-selected maintenance, subject to runtime safety and availability:'
+    Write-WacPreviewLine -Text '  [ON ] Delivery Optimization cache (supported cmdlet, otherwise allow-list fallback)'
+    Write-WacPreviewLine -Text '  [ON ] Windows component store cleanup (DISM /StartComponentCleanup, independent of /ResetBase)'
+    Write-WacPreviewLine -Text '  [ON ] Device driver package handler (pnpclean, independent of optional package pruning)'
+    Write-WacPreviewLine -Text 'SkipCategory filters file targets; it does not disable these maintenance steps.'
+    Write-WacPreviewLine -Text 'This is selection, not permission: quarantine, trust, availability and deadlines are checked at execution.'
     Write-WacPreviewLine -Text ''
 
     $skip = @($SkipCategory | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })

@@ -42,7 +42,7 @@ function Get-WacRunSummaryPath {
 function Get-WacStepExecutionState {
     <#
     .SYNOPSIS
-        Which of the three states one step result describes.
+        Which of the four states one step result describes.
     .DESCRIPTION
         Read off the result's own facts. A step that was attempted ran, whatever it concluded. A
         step that was not attempted either refused on evidence - a security refusal, or an
@@ -56,11 +56,14 @@ function Get-WacStepExecutionState {
     # may never depend on whether its own report could be assembled.
     $stated = @($Result.PSObject.Properties.Name)
 
-    if ($stated -ccontains 'Attempted' -and [bool]$Result.Attempted) { return 'executed' }
+    if ($stated -cnotcontains 'Attempted' -or $Result.Attempted -isnot [bool]) { return 'unstated' }
+    if ([bool]$Result.Attempted) { return 'executed' }
     if ($stated -ccontains 'Outcome') {
         if ([string]$Result.Outcome -ceq 'SecurityRefusal') { return 'refused' }
         if ([string]$Result.Outcome -ceq 'Incomplete') { return 'refused' }
-        return 'unarmed'
+        if ([string]$Result.Outcome -ceq 'Failed') { return 'refused' }
+        if (@('Succeeded', 'SafeSkip') -ccontains [string]$Result.Outcome) { return 'unarmed' }
+        return 'unstated'
     }
 
     # Neither fact is stated. That is not a step that ran quietly; it is a step nobody can classify,
@@ -82,7 +85,8 @@ function Write-WacRunSummary {
         [object[]]$TargetResult = @(),
         [Nullable[long]]$FreeBytesBefore,
         [Nullable[long]]$FreeBytesAfter,
-        [bool]$RebootRequired
+        [bool]$RebootRequired,
+        [ValidateSet('cleanup', 'preview', 'delegated')][string]$Mode = 'cleanup'
     )
 
     $path = Get-WacRunSummaryPath
@@ -91,7 +95,7 @@ function Write-WacRunSummary {
     try {
         return (Write-WacRunSummaryDocument -Path $path -Outcome $Outcome -ExitCode $ExitCode `
                 -StepResult $StepResult -TargetResult $TargetResult -FreeBytesBefore $FreeBytesBefore `
-                -FreeBytesAfter $FreeBytesAfter -RebootRequired $RebootRequired)
+                -FreeBytesAfter $FreeBytesAfter -RebootRequired $RebootRequired -Mode $Mode)
     }
     catch {
         # EVERYTHING, not just the write. Assembling the document reads whatever the steps and
@@ -118,7 +122,8 @@ function Write-WacRunSummaryDocument {
         [object[]]$TargetResult = @(),
         [Nullable[long]]$FreeBytesBefore,
         [Nullable[long]]$FreeBytesAfter,
-        [bool]$RebootRequired
+        [bool]$RebootRequired,
+        [ValidateSet('cleanup', 'preview', 'delegated')][string]$Mode = 'cleanup'
     )
 
     $steps = New-Object 'System.Collections.Generic.List[object]'
@@ -153,6 +158,7 @@ function Write-WacRunSummaryDocument {
 
     $document = [PSCustomObject]@{
         schema = $script:RunSummarySchema
+        mode = $Mode
         # $script:Version and $script:Stopwatch are the RUN's own state, shared with this part the
         # same way the report's are. The deployment module is deliberately not imported by the
         # runtime, so its version helper is not reachable from here and must not be reached for.
@@ -177,9 +183,29 @@ function Write-WacRunSummaryDocument {
         }
     }
 
-    # Written whole, with the same encoding the log uses. A torn summary is worse than none: it
-    # looks like an answer. A failure here throws to the caller, which owns the one catch.
-    [System.IO.File]::WriteAllText($Path, (ConvertTo-Json -InputObject $document -Depth 6),
-        (New-Object System.Text.UTF8Encoding($false)))
+    # Serialize BEFORE creating a name. A collision is not our file, even when it is a hard link
+    # to an ordinary file: never open, truncate or replace it. Bind creation to the same trusted
+    # directory primitive used by the audit log rather than resolving its pathname a second time.
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes((ConvertTo-Json -InputObject $document -Depth 6))
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $directory = Open-WacTrustedDirectory -Path ([System.IO.Path]::GetDirectoryName($full)) `
+        -RequireMachineTrust:(Test-WacIsAdministrator)
+    try {
+        if (-not $directory.IsTrusted) { throw ('The summary directory was refused: ' + [string]$directory.Reason) }
+        $created = New-WacBoundFile -DirectoryHandle $directory.Handle -Name ([System.IO.Path]::GetFileName($full))
+        if ([string]$created.Kind -cne 'Created') {
+            throw ('The summary name could not be exclusively created: ' + [string]$created.Kind)
+        }
+        try {
+            $created.Stream.Write($bytes, 0, $bytes.Length)
+            $created.Stream.Flush($true)
+        }
+        finally { $created.Stream.Dispose() }
+    }
+    finally {
+        if ($directory.Handle -ne [IntPtr]::Zero) { [void](Close-WacTrustedDirectory -Handle $directory.Handle) }
+    }
+    # This is not an atomic-rename protocol. A process kill or storage failure can leave incomplete
+    # JSON; readers must reject it and must never infer success from file existence alone.
     return $true
 }

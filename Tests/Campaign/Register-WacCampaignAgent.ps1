@@ -1,127 +1,69 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Arms a disposable guest for campaigns. Run this ONCE, inside the virtual machine, elevated, by
-    the person who owns it.
-
+    Arms a disposable guest for campaigns, once, inside the guest, elevated, by its owner.
 .DESCRIPTION
-    This is the single manual step in the whole campaign, and it is manual on purpose. The host can
-    deliver files into a guest and read what the guest publishes, but it cannot start anything in
-    there - so a machine runs campaigns only because somebody stood in front of it and said so.
-
-    What it registers: one scheduled task, running the agent as SYSTEM at startup, so the agent
-    comes back by itself after the power-loss and restart scenarios cut the machine off mid-way.
-
-.NOTES
-    Run it in the guest you intend to throw away. It refuses to arm a machine that looks like a real
-    workstation, because the scenarios it enables lose power on purpose.
+    Registers the campaign agent as SYSTEM at startup so an explicitly authorized disposable guest
+    can report recovery after a cut. Positive virtual hardware evidence is required before arming.
 #>
-
 [CmdletBinding()]
-param(
-    [string]$AgentPath,
-    [string]$Root = 'C:\wac-campaign',
-    [switch]$Unregister
-)
-
+param([string]$AgentPath, [string]$Root = 'C:\wac-campaign', [switch]$Unregister)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-
 $taskPath = '\WindowsAutoCleanupCampaign\'
 $taskName = 'CampaignAgent'
-
-function Write-ArmingLine {
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'An operator runs this by hand and reads its output; the console text is the product.')]
-    param([string]$Text = '')
-    Write-Host $Text
-}
-
+function Write-ArmingLine { param([string]$Text = '') Write-Host $Text }
 $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-ArmingLine 'REFUSED: arming registers a SYSTEM scheduled task and needs an elevated session.'
+    Write-ArmingLine 'REFUSED: arming requires an elevated session.'
     exit 1
 }
-
 if ($Unregister) {
-    $existing = @(Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue)
-    if ($existing.Count -eq 0) {
-        Write-ArmingLine 'This guest is not armed; nothing to remove.'
-        exit 0
-    }
-    Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false
-    Write-ArmingLine 'Disarmed. The agent will not run again.'
+    $existing = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskPath -ieq $taskPath -and $_.TaskName -ieq $taskName })
+    if ($existing.Count -eq 0) { Write-ArmingLine 'This guest is not armed.'; exit 0 }
+    Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false -ErrorAction Stop
+    Write-ArmingLine 'Disarmed.'
     exit 0
 }
-
-# A campaign cuts this machine's power on purpose and installs and uninstalls a SYSTEM task in it.
-# Asking whether it is really a virtual machine is cheap and the mistake it prevents is not.
-$model = [string](Get-CimInstance -ClassName Win32_ComputerSystem).Model
-$manufacturer = [string](Get-CimInstance -ClassName Win32_ComputerSystem).Manufacturer
-if ($model -notmatch '(?i)virtual|vmware|kvm|xen|qemu' -and $manufacturer -notmatch '(?i)microsoft|vmware|innotek|qemu|xen') {
-    Write-ArmingLine ('REFUSED: this looks like physical hardware ({0} / {1}).' -f $manufacturer, $model)
-    Write-ArmingLine 'The campaign scenarios lose power and modify system state on purpose. Arm a disposable guest instead.'
+. (Join-Path $PSScriptRoot 'WacCampaignChecks.ps1')
+$computer = @(Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop)
+if ($computer.Count -ne 1 -or -not (Test-WacCampaignGuest -Computer $computer[0])) {
+    Write-ArmingLine 'REFUSED: positive supported virtual hardware evidence is required before arming.'
     exit 1
 }
-
-if ([string]::IsNullOrWhiteSpace($AgentPath)) {
-    $AgentPath = Join-Path -Path $PSScriptRoot -ChildPath 'WacCampaignAgent.ps1'
+if ([string]::IsNullOrWhiteSpace($AgentPath)) { $AgentPath = Join-Path $PSScriptRoot 'WacCampaignAgent.ps1' }
+if (-not (Test-Path -LiteralPath $AgentPath -PathType Leaf)) { Write-ArmingLine 'REFUSED: the agent file is missing.'; exit 1 }
+$agentHome = Join-Path $Root 'agent'
+$files = @('WacCampaignAgent.ps1', 'WacCampaignScenario.ps1', 'WacCampaignChecks.ps1',
+    'WacCampaignState.ps1', 'Invoke-WacCampaignScript.ps1', 'Register-WacCampaignAgent.ps1')
+# Validate the complete source set before creating or copying anything.
+foreach ($file in $files) {
+    $source = Join-Path (Split-Path -Parent $AgentPath) $file
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw ('Missing required campaign file: ' + $file) }
 }
-if (-not (Test-Path -LiteralPath $AgentPath -PathType Leaf)) {
-    Write-ArmingLine ('REFUSED: the agent was not found at {0}.' -f $AgentPath)
-    exit 1
-}
-
-# The agent and its scenarios are COPIED into the guest's own directory. Leaving the task pointing
-# at wherever the operator happened to unzip this would make arming depend on a folder nobody
-# remembers not to delete.
-$agentHome = Join-Path -Path $Root -ChildPath 'agent'
 [void](New-Item -ItemType Directory -Path $agentHome -Force)
-foreach ($file in @('WacCampaignAgent.ps1', 'WacCampaignScenario.ps1')) {
-    $source = Join-Path -Path (Split-Path -Parent $AgentPath) -ChildPath $file
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-        Write-ArmingLine ('REFUSED: {0} is missing beside the agent; arming half of it would be worse than not arming it.' -f $file)
-        exit 1
-    }
-    # A file is not copied onto itself. Arming can be run FROM the agent's own home - the agent does
-    # exactly that when it makes its own arming durable - and there the source and the destination
-    # are one file, which is open because it is the script currently running. Windows answers that
-    # with an IOException, and the whole arming then fails for a copy that had nothing to do.
-    $destination = Join-Path -Path $agentHome -ChildPath $file
-    if ([string]::Equals([System.IO.Path]::GetFullPath($source), [System.IO.Path]::GetFullPath($destination),
-            [System.StringComparison]::OrdinalIgnoreCase)) {
-        Write-ArmingLine ('{0} is already in place.' -f $file)
-        continue
-    }
-    Copy-Item -LiteralPath $source -Destination $destination -Force
+foreach ($file in $files) {
+    $source = Join-Path (Split-Path -Parent $AgentPath) $file
+    $destination = Join-Path $agentHome $file
+    if ([string]::Equals([IO.Path]::GetFullPath($source), [IO.Path]::GetFullPath($destination), [StringComparison]::OrdinalIgnoreCase)) { continue }
+    Copy-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
 }
-
-$installed = Join-Path -Path $agentHome -ChildPath 'WacCampaignAgent.ps1'
+$installed = Join-Path $agentHome 'WacCampaignAgent.ps1'
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-    -Argument ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Root "{1}"' -f $installed, $Root)
+    -Argument ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Root "{1}"' -f $installed, $Root.TrimEnd('\'))
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::FromHours(4))
-
 [void](Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings -Force)
-
-Write-ArmingLine ('Armed. The agent runs as SYSTEM at every startup and watches {0}.' -f $Root)
-Write-ArmingLine ''
-
-# Prove the channel NOW rather than discovering at campaign time that the guest cannot speak. The
-# host reads this exact value back; an operator who sees it there has verified the whole return path
-# before any scenario depends on it.
+    -Principal $principal -Settings $settings -Force)
+Write-ArmingLine ('Armed. The agent watches {0}.' -f $Root)
 $kvpKey = 'HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest'
-$stamp = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+$stamp = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
 if (-not (Test-Path -LiteralPath $kvpKey)) { [void](New-Item -Path $kvpKey -Force) }
 Set-ItemProperty -LiteralPath $kvpKey -Name 'WacCampaign.ArmingProbe' -Value $stamp -Type String -Force
-
-Write-ArmingLine 'A probe value was published to the host. Confirm the return channel from the HOST with:'
-Write-ArmingLine ''
+Write-ArmingLine 'Confirm the return channel from the host:'
 Write-ArmingLine '    . .\Tests\Campaign\WacCampaignChannel.ps1'
 Write-ArmingLine '    (Read-WacCampaignReport -VMName ''<your vm>'')[''ArmingProbe'']'
-Write-ArmingLine ''
-Write-ArmingLine ('It should print {0}. If it prints nothing, Key-Value Pair Exchange is not delivering' -f $stamp)
-Write-ArmingLine 'and no campaign can report its results - fix that before running one.'
+Write-ArmingLine ('Expected probe value: {0}' -f $stamp)
 exit 0
