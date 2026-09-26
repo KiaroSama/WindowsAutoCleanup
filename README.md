@@ -361,11 +361,12 @@ Logs contain local usernames, paths and host details. They are ignored by Git an
 
 ### Machine-readable run summary
 
-Every run also writes one JSON document beside its own log, with the same base name and a `.summary.json` extension. The log is written for a person, one line per event in the order the events happened; the summary answers "did last night's run clean, or did it refuse?" without parsing prose.
+Every run that reaches its log also writes one JSON document beside that log, with the same base name and a `.summary.json` extension, on every exit path - completion, refusal, busy lock, missing module, expired preflight - with `exitCode` equal to the process's real exit code. The log is written for a person, one line per event in the order the events happened; the summary answers "did last night's run clean, or did it refuse?" without parsing prose.
 
 ```json
 {
   "schema": 1,
+  "mode": "cleanup",
   "version": "1.2.0",
   "executionId": "6a2f...",
   "elapsed": "00:04:11",
@@ -373,7 +374,7 @@ Every run also writes one JSON document beside its own log, with the same base n
   "outcome": "Succeeded",
   "exitCode": 0,
   "rebootRequired": false,
-  "logPath": "C:\ProgramData\WindowsAutoCleanup\Logs\WindowsAutoCleanup_2026-09-19_02-27-33_UTC.log",
+  "logPath": "C:\\ProgramData\\WindowsAutoCleanup\\Logs\\WindowsAutoCleanup_2026-09-19_02-27-33_UTC.log",
   "steps": [
     { "category": "Delivery Optimization cache", "state": "executed", "outcome": "Succeeded", "detail": "", "durationMs": 1204, "rebootRequired": false }
   ],
@@ -382,16 +383,26 @@ Every run also writes one JSON document beside its own log, with the same base n
 }
 ```
 
-Each step carries one of three states, and the distinction is the point of the file:
+`mode` says what kind of run the summary describes:
+
+| `mode` | Meaning |
+| --- | --- |
+| `cleanup` | A cleanup run; it may have changed the machine. |
+| `preview` | A `-Preview` run; it reports the selection and changes nothing. |
+| `delegated` | An unelevated parent that handed the work to an elevated relaunch and did none itself; the child writes its own summary. |
+
+Each step carries one of four states, and the distinction is the point of the file:
 
 | `state` | Meaning |
 | --- | --- |
 | `executed` | The step ran. Whatever it concluded is in `outcome`. |
-| `refused` | The step did not start because the run refused it — a security refusal, or an unresolved mutation this run inherited. |
+| `refused` | The step did not start because the run declined it: a security refusal, an unresolved mutation this run inherited (`Incomplete`), or a failed precondition (`Failed`). |
 | `unarmed` | The step did not start because it was not switched on. |
-| `unstated` | The step stated neither fact. Nobody can classify it, and it is recorded as such rather than folded into one of the other three. |
+| `unstated` | The step did not state a real true/false fact about starting. Nobody can classify it, and it is recorded as such rather than folded into one of the other three. |
 
-A reader that sees only "0 files removed" cannot tell a quiet night from a refusal; these three can. `schema` changes only when a field changes meaning, never when one is added, so a reader that ignores unknown fields keeps working.
+A reader that sees only "0 files removed" cannot tell a quiet night from a refusal; these states can. `schema` changes only when a field changes meaning, never when one is added (`mode` was added under `schema` 1), so a reader that ignores unknown fields keeps working.
+
+The file is created exclusively inside the trusted log directory: an existing name, a hard link or a redirected parent folder is refused, never overwritten or followed. Creation is not an atomic rename, so a run killed mid-write can leave incomplete JSON; a reader must reject a document it cannot parse rather than infer success from the file existing.
 
 The summary holds outcomes, categories, counts and durations. It carries no command line, no environment, no per-path inventory and no credential of any kind. If it cannot be written the run logs a warning and carries on: the run's verdict is the log's and the exit code's, and this only repeats it.
 
