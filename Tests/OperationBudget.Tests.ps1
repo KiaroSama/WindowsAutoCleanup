@@ -451,4 +451,31 @@ Test-Case 'R06-4 the termination floor is spent ONCE for a call, not once for ev
     }
 }
 
+Test-Case 'R06-6 a fast rescan cannot grant a later pass what the first pass already granted' {
+    # FR-013, and the case R06-4 cannot see: its enumeration sleeps 150 ms, so the clock itself eats
+    # the budget between passes. With a FAST rescan the first pass grants the whole bound as its
+    # floor and each later pass used to grant the whole clock-remaining bound again - 1971 and
+    # 2939 ms under a 1000 ms bound in CI on 2026-09-26. The sum of grants is the claim, so it may
+    # never exceed the bound, however quickly the passes follow each other.
+    $realEnum = Get-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId'
+    $child = $null
+    try {
+        $child = Start-Process -FilePath $script:HostExe -PassThru -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30')
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId' -Body {
+            param([Parameter(Mandatory = $true)][int]$ProcessId)
+            $null = $ProcessId
+            return @(268435452)
+        }
+        $result = Stop-WacProcessTree -ProcessId $child.Id -TimeoutMs 1000
+        Assert-True ([int]$result.GrantedWaitMs -le 1000) `
+            ('three fast passes under a 1000 ms bound granted {0} ms of waiting' -f [int]$result.GrantedWaitMs)
+        Assert-True ([int]$result.GrantedWaitMs -gt 0) 'the call granted nothing, so the ceiling above proves nothing'
+    }
+    finally {
+        Set-ModuleFunctionBody -Module $script:CoreModule -Name 'Get-WacProcessDescendantId' -Body $realEnum
+        if ($child) { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Complete-TestRun
