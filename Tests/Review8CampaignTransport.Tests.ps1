@@ -47,6 +47,31 @@ Test-Case 'A timeout is not converted into a successful campaign process' {
     }
     finally { Remove-TestSandbox -Path $sandbox }
 }
+Test-Case 'A real exit code the runner could not settle is never reported' {
+    # H-4. The product runner returns the root's real code when a descendant still holds its output
+    # (src\WindowsAutoCleanup.Process.ps1). Each unsettled fact alone must withhold that code.
+    $sandbox = New-TestSandbox -Prefix 'campaign-unsettled'
+    try {
+        $path = Join-Path $sandbox 'payload.ps1'
+        [IO.File]::WriteAllText($path, 'exit 0')
+        foreach ($fault in @('OutputComplete', 'TerminationProven', 'Owned')) {
+            $script:Fault = $fault
+            function Invoke-WacProcess {
+                param($FilePath, $ArgumentList, $TimeoutMs)
+                $null = $FilePath, $ArgumentList, $TimeoutMs
+                $ran = [PSCustomObject]@{ Started = $true; TimedOut = $false; TerminationProven = $true
+                    OutputComplete = $true; ExitCode = 0; Owned = $true; OwnedTreeState = 'Complete'
+                    StandardOutput = ''; StandardError = '' }
+                $ran.$script:Fault = $false
+                return $ran
+            }
+            $answer = Invoke-WacCampaignHost -ScriptPath $path
+            Assert-False $answer.Settled $fault
+            Assert-Equal -1 ([int]$answer.ExitCode) ('an unsettled run reported the root exit code: ' + $fault)
+        }
+    }
+    finally { Remove-TestSandbox -Path $sandbox }
+}
 Test-Case 'An owned harmless root can be held, observed, and terminated without leaking handles' {
     $sandbox = New-TestSandbox -Prefix 'campaign-held'
     $started = $null; $held = $null

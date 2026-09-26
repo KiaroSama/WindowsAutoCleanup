@@ -99,6 +99,29 @@ Test-Case 'After restoring power the campaign waits for the new boot before read
     $start = [array]::IndexOf($commands, 'Start-VM'); $wait = [array]::IndexOf($commands, 'Wait-WacCampaignSignal')
     Assert-True ($start -ge 0 -and $wait -gt $start)
 }
+Test-Case 'A cut is answered only by a beacon newer than the cut and a cleared request' {
+    # H-1 and H-2 at the call site: the predicate the driver really waits on after restoring power.
+    foreach ($name in @('Get-CampaignBeaconUtc', 'Invoke-CampaignPowerCut')) {
+        . ([scriptblock]::Create((Get-CampaignFunction -File 'Invoke-WacVmCampaign.ps1' -Name $name).Extent.Text))
+    }
+    function Write-CampaignLine { param($Text) $null = $Text }
+    function Stop-WacCampaignVm { param($Vm, [switch]$PowerCut) $null = $Vm, $PowerCut; return [PSCustomObject]@{ Off = $true } }
+    function Start-VM { [CmdletBinding()]param($VM) $null = $VM }
+    function Wait-WacCampaignSignal {
+        param($VMName, $VmId, $TimeoutSeconds, $IdleSeconds, [scriptblock]$Until)
+        $null = $VMName, $VmId, $TimeoutSeconds, $IdleSeconds
+        $stale = [datetime]::UtcNow.AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $fresh = [datetime]::UtcNow.AddHours(1).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $script:Verdicts = @([bool](& $Until @{ AgentReady = $stale }),
+            [bool](& $Until @{ AgentReady = $fresh; Await = 'power-cut:x' }),
+            [bool](& $Until @{ AgentReady = $fresh; Await = '' }))
+        return [PSCustomObject]@{ Signalled = $true; Item = @{}; Reason = '' }
+    }
+    Assert-True (Invoke-CampaignPowerCut -Vm ([PSCustomObject]@{ Name = 'x'; Id = [guid]::NewGuid() }) -AtStep 'x')
+    Assert-False $script:Verdicts[0] 'a beacon older than the cut answered it'
+    Assert-False $script:Verdicts[1] 'a request still standing answered the cut'
+    Assert-True $script:Verdicts[2] 'a fresh beacon with a cleared request was refused'
+}
 Test-Case 'No reader in the campaign takes a beacon on presence alone' {
     foreach ($file in @(Get-ChildItem -LiteralPath $script:CampaignRoot -Filter '*.ps1' -File)) {
         $text = [IO.File]::ReadAllText($file.FullName)
@@ -145,5 +168,18 @@ Test-Case 'A campaign starts from a proven-clean machine, or it does not start' 
     Assert-Equal 1 $resume.Count
     Assert-False ($resume[0].Clauses[0].Item2.Extent.Text -match 'Reset-WacCampaignMachine')
     Assert-True ($ast.Extent.Text -match 'if \(-not \$baseline\.Clean\)')
+}
+Test-Case 'A state left by a killed campaign is refused, never replayed or discarded' {
+    # H-6. Only a finished state may be cleared and only awaiting-power-cut may resume; anything
+    # else - a campaign killed mid-run - must stop the agent rather than vanish.
+    $ast = Get-CampaignAst -File 'WacCampaignAgent.ps1'
+    $gate = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses.Count -ge 2 -and
+        $node.Clauses[1].Item1.Extent.Text -match "\`$state\.phase\s*-cne\s*'awaiting-power-cut'"
+    }, $true))
+    Assert-Equal 1 $gate.Count 'the unfinished-state gate is missing'
+    $body = $gate[0].Clauses[1].Item2
+    Assert-Equal 1 @($body.Statements).Count 'the unfinished-state gate does more than refuse'
+    Assert-True ($body.Statements[0] -is [Management.Automation.Language.ThrowStatementAst]) 'an unfinished state is not refused'
 }
 Complete-TestRun

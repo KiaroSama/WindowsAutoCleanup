@@ -17,7 +17,7 @@ Import-Module (Join-Path $script:SrcRoot 'WindowsAutoCleanup.Core.psm1') -Force 
 . (Join-Path $PSScriptRoot '_RunRig.ps1')
 
 function Assert-TerminalSummary {
-    param($Rig, $Result, [int]$Code)
+    param($Rig, $Result, [int]$Code, [string]$Mode = 'cleanup')
     Assert-True $Result.Exited ('child timed out: ' + $Result.ErrorText)
     Assert-Equal $Code ([int]$Result.ExitCode) (Get-RigLogText -Rig $Rig)
     $logs = @(Get-ChildItem -LiteralPath $Rig.LogDirectory -Filter 'WindowsAutoCleanup_*.log' -File)
@@ -26,6 +26,7 @@ function Assert-TerminalSummary {
     Assert-True ([System.IO.File]::Exists($path)) 'a durably logged terminal path wrote no summary'
     $value = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
     Assert-Equal $Code ([int]$value.exitCode) 'summary and observed process exit disagree'
+    Assert-Equal $Mode ([string]$value.mode) 'the summary misstates what kind of run this was'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$value.outcome)) 'no terminal outcome was recorded'
     if ($Code -ne 0) { Assert-False ([string]$value.outcome -ceq 'Succeeded') 'a refusal was summarized as success' }
     Assert-Equal 0 ([int]$value.removed.entries) 'pre-cleanup refusal invented deleted entries'
@@ -76,7 +77,7 @@ Test-Case 'A busy operation lock exit 3 has a terminal summary without owning th
 
 Test-Case 'An invalid scheduled preview exit 1 has a terminal summary' {
     $rig = New-RunRig -Prefix 'review7-summary-options'
-    try { Assert-TerminalSummary -Rig $rig -Result (Invoke-RunRig -Rig $rig -Plan @{} -ExtraArgument @('-Preview')) -Code 1 }
+    try { Assert-TerminalSummary -Rig $rig -Result (Invoke-RunRig -Rig $rig -Plan @{} -ExtraArgument @('-Preview')) -Code 1 -Mode 'preview' }
     finally { Remove-RunRig -Rig $rig }
 }
 Complete-TestRun

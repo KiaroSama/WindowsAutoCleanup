@@ -27,6 +27,14 @@ Test-Case 'A literal exact VM name remains accepted' {
 }
 Test-Case 'A wildcard resolving to one VM is still not explicit authorization' {
     Assert-Throws -ScriptBlock { Get-WacCampaignVm -VMName '*' }
+    # A VM literally named with a wildcard character passes the name comparison, so only the
+    # literal-name rule stands between the pattern and the machine it happens to match.
+    function Get-VM {
+        [CmdletBinding()]param([string]$Name)
+        $null = $Name
+        return [PSCustomObject]@{ Name = 'Lab*'; Id = [guid]'db743cdd-c3b8-4024-91ed-0c5e8a012f4c' }
+    }
+    Assert-Throws -ScriptBlock { Get-WacCampaignVm -VMName 'Lab*' } -Pattern 'explicit literal name'
 }
 Test-Case 'A returned different VM cannot satisfy literal selection' {
     Assert-Throws -ScriptBlock { Get-WacCampaignVm -VMName 'AnotherMachine' }
@@ -49,6 +57,16 @@ Test-Case 'All ordinary installer calls explicitly disable ResetBase' {
         [void](Invoke-WacCampaignScenario -Name $scenario -State $state -StatePath 'unused' -Save {})
         Assert-True ($script:InstallArguments -contains '-ResetWindowsUpdateBase:$false') $scenario
     }
+    # The install cut hands the installer straight to the interruption; capture it there.
+    function Start-WacCampaignInterruption {
+        param($Scenario, $ScriptPath, $ArgumentList, $RecordPath, $State, $StatePath, $Save, $ResumeKind)
+        $null = $Scenario, $RecordPath, $State, $StatePath, $Save, $ResumeKind
+        if ($ScriptPath -like '*Install-WindowsAutoCleanupTask.ps1') { $script:InstallArguments = @($ArgumentList) }
+        return [PSCustomObject]@{ Verdict = 'failed' }
+    }
+    $script:InstallArguments = @()
+    [void](Invoke-WacCampaignScenario -Name 'power-loss-during-install' -State $state -StatePath 'unused' -Save {})
+    Assert-True ($script:InstallArguments -contains '-ResetWindowsUpdateBase:$false') 'power-loss-during-install'
 }
 Test-Case 'Campaign PowerShell transport preserves a spaced path and an explicit false switch' {
     $sandbox = New-TestSandbox -Prefix 'review7 transport'

@@ -73,6 +73,37 @@ Test-Case 'An already-exited root does not hide a living owned descendant' {
     }
     finally { if ($started) { Close-WacCampaignLaunch -Started $started }; Remove-TestSandbox -Path $sandbox }
 }
+Test-Case 'An empty job never stands in for a root that has not signalled' {
+    # The transient state this proof exists for, made deterministic: an empty job the test owns and a
+    # live root outside it. Terminating the empty job ends nothing, so the root stays unsignalled.
+    if (-not ('WacTest.CloseSeam' -as [type])) {
+        Add-Type -Namespace WacTest -Name CloseSeam -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern System.IntPtr CreateJobObjectW(System.IntPtr attributes, string name);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern System.IntPtr OpenProcess(uint access, bool inherit, int processId);
+'@
+    }
+    $sandbox = New-TestSandbox -Prefix 'campaign-empty-job'
+    $live = $null
+    try {
+        $path = Join-Path $sandbox 'sleep.ps1'
+        [IO.File]::WriteAllText($path, 'Start-Sleep -Seconds 60')
+        $live = Invoke-WacCampaignHost -ScriptPath $path -PassThruProcess -TimeoutSeconds 60
+        $launch = New-Object WacOwnedLaunch
+        $launch.Job = [WacTest.CloseSeam]::CreateJobObjectW([IntPtr]::Zero, $null)
+        # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION: enough to wait on, not enough to end it.
+        $launch.Process = [WacTest.CloseSeam]::OpenProcess([uint32]0x00101000, $false, $live.Process.Id)
+        $started = [PSCustomObject]@{ Launch = $launch; Process = $null; OutReader = $null; ErrReader = $null }
+        Assert-True ($launch.Job -ne [IntPtr]::Zero -and $launch.Process -ne [IntPtr]::Zero) 'fixture handles were not opened'
+        Assert-Throws -ScriptBlock { Close-WacCampaignLaunch -Started $started -TimeoutMs 300 } -Pattern 'termination unproven'
+        Assert-False $started.CloseProof.TerminationProven 'an empty job was accepted as a finished root'
+        Assert-False $started.CloseProof.RootSignalled
+        Assert-Equal 0 $started.CloseProof.ActiveProcesses
+        Assert-False ([WacOwnedProcess]::WaitForExit($live.Launch.Process, 0)) 'the root outside the job was terminated'
+    }
+    finally { try { if ($live) { Close-WacCampaignLaunch -Started $live } } finally { Remove-TestSandbox -Path $sandbox } }
+}
 Test-Case 'Closing one owned job leaves a separately owned harmless job alive' {
     $sandbox = New-TestSandbox -Prefix 'campaign-separate-job'
     $first = $null; $second = $null

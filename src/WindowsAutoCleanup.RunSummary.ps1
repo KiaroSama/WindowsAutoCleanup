@@ -42,7 +42,7 @@ function Get-WacRunSummaryPath {
 function Get-WacStepExecutionState {
     <#
     .SYNOPSIS
-        Which of the three states one step result describes.
+        Which of the four states one step result describes.
     .DESCRIPTION
         Read off the result's own facts. A step that was attempted ran, whatever it concluded. A
         step that was not attempted either refused on evidence - a security refusal, or an

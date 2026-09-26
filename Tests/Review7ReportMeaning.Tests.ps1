@@ -21,6 +21,14 @@ Test-Case 'A missing attempted fact remains unstated even when an outcome exists
     Assert-Equal 'unstated' (Get-WacStepExecutionState -Result ([PSCustomObject]@{ Outcome = 'Succeeded' }))
 }
 
+Test-Case 'An attempted fact that is not a real Boolean is never coerced into a state' {
+    # [bool]'False' is $true and [bool]0 is $false: coercion would invent either answer.
+    foreach ($notBoolean in @('False', 'True', 1, 0, $null)) {
+        Assert-Equal 'unstated' (Get-WacStepExecutionState -Result ([PSCustomObject]@{ Attempted = $notBoolean; Outcome = 'Failed' })) `
+            ('a non-Boolean Attempted was coerced: ' + [string]$notBoolean)
+    }
+}
+
 Test-Case 'Known attempted and safely disabled steps retain their distinct states' {
     Assert-Equal 'executed' (Get-WacStepExecutionState -Result ([PSCustomObject]@{ Attempted = $true; Outcome = 'Failed' }))
     Assert-Equal 'unarmed' (Get-WacStepExecutionState -Result ([PSCustomObject]@{ Attempted = $false; Outcome = 'SafeSkip' }))
@@ -37,8 +45,9 @@ Test-Case 'An empty allow-list preview still discloses every always-selected mai
     function Write-WacRunVerdict { param([string]$Outcome) if ($Outcome -ceq 'Succeeded') { return 0 }; return 6 }
     Assert-Equal 0 (Show-WacRunPreview -SkipRecycleBin)
     $text = $script:Lines -join "`n"
-    foreach ($required in @('Delivery Optimization', 'StartComponentCleanup', 'pnpclean')) {
-        Assert-True ($text -match [regex]::Escape($required)) ('preview omitted selected maintenance: ' + $required)
+    foreach ($required in @('Delivery Optimization', 'StartComponentCleanup', 'pnpclean',
+            'no cleanup or maintenance is performed', 'SkipCategory filters file targets')) {
+        Assert-True ($text -match [regex]::Escape($required)) ('preview omitted a required disclosure: ' + $required)
     }
 }
 Complete-TestRun
