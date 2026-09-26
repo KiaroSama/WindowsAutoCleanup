@@ -89,11 +89,16 @@ Test-Case 'a blocked initializer returns inside the bound instead of when it eve
         Assert-True ([bool]$result.TimedOut) 'a bound that was hit was not reported as a timeout'
         Assert-Equal 0 (@($result.Output).Count) 'a block whose import never finished produced output'
 
-        # Started is $true, and that is the change rather than a regression: the import is the FIRST
-        # STATEMENT OF THE BOUNDED PIPELINE now, so the pipeline genuinely was scheduled and the
-        # conservative answer for a caller asking "could this have had effects" is yes. What must
-        # never happen is waiting the import out, and that is the assertion below.
-        Assert-True ([bool]$result.Started) 'the pipeline carrying the import was not scheduled at all'
+        # Two shapes are correct, and which one a run gets depends on the machine, not the code.
+        # Normally the pipeline carrying the import was scheduled (Started, conservatively: it could
+        # have had effects). On a loaded runner, creating and opening the runspace alone can spend
+        # the whole 800 ms - measured twice on windows-2025 / 5.1 in CI on 2026-09-26 - and then
+        # nothing was scheduled at all. What must never happen is waiting the import out, and that
+        # is the assertion below; each shape is still checked for being the one it claims to be.
+        if (-not [bool]$result.Started) {
+            Assert-True ([string]$result.Error -match 'Preparing the bounded work used') `
+                ('work that was never scheduled did not say its preparation spent the bound: ' + [string]$result.Error)
+        }
 
         # The whole point: the CALL returned, not the import. Four seconds is half the import and
         # five times the bound - generous enough for a loaded runner, far short of waiting it out.
