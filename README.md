@@ -1,5 +1,12 @@
 # WindowsAutoCleanup
 
+[![CI](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/ci.yml?query=branch%3Amain)
+[![Campaign contract](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/campaign-contract.yml/badge.svg?event=pull_request)](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/campaign-contract.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![PowerShell 5.1 | 7](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)](#requirements)
+[![Windows 10 | 11 | Server](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20Server-0078D6)](#requirements)
+[![Last commit](https://img.shields.io/github/last-commit/KiaroSama/WindowsAutoCleanup/main)](https://github.com/KiaroSama/WindowsAutoCleanup/commits/main)
+
 WindowsAutoCleanup is an administrator-only PowerShell cleanup utility for Windows. It removes only explicitly allow-listed temporary files and cache locations on drive `C:`, runs supported Windows cleanup tools, and can install itself as a hidden daily scheduled task.
 
 The project targets unattended maintenance on Windows 10, Windows 11, and supported Windows Server versions. It runs on Windows PowerShell 5.1 and PowerShell 7, and writes a structured UTC log for every run.
