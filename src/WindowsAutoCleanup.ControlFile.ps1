@@ -136,7 +136,7 @@ function Write-WacControlFile {
         try {
             $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Content)
             $created.Stream.Write($bytes, 0, $bytes.Length)
-            $created.Stream.Flush()
+            $created.Stream.Flush($true)
             $result.Kind = 'Created'
             $result.Reason = 'the control file was created and written'
         }

@@ -273,23 +273,15 @@ function Write-WacDeploymentJournal {
     # No backup copy. File.Replace used to displace the live record to '<record>.last' so an
     # unreadable record would have a predecessor to reconcile against - and nothing in this project
     # ever read one, so the only thing it produced was an artifact outliving the transaction that
-    # made it. A null backup name keeps the replace atomic and leaves the lifecycle above true.
+    # made it. The swap is now one write-through rename, which leaves no backup by construction.
     $staging = $path + '.new'
 
     try {
-        [System.IO.File]::WriteAllText($staging, (ConvertTo-Json -InputObject $Record -Depth 5),
-            (New-Object System.Text.UTF8Encoding($false)))
-
-        if ([System.IO.File]::Exists($path)) {
-            # [NullString]::Value, not $null. PowerShell converts $null to an EMPTY STRING when it
-            # binds a [string] parameter, and File.Replace rejects an empty path - measured on both
-            # shipped hosts: "The path is empty. (Parameter 'path')". The write then failed
-            # silently, leaving the record frozen at whatever stage last managed a File.Move.
-            [System.IO.File]::Replace($staging, $path, [NullString]::Value, $true)
-        }
-        else {
-            [System.IO.File]::Move($staging, $path)
-        }
+        # DURABLE, BOTH HALVES (live power-cut campaign, 2026-09-27). WriteAllText left the bytes in
+        # the cache and File.Replace did not make the rename durable: a cut seconds later left a
+        # record nobody could parse, and install and uninstall then refused on it forever.
+        Write-WacFileDurable -Path $staging -Bytes ((New-Object System.Text.UTF8Encoding($false)).GetBytes((ConvertTo-Json -InputObject $Record -Depth 5)))
+        Move-WacFileDurable -Source $staging -Destination $path -Replace:([System.IO.File]::Exists($path))
         return $true
     }
     catch {

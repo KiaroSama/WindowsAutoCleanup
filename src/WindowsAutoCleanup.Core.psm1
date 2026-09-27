@@ -38,6 +38,7 @@ $script:CoreModulePath      = $PSCommandPath
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.TrustedStore.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Locations.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Budget.ps1')
+. (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.DurableFile.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.ControlFile.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.Quarantine.ps1')
 . (Join-Path -Path $PSScriptRoot -ChildPath 'WindowsAutoCleanup.RunState.ps1')
@@ -72,6 +73,7 @@ Export-ModuleMember -Function @(
     'Set-WacDirectoryCreateProbe', 'Set-WacDirectoryTrustJudge',
     'Get-WacDataRoot', 'Get-WacFallbackDataRoot', 'Get-WacDeploymentRoot', 'Get-WacDriverBackupRoot', 'Get-WacLegacyDriverBackupRoot',
     'Get-WacControlRoot', 'Set-WacControlRoot', 'Get-WacLegacyControlRoot',
+    'Write-WacFileDurable', 'Move-WacFileDurable',
     'Write-WacControlFile', 'Read-WacControlFile', 'Remove-WacControlFile', 'Test-WacLegacyControlFile',
     'Test-WacControlStorePresence',
     'Initialize-WacRun', 'Write-WacLog', 'Close-WacLog', 'Get-WacLogPath', 'Get-WacExecutionId',

@@ -125,9 +125,12 @@ function Write-WacDriverBackupControlFile {
             try {
                 $writer.Write($Content)
                 $writer.Flush()
+                # Dispose does NOT put the bytes on disk; FlushFileBuffers does. A power cut after
+                # the rename below would otherwise leave a manifest that cannot be parsed.
+                $file.Stream.Flush($true)
             }
             finally {
-                # Disposes the underlying stream too, which is what puts the bytes on disk.
+                # Disposes the underlying stream too.
                 $writer.Dispose()
             }
         }
@@ -409,13 +412,9 @@ function Complete-WacDriverBackup {
     $staged = Write-WacDriverBackupControlFile -Path $Path -Name $stagingName -Content ($Manifest | ConvertTo-Json -Depth 6)
     if (-not $staged.Ok) { return $false }
 
-    try {
-        try { [System.IO.File]::Replace($stagingPath, $manifestPath, $null) }
-        catch {
-            [System.IO.File]::Delete($manifestPath)
-            [System.IO.File]::Move($stagingPath, $manifestPath)
-        }
-    }
+    # One write-through rename (power-cut campaign, 2026-09-27): there is never a moment without a
+    # manifest, which the old Delete+Move fallback had, and the swap is on disk when this returns.
+    try { Move-WacFileDurable -Source $stagingPath -Destination $manifestPath -Replace }
     catch {
         try { [System.IO.File]::Delete($stagingPath) } catch { $null = $_ }
         return $false
