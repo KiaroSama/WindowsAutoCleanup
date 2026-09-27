@@ -75,6 +75,23 @@ Test-Case 'A real sharing violation cannot truncate the previous authoritative s
     }
     finally { if ($held) { $held.Dispose() }; Remove-TestSandbox -Path $sandbox }
 }
+Test-Case 'Publication renames with write-through, so a power cut right after it cannot roll it back' {
+    # Measured live on 2026-09-27: File.Replace returned, the agent raised Await, the host cut the
+    # power within seconds and NTFS rolled the rename back - leaving state.json.pending, which the
+    # next boot correctly refused. Flushing the file's DATA does not make its RENAME durable.
+    $scriptPath = Join-Path $PSScriptRoot 'Campaign\WacCampaignState.ps1'
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$parseErrors)
+    Assert-Equal 0 @($parseErrors).Count 'the state library no longer parses'
+    $save = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Save-WacCampaignState' }, $true))
+    Assert-Equal 1 $save.Count 'exactly one Save-WacCampaignState must exist'
+    $text = $save[0].Extent.Text
+    Assert-True ($text -match 'Move-WacCampaignFileDurable') 'publication no longer goes through the durable rename'
+    Assert-False ($text -match '\[IO\.File\]::(Replace|Move)\(') 'publication renames through an API with no write-through'
+    Assert-Equal 9 ([WacCampaignDurableMove]::Flags($true)) 'a replacing publication must be MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH'
+    Assert-Equal 8 ([WacCampaignDurableMove]::Flags($false)) 'a first publication must be MOVEFILE_WRITE_THROUGH and must not replace'
+}
+
 Test-Case 'Invalid Boolean authorization and unknown scenarios are rejected before publication' {
     $state = New-State; $state.destructiveAuthorized = 'false'
     Assert-False (Test-WacCampaignStateShape -State $state)

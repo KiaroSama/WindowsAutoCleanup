@@ -338,8 +338,11 @@ function Invoke-WacCampaignRecoveryCheck {
         $machine = Get-WacCampaignMachine -ProjectRoot $ProjectRoot -Installed
         $ok = $finish.ExitCode -eq 0 -and $machine.Coherent -and $machine.SafeMaintenance
     }
+    # The END of the output carries the verdict's reason; one line, bounded, so it fits the report.
+    $said = ([regex]::Replace([string]$finish.Output, '\s+', ' ')).Trim()
+    if ($said.Length -gt 400) { $said = '...' + $said.Substring($said.Length - 400) }
     return [PSCustomObject]@{ Scenario = $scenario; Verdict = $(if ($ok) { 'passed' } else { 'failed' })
-        Detail = ('recoveryExit={0} known={1} clean={2} coherent={3}' -f $finish.ExitCode, $machine.Known, $machine.Clean, $machine.Coherent) }
+        Detail = ('recoveryExit={0} known={1} clean={2} coherent={3} output={4}' -f $finish.ExitCode, $machine.Known, $machine.Clean, $machine.Coherent, $said) }
 }
 
 function Invoke-WacCampaignScenario {

@@ -72,9 +72,39 @@ function Save-WacCampaignState {
             (@($previous.scenarios) -join '|') -cne (@($State.scenarios) -join '|')) {
             throw 'Publication cannot replace a different campaign identity.'
         }
-        [IO.File]::Replace($pending, $Path, [Management.Automation.Language.NullString]::Value)
+        Move-WacCampaignFileDurable -Source $pending -Destination $Path -Replace
     }
-    else { [IO.File]::Move($pending, $Path) }
+    else { Move-WacCampaignFileDurable -Source $pending -Destination $Path }
+}
+
+function Move-WacCampaignFileDurable {
+    <#
+    .SYNOPSIS
+        Renames with MOVEFILE_WRITE_THROUGH: the call returns only once the rename is on disk.
+    .DESCRIPTION
+        The host cuts the power seconds after a publication. File.Replace/File.Move return before the
+        rename is durable, and a live cut rolled one back (2026-09-27). Without -Replace an existing
+        destination fails the move, exactly like File.Move.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Source, [Parameter(Mandatory = $true)][string]$Destination, [switch]$Replace)
+    if (-not ('WacCampaignDurableMove' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WacCampaignDurableMove {
+    private const int MOVEFILE_REPLACE_EXISTING = 0x1;
+    private const int MOVEFILE_WRITE_THROUGH = 0x8;
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool MoveFileExW(string existing, string target, int flags);
+    public static int Flags(bool replace) { return MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0); }
+    public static int Move(string source, string destination, bool replace) {
+        return MoveFileExW(source, destination, Flags(replace)) ? 0 : Marshal.GetLastWin32Error();
+    }
+}
+'@
+    }
+    $code = [WacCampaignDurableMove]::Move($Source, $Destination, [bool]$Replace)
+    if ($code -ne 0) { throw ('The state publication could not be renamed into place (Win32 {0}).' -f $code) }
 }
 
 function Get-WacCampaignStateValue {

@@ -98,4 +98,20 @@ Test-Case 'A disabled pnputil step and successful pnpclean cannot certify driver
     $result = Invoke-WacCampaignScenario -Name 'driver-prune' -State $state -StatePath 'unused' -Save {}
     Assert-Equal 'failed' ([string]$result.Verdict)
 }
+Test-Case 'A failed recovery reports what the installer said, bounded to one line' {
+    # The first live install cut (2026-09-27) reported only recoveryExit=1, and the guest that held
+    # the log was gone: the verdict could not be diagnosed. The reason travels with the verdict.
+    function Invoke-WacCampaignHost {
+        param($ScriptPath, $ArgumentList)
+        $null = $ScriptPath, $ArgumentList
+        return [PSCustomObject]@{ ExitCode = 1; Output = (('noise ' * 200) + "`r`nREFUSED: the transaction record is unreadable.`r`n") }
+    }
+    function Get-WacCampaignMachine { param($ProjectRoot, [switch]$Installed) $null = $ProjectRoot, $Installed; return [PSCustomObject]@{ Known = $true; Clean = $false; Coherent = $false; SafeMaintenance = $false } }
+    $state = [PSCustomObject]@{ cutStep = 'power-loss-during-install' }
+    $result = Invoke-WacCampaignRecoveryCheck -State $state -ProjectRoot 'C:\Fixture'
+    Assert-Equal 'failed' ([string]$result.Verdict)
+    Assert-True ([string]$result.Detail -match 'REFUSED: the transaction record is unreadable\.') ('the installer output is missing: ' + $result.Detail)
+    Assert-False ([string]$result.Detail -match "[`r`n]") 'the detail must stay on one line'
+    Assert-True (([string]$result.Detail).Length -le 700) ('the detail is unbounded: ' + ([string]$result.Detail).Length)
+}
 Complete-TestRun
