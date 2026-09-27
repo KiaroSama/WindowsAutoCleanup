@@ -148,7 +148,7 @@ Full list and evidence: `.ai/BUGS.md`.
 ### What is still open
 
 Isolation between SCENARIOS works: one guest boot each, base checkpoint restored between them.
-Isolation between CAMPAIGNS is now handled in code but **not yet proven on the guest**. The driver
+Isolation between CAMPAIGNS is handled in code and was exercised on the guest on 2026-09-27. The driver
 takes its base checkpoint at campaign start, so residue from a previous run sat inside the baseline
 every scenario was returned to. The agent now brings the machine back to a clean state before any
 scenario runs - using the product's own uninstaller, which is the documented way to resolve an
@@ -157,8 +157,12 @@ not clean. The verdict comes from looking, never from an exit code, and the post
 never resets, because there the machine's state is the evidence. It publishes
 `Baseline = clean | polluted` so the host can see which happened.
 
-Unit-tested and mutation-proved; the live run to confirm it has not completed. Until it has, neither
-cut scenario has a verdict worth quoting.
+Unit-tested and mutation-proved, and confirmed live on 2026-09-27: both cut scenarios PASSED on the
+guest at commit `f1c4f55` (install cut -> the rerun installer reconciled and registered; uninstall
+cut -> a premature install was refused and the uninstaller finished clean). The first live runs
+failed and found two defects, both fixed before that pass: the campaign state rename was not
+durable before the host cut the power, and the product's own transaction records were torn by the
+cut (data not flushed, rename not write-through), which fenced install and uninstall alike.
 
 ### Reading a silent guest, so the next run is not wasted
 
