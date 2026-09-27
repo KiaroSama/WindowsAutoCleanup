@@ -134,4 +134,40 @@ Test-Case 'A real grandchild is held recursively while root identity mismatches 
         Remove-TestSandbox -Path $sandbox
     }
 }
+Test-Case 'A stranger named as a child by a reused parent id never aborts the hold, and is never held' {
+    # CI 36326971930 (windows-2022): a candidate offered by recorded ParentProcessId could not be
+    # opened, its Handle read as $null and the WHOLE hold failed. Windows reuses process ids, so that
+    # parent id can name an unrelated protected process - or one that has already exited. Neither
+    # can be a member we failed to hold: the job-count check after the walk still proves that.
+    $sandbox = New-TestSandbox -Prefix 'campaign-stranger'
+    $started = $null; $held = $null
+    try {
+        $path = Join-Path $sandbox 'sleep.ps1'
+        [IO.File]::WriteAllText($path, 'Start-Sleep -Seconds 30; exit 0')
+        $started = Invoke-WacCampaignHost -ScriptPath $path -PassThruProcess -TimeoutSeconds 30
+        $rootId = $started.Process.Id
+        $stranger = @(Get-Process -Name 'csrss' | Sort-Object -Property Id)[0]
+        $strangerId = $stranger.Id
+        $realChildren = ${function:Get-WacCampaignChildProcess}
+        function Get-WacCampaignChildProcess {
+            param([int]$ParentId)
+            $real = @(& $realChildren -ParentId $ParentId)
+            if ($ParentId -ne $rootId) { return $real }
+            return @($real) + @(
+                [PSCustomObject]@{ ProcessId = $strangerId; CreationDate = [datetime]::Now.AddDays(-1) },
+                [PSCustomObject]@{ ProcessId = 2147483644; CreationDate = [datetime]::Now })
+        }
+        $held = Suspend-WacCampaignTree -ProcessId $rootId -ExpectedCreatedUtc $started.Process.StartTime.ToUniversalTime() -Job $started.Launch.Job
+        Assert-True $held.RootHeld ('an unopenable or exited stranger aborted the hold: ' + $held.Detail)
+        $ids = @($held.Processes | ForEach-Object { $_.Id })
+        Assert-True ($ids -contains $rootId) 'the owned root was not held'
+        Assert-False ($ids -contains $strangerId) 'an unrelated protected process was held'
+        Assert-Equal ([int](Get-WacOwnedTreeState -Launch $started.Launch).ActiveProcesses) $ids.Count 'not every owned job member was held'
+    }
+    finally {
+        if ($held) { foreach ($process in @($held.Processes)) { $process.Dispose() } }
+        if ($started) { Close-WacCampaignLaunch -Started $started }
+        Remove-TestSandbox -Path $sandbox
+    }
+}
 Complete-TestRun

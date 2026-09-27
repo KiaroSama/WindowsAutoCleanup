@@ -45,6 +45,12 @@ function Wait-WacCampaignFile {
     return $false
 }
 
+function Get-WacCampaignChildProcess {
+    <# Processes whose RECORDED parent id is ParentId - a candidate list, never proof of parentage. #>
+    param([Parameter(Mandatory = $true)][int]$ParentId)
+    return @(Get-CimInstance Win32_Process -Filter ('ParentProcessId={0}' -f $ParentId) -ErrorAction Stop)
+}
+
 function Suspend-WacCampaignTree {
     <# Freeze only the identified root and verified descendants; unwind partial holds. #>
     param([Parameter(Mandatory = $true)][int]$ProcessId,
@@ -73,11 +79,24 @@ public static extern bool IsProcessInJob(System.IntPtr processHandle, System.Int
             if ($watch.Elapsed.TotalSeconds -ge 20 -or $held.Count -ge 256) { throw 'The bounded hold limit was reached.' }
             $next = $queue.Dequeue()
             if ($seen.ContainsKey([int]$next.Id)) { continue }
-            $process = [Diagnostics.Process]::GetProcessById($next.Id)
+            # A candidate is offered by RECORDED parent id, which Windows reuses (CI 36326971930): one
+            # that has exited or cannot be opened is not a member this run could hold, and if it were,
+            # the job-count check after the walk still refuses the cut. Only the root must open.
+            $process = $null; $handle = $null; $born = $null
             try {
+                $process = [Diagnostics.Process]::GetProcessById($next.Id)
+                $handle = $process.Handle
                 $born = $process.StartTime.ToUniversalTime()
+            }
+            catch { $handle = $null }
+            if ($null -eq $handle -or $handle -eq [IntPtr]::Zero -or $null -eq $born) {
+                if ($null -ne $process) { $process.Dispose() }
+                if ($next.Exact) { throw 'The owned root could not be opened.' }
+                continue
+            }
+            try {
                 $belongs = $false
-                if (-not [WacCampaign.Hold]::IsProcessInJob($process.Handle, $Job, [ref]$belongs)) { throw 'Cannot verify owned job membership.' }
+                if (-not [WacCampaign.Hold]::IsProcessInJob($handle, $Job, [ref]$belongs)) { throw 'Cannot verify owned job membership.' }
                 if (-not $belongs) {
                     if ($next.Exact) { throw 'The root no longer belongs to the owned job.' }
                     # An OS-created auxiliary child may not belong to this job; never suspend it.
@@ -92,7 +111,7 @@ public static extern bool IsProcessInJob(System.IntPtr processHandle, System.Int
             [void]$held.Add($process)
             $seen[[int]$process.Id] = $true
             # A held parent cannot spawn after this query. Traverse recursively, not twice at root.
-            foreach ($child in @(Get-CimInstance Win32_Process -Filter ('ParentProcessId={0}' -f $process.Id) -ErrorAction Stop)) {
+            foreach ($child in @(Get-WacCampaignChildProcess -ParentId $process.Id)) {
                 $queue.Enqueue([PSCustomObject]@{ Id = [int]$child.ProcessId; Born = $child.CreationDate.ToUniversalTime(); Exact = $false })
             }
         }
