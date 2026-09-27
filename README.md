@@ -2,10 +2,21 @@
 
 [![CI](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/ci.yml?query=branch%3Amain)
 [![Campaign contract](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/campaign-contract.yml/badge.svg?event=pull_request)](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/campaign-contract.yml)
+[![Tested on Windows Server 2022 | 2025](https://img.shields.io/badge/tested%20on-Windows%20Server%202022%20%7C%202025-0078D6)](https://github.com/KiaroSama/WindowsAutoCleanup/actions/workflows/ci.yml)
+[![Lint: PSScriptAnalyzer 1.25.0](https://img.shields.io/badge/lint-PSScriptAnalyzer%201.25.0-5391FE)](.github/workflows/ci.yml)
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![PowerShell 5.1 | 7](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)](#requirements)
 [![Windows 10 | 11 | Server](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20Server-0078D6)](#requirements)
+
 [![Last commit](https://img.shields.io/github/last-commit/KiaroSama/WindowsAutoCleanup/main)](https://github.com/KiaroSama/WindowsAutoCleanup/commits/main)
+[![Commit activity](https://img.shields.io/github/commit-activity/m/KiaroSama/WindowsAutoCleanup)](https://github.com/KiaroSama/WindowsAutoCleanup/commits/main)
+[![Contributors](https://img.shields.io/github/contributors/KiaroSama/WindowsAutoCleanup)](https://github.com/KiaroSama/WindowsAutoCleanup/graphs/contributors)
+[![Open issues](https://img.shields.io/github/issues/KiaroSama/WindowsAutoCleanup)](https://github.com/KiaroSama/WindowsAutoCleanup/issues)
+[![Stars](https://img.shields.io/github/stars/KiaroSama/WindowsAutoCleanup)](https://github.com/KiaroSama/WindowsAutoCleanup/stargazers)
+
+[![Code size](https://img.shields.io/github/languages/code-size/KiaroSama/WindowsAutoCleanup)](https://github.com/KiaroSama/WindowsAutoCleanup)
+[![Support donations](https://img.shields.io/badge/Support-donations-d04a9a)](#donate)
 
 WindowsAutoCleanup is an administrator-only PowerShell cleanup utility for Windows. It removes only explicitly allow-listed temporary files and cache locations on drive `C:`, runs supported Windows cleanup tools, and can install itself as a hidden daily scheduled task.
 
