@@ -221,7 +221,7 @@ jobs:
         # what a later investigation compares a red one against; keeping them only when something
         # broke means there is never a baseline to compare with.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         timeout-minutes: 5
         with:
           # Unique per matrix leg: two legs uploading the same name collide and one is lost.
@@ -311,7 +311,7 @@ jobs:
 
       - name: Upload lifecycle evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         timeout-minutes: 5
         with:
           name: lifecycle-evidence-${{ matrix.os }}-${{ github.run_attempt }}
